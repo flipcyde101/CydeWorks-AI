@@ -2,15 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
+import {createMockOllama} from './test-support/mock-ollama.mjs';
 
 async function scenario(t,{cloud='disabled',remote=false,digest='a'.repeat(64)}={}) {
-  const loader=new URL('./test-support/mock-ollama.mjs',import.meta.url).href;
-  const child=spawn(process.execPath,['--import',loader,'server.mjs'],{cwd:new URL('.',import.meta.url),windowsHide:true,
-    env:{...process.env,BFE_PORT:'0',BFE_TEST_MEMORY:'1',BFE_TEST_KEY:'c'.repeat(64),
-      BFE_MOCK_CLOUD:cloud,BFE_MOCK_REMOTE:remote?'1':'0',BFE_OLLAMA_PORT:'11534'},stdio:['ignore','pipe','pipe','ipc']});
   let calls=0;
-  child.on('message',message=>{if(message?.type==='synthetic-chat-call')calls++;});
-  t.after(async()=>{if(child.exitCode===null&&child.signalCode===null){const exited=once(child,'exit');child.kill();await exited;}});
+  const mock=createMockOllama({cloud,remote,onChat:()=>calls++});
+  mock.listen(0,'127.0.0.1');await once(mock,'listening');
+  const child=spawn(process.execPath,['server.mjs'],{cwd:new URL('.',import.meta.url),windowsHide:true,
+    env:{...process.env,BFE_PORT:'0',BFE_TEST_MEMORY:'1',BFE_TEST_KEY:'c'.repeat(64),
+      BFE_OLLAMA_PORT:String(mock.address().port)},stdio:['ignore','pipe','pipe','ipc']});
+  t.after(async()=>{
+    if(child.exitCode===null&&child.signalCode===null){const exited=once(child,'exit');child.kill();await exited;}
+    mock.closeAllConnections();await new Promise(resolve=>mock.close(resolve));
+  });
   const [chunk]=await Promise.race([once(child.stdout,'data'),once(child,'exit').then(([code])=>{throw Error('Synthetic server exited '+code);})]);
   const match=/http:\/\/127\.0\.0\.1:\d+/.exec(chunk.toString());
   assert.ok(match);

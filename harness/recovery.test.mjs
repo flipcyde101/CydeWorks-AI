@@ -71,7 +71,7 @@ test('a restarted workspace holds uncertain retries and preserves safe attempts'
   await mkdir(join(scratch,'.state'));
   await mkdir(join(scratch,'desktop'));
   await copyFile(join(workspace,'desktop','utility-test-child.cjs'),join(scratch,'desktop','utility-test-child.cjs'));
-  for (const file of ['server.mjs','opencode.mjs','providers.mjs','patch.mjs','recovery.mjs','workspace-lock.mjs','export.mjs','attention.mjs','route.mjs','owner-lease.mjs','removal.mjs']) {
+  for (const file of ['server.mjs','opencode.mjs','providers.mjs','direct-local-fetch.mjs','patch.mjs','recovery.mjs','workspace-lock.mjs','export.mjs','attention.mjs','route.mjs','owner-lease.mjs','removal.mjs']) {
     await copyFile(join(workspace,file),join(scratch,file));
   }
   for (const file of ['app.js','index.html','style.css','observer.js','export-dialog.js','usage.js','progress.js','removal-dialog.js']) {

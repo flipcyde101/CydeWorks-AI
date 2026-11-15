@@ -56,7 +56,7 @@ The service binds to loopback. It stores local task records under `.state`; the 
 
 ## Real model and desktop limitations
 
-The Ollama route is held if the local service reports cloud features enabled or its cloud status is unavailable. A reported model digest is checked before dispatch, but a mutable model tag and the absence of OS-enforced network isolation mean this is not proof of offline execution identity. Local models and OpenCode have not passed the intended live coding and detach/reattach qualification.
+The Ollama route is held if the local service reports cloud features enabled or its cloud status is unavailable. The direct Ollama adapter uses a dedicated loopback connection that ignores environment proxy settings. This does not establish OS-enforced network isolation or constrain separate runtimes. A reported model digest is checked before dispatch, but a mutable model tag means this is not proof of execution identity. Local models and OpenCode have not passed the intended live coding and detach/reattach qualification.
 
 The OpenCode adapter currently expects an existing Windows executable at `work/paperclip-evaluation/node_modules/opencode-windows-x64/bin/opencode.exe`, relative to this repository root. That executable and its dependencies are not included. The route is unavailable when the file is absent; the fixture remains available. Do not use the preview on sensitive or real repositories until an isolation boundary has been independently qualified.
 
@@ -64,7 +64,7 @@ The Electron desktop directory is source and a dependency lockfile only. Native 
 
 ## Tests
 
-From `harness`, run `npm test`. The latest complete run of the source used for this snapshot passed 71 synthetic tests. These tests do not establish model quality, protected repository execution or a signed desktop release.
+From `harness`, run `npm test`. The latest complete run of the source used for this snapshot passed 76 synthetic tests. These tests do not establish model quality, protected repository execution or a signed desktop release.
 
 ## License
 

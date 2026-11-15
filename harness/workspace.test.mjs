@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import {createServer} from 'node:net';
-import {ollama,ollamaEndpoint} from './providers.mjs';
+import {createOllama,ollamaEndpoint} from './providers.mjs';
 import {approvedPrompt,classifyOutput} from './opencode.mjs';
 import {assessRoute} from './route.mjs';
 
@@ -216,6 +216,7 @@ test('Ollama requires an explicit final completion marker',async t=>{
     JSON.stringify({message:{content:'{"summary":"Brief","content":"Source [1]."}'},done:false}),
     JSON.stringify({done:'true',prompt_eval_count:12,eval_count:6}),
   ].join('\n')));
+  const ollama=createOllama({transport:globalThis.fetch});
   await assert.rejects(()=>ollama.run({model:'qwen3:1.7b',kind:'brief',source:'Source',request:'Summarize'},
     {signal:AbortSignal.timeout(2000),progress(){}}),/stream ended before completion/);
 });
@@ -227,6 +228,7 @@ test('local inventory shows unknown models and holds them along with missing or 
     {name:'qwen3.5:4b-dell-gpu',size:5000000000},
     {name:'unqualified:cloud',size:1,details:{quantization_level:{toString:null,valueOf:null}}},
   ]}));
+  const ollama=createOllama({transport:globalThis.fetch});
   const models=await ollama.models();
   assert.equal(models.length,4);
   assert.equal(assessRoute({...models[0],engine:'ollama'},9000000000).eligible,true);
@@ -242,6 +244,7 @@ test('reported remote Ollama aliases are held and remote responses are never pre
     {name:'qwen3:1.7b',size:1000000000,remote_host:'https://example.invalid'},
   ]}):new Response(JSON.stringify({done:true,error:'synthetic error',remote_host:'https://example.invalid',
     message:{content:'{"summary":"Synthetic","content":"Source [1]."}'}})));
+  const ollama=createOllama({transport:globalThis.fetch});
   const [model]=await ollama.models();
   assert.equal(model.remote,true);
   assert.equal(assessRoute({...model,engine:'ollama'},9000000000).eligible,false);
@@ -255,6 +258,7 @@ test('missing or enabled cloud status keeps local model routes on hold',async t=
   t.mock.method(globalThis,'fetch',async url=>url.endsWith('/api/status')
     ?state===null?new Response('',{status:404}):Response.json({cloud:{disabled:state}})
     :Response.json({models:[{name:'qwen3:1.7b',size:1000000000,digest:'a'.repeat(64)}]}));
+  const ollama=createOllama({transport:globalThis.fetch});
   let [model]=await ollama.models();
   assert.equal(model.cloudDisabled,null);
   assert.equal(assessRoute({...model,engine:'ollama'},9000000000).eligible,false);
@@ -273,6 +277,7 @@ test('oversized inventory is rejected and an oversized cloud-status response hol
     ?Response.json({cloud:{disabled:true},padding:'x'.repeat(32000)})
     :oversizedInventory?new Response('x'.repeat(2000001))
       :Response.json({models:[{name:'qwen3:1.7b',size:1,digest:'a'.repeat(64)}]}));
+  const ollama=createOllama({transport:globalThis.fetch});
   await assert.rejects(()=>ollama.models(),/size limit/);
   oversizedInventory=false;
   const [model]=await ollama.models();
@@ -284,6 +289,7 @@ test('invalid UTF-8 in cloud status is held, even if it contains disabled true',
   const invalid=Buffer.concat([Buffer.from('{"cloud":{"disabled":true},"extra":"'),Buffer.from([255]),Buffer.from('"}')]);
   t.mock.method(globalThis,'fetch',async url=>url.endsWith('/api/status')?new Response(invalid)
     :Response.json({models:[{name:'qwen3:1.7b',size:1,digest:'a'.repeat(64)}]}));
+  const ollama=createOllama({transport:globalThis.fetch});
   const [model]=await ollama.models();
   assert.equal(model.cloudDisabled,null);
   assert.equal(assessRoute({...model,engine:'ollama'},9000000000).eligible,false);
@@ -294,6 +300,7 @@ test('failed inventory cancels its unused body and still consumes concurrent sta
   t.mock.method(globalThis,'fetch',async url=>url.endsWith('/api/tags')
     ?new Response(new ReadableStream({cancel(){cancelled=true;}}),{status:500})
     :new Response(new ReadableStream({pull(controller){consumed=true;controller.enqueue(new TextEncoder().encode('{"cloud":{"disabled":true}}'));controller.close();}})));
+  const ollama=createOllama({transport:globalThis.fetch});
   await assert.rejects(()=>ollama.models(),/unsuccessful response/);
   assert.equal(cancelled,true);
   assert.equal(consumed,true);
@@ -302,6 +309,7 @@ test('failed inventory cancels its unused body and still consumes concurrent sta
 test('an unsuccessful inference response cancels its unused body',async t=>{
   let cancelled=false;
   t.mock.method(globalThis,'fetch',async()=>new Response(new ReadableStream({cancel(){cancelled=true;}}),{status:503}));
+  const ollama=createOllama({transport:globalThis.fetch});
   await assert.rejects(()=>ollama.run({model:'qwen3:1.7b',kind:'brief',source:'Synthetic',request:'Summarize'},
     {signal:AbortSignal.timeout(2000),progress(){}}),/rejected the run/);
   assert.equal(cancelled,true);
@@ -324,6 +332,7 @@ test('Ollama adapter bounds the destination and preserves reported and missing u
       JSON.stringify({done:true,prompt_eval_count:12,eval_count:6,eval_duration:500000000}),
     ].join('\n'));
   });
+  const ollama=createOllama({transport:globalThis.fetch});
   const models=await ollama.models();
   assert.deepEqual(models.map(model=>model.id),['qwen3:1.7b','unqualified:cloud']);
   assert.equal(assessRoute({...models[1],engine:'ollama'},9000000000).eligible,false);
