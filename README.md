@@ -35,6 +35,8 @@ The Electron desktop directory is source and a dependency lockfile only. Native 
 
 From `harness`, run `npm test`. The latest complete run of the source used for this snapshot passed 71 synthetic tests. These tests do not establish model quality, protected repository execution or a signed desktop release.
 
-## Project status and licensing
+## License
 
-OpenCode and Ollama are external candidate integrations. Electron is an optional development dependency. None of their source or binaries is bundled in this snapshot. This repository does not yet include a project license; a license decision and third-party notice review are still needed.
+The BFE Harness+ source in this repository is available under the [MIT License](LICENSE).
+
+OpenCode and Ollama are external candidate integrations. Electron is an optional development dependency. None of their source or binaries is bundled in this snapshot, and those projects have their own licenses.
