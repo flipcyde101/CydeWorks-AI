@@ -15,6 +15,7 @@ import {attentionFor} from './attention.mjs';
 import {assessRoute,matchesModelIdentity} from './route.mjs';
 import {createOwnerLease} from './owner-lease.mjs';
 import {previewRemoval,verifyRemoval} from './removal.mjs';
+import {buildReadiness} from './readiness.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.BFE_PORT || 15371);
@@ -57,6 +58,7 @@ const assets = new Map(await Promise.all([
   ['/usage.js','usage.js','text/javascript'],
   ['/progress.js','progress.js','text/javascript'],
   ['/removal-dialog.js','removal-dialog.js','text/javascript'],
+  ['/route-diagnostics.js','route-diagnostics.js','text/javascript'],
 ].map(async ([route,file,type]) => [route,{data:await readFile(resolve(root,'web',file)),type}])));
 let active;
 
@@ -216,13 +218,16 @@ const server=http.createServer(async (req,res) => {
     const cookie=req.headers.cookie?.split(';').map(value=>value.trim()).find(value=>value.startsWith('bfe_session='));
     if (!equal(cookie?.slice('bfe_session='.length),session)) fail(401,'Unlock this workspace with its local access.key file.');
     if (req.method==='GET' && path==='/api/models') {
-      const [installed,engines]=await Promise.all([ollama.models().catch(()=>[]),opencode.models().catch(()=>[])]);
+      const [inspection,codeCheck]=await Promise.allSettled([ollama.inspect(),opencode.availability()]);
+      const installed=inspection.status==='fulfilled'?inspection.value.models:[];
+      const engines=codeCheck.status==='fulfilled'&&codeCheck.value==='present'?installed:[];
+      const diagnostics=buildReadiness(inspection,codeCheck);
       const available=freemem();
       const models=[...engines.map(model=>({...model,engine:'opencode'})),
         ...installed.map(model=>({...model,engine:'ollama'})),
         ...(await fixture.models()).map(model=>({...model,engine:'fixture'}))];
       return send(200,{models:models.map(model=>({...model,endpoint:model.engine==='fixture'?null:ollamaEndpoint,
-        readiness:assessRoute(model,available)}))});
+        readiness:assessRoute(model,available)})),diagnostics});
     }
     if (req.method==='GET' && path==='/api/tasks') {
       return send(200,{tasks:all().map(({id,title,kind,status}) => ({id,title,kind,status}))});

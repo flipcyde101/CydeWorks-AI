@@ -4,9 +4,9 @@ import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import {createMockOllama} from './test-support/mock-ollama.mjs';
 
-async function scenario(t,{cloud='disabled',remote=false,digest='a'.repeat(64)}={}) {
+async function scenario(t,{cloud='disabled',remote=false,inventoryFailure=false,digest='a'.repeat(64)}={}) {
   let calls=0;
-  const mock=createMockOllama({cloud,remote,onChat:()=>calls++});
+  const mock=createMockOllama({cloud,remote,inventoryFailure,onChat:()=>calls++});
   mock.listen(0,'127.0.0.1');await once(mock,'listening');
   const child=spawn(process.execPath,['server.mjs'],{cwd:new URL('.',import.meta.url),windowsHide:true,
     env:{...process.env,BFE_PORT:'0',BFE_TEST_MEMORY:'1',BFE_TEST_KEY:'c'.repeat(64),
@@ -19,10 +19,14 @@ async function scenario(t,{cloud='disabled',remote=false,digest='a'.repeat(64)}=
   const match=/http:\/\/127\.0\.0\.1:\d+/.exec(chunk.toString());
   assert.ok(match);
   const origin=match[0];
+  const diagnosticAsset=await fetch(origin+'/route-diagnostics.js');
+  assert.equal(diagnosticAsset.status,200);
+  assert.match(diagnosticAsset.headers.get('content-type'),/text\/javascript/);
   const post=(path,body,cookie)=>fetch(origin+path,{method:'POST',headers:{Origin:origin,'Content-Type':'application/json',
     ...(cookie?{Cookie:cookie}:{})},body:JSON.stringify(body)});
   const session=await post('/api/session',{key:'c'.repeat(64)});
   const cookie=session.headers.get('set-cookie').split(';')[0];
+  const routes=await (await fetch(origin+'/api/models',{headers:{Cookie:cookie}})).json();
   const created=await (await post('/api/tasks',{title:'Synthetic',kind:'change',filename:'example.txt',
     request:'Replace the file',source:'Original',expected:'Revised example'},cookie)).json();
   const path='/api/tasks/'+created.id;
@@ -35,7 +39,7 @@ async function scenario(t,{cloud='disabled',remote=false,digest='a'.repeat(64)}=
     if(result.status!=='running')break;
     await new Promise(resolve=>setTimeout(resolve,20));
   }
-  return {result,get calls(){return calls;}};
+  return {result,routes,get calls(){return calls;}};
 }
 
 test('changed model identity is held before any synthetic inference call', {timeout:10000},async t=>{
@@ -50,6 +54,9 @@ test('enabled cloud or reported remote model is held before inference', {timeout
   const cloud=await scenario(t,{cloud:'enabled'});
   assert.equal(cloud.result.status,'failed');
   assert.match(cloud.result.attempts[0].problem,/cloud features/i);
+  assert.equal(cloud.routes.diagnostics.ollama.cloud,'enabled');
+  assert.equal(cloud.routes.diagnostics.ollama.modelCount,1);
+  assert.ok(cloud.routes.models.some(model=>model.engine==='fixture'&&model.readiness.eligible));
   assert.equal(cloud.calls,0);
   const remote=await scenario(t,{remote:true});
   assert.equal(remote.result.status,'failed');
@@ -64,4 +71,21 @@ test('matching preflight and disabled cloud allow a synthetic adapter response',
   assert.equal(run.result.attempts[0].approvedModelDigest,'a'.repeat(64));
   assert.equal(run.result.attempts[0].usage.providerCharge,null);
   assert.equal(run.calls,1);
+});
+
+test('unavailable model inventory keeps the fixture usable and hides raw provider errors', {timeout:10000},async t=>{
+  const run=await scenario(t,{inventoryFailure:true});
+  assert.equal(run.routes.diagnostics.ollama.status,'unavailable');
+  assert.equal(run.routes.diagnostics.ollama.modelCount,null);
+  assert.ok(run.routes.models.some(model=>model.engine==='fixture'&&model.readiness.eligible));
+  assert.doesNotMatch(JSON.stringify(run.routes),/PRIVATE_SYNTHETIC_ERROR/);
+  assert.equal(run.calls,0);
+});
+
+test('unknown cloud status is explained and blocks synthetic inference', {timeout:10000},async t=>{
+  const run=await scenario(t,{cloud:'unknown'});
+  assert.equal(run.routes.diagnostics.ollama.cloud,'unknown');
+  assert.ok(run.routes.diagnostics.messages.some(message=>message.code==='cloud_unknown'));
+  assert.equal(run.result.status,'failed');
+  assert.equal(run.calls,0);
 });

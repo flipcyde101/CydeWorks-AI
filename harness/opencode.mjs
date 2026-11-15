@@ -1,5 +1,5 @@
 import {spawn} from 'node:child_process';
-import {access, mkdir, writeFile} from 'node:fs/promises';
+import {access, stat, mkdir, writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createInterface} from 'node:readline';
@@ -8,6 +8,16 @@ import {ollama,ollamaEndpoint} from './providers.mjs';
 const executable=fileURLToPath(new URL('../work/paperclip-evaluation/node_modules/opencode-windows-x64/bin/opencode.exe',import.meta.url));
 const root=fileURLToPath(new URL('./.state/opencode/',import.meta.url));
 const number=value=>Number.isSafeInteger(value)&&value>=0 ? value : null;
+
+export async function openCodeAvailability({inspect=stat,probe=access}={}) {
+  try {
+    const info=await inspect(executable);
+    if(!info.isFile())return 'missing';
+    await probe(executable);
+    return 'present';
+  }
+  catch(error) {return error?.code==='ENOENT'?'missing':'unknown';}
+}
 
 export function approvedPrompt(task) {
   const format=task.kind==='change'
@@ -47,7 +57,7 @@ export async function collectOpenCode(child,task,{signal,progress,terminal}) {
   signal.addEventListener('abort',stop,{once:true});
   if (signal.aborted) stop();
   const closed=new Promise((resolve,reject)=>{
-    child.once('error',reject);
+    child.once('error',()=>reject(new Error('OpenCode could not start. Check the configured executable.')));
     child.once('close',(code,exitSignal)=>resolve({code,exitSignal}));
   });
   child.stdin.on('error',()=>{ failure ??= 'OpenCode could not receive the approved request.'; });
@@ -100,8 +110,11 @@ export async function collectOpenCode(child,task,{signal,progress,terminal}) {
 }
 
 export const opencode={
+  availability:openCodeAvailability,
   async models() {
-    await access(executable);
+    const state=await opencode.availability();
+    if(state==='missing')throw Error('The configured OpenCode executable was not found.');
+    if(state!=='present')throw Error('The configured OpenCode executable could not be checked.');
     return ollama.models();
   },
   async run(task,{signal,progress,terminal,attemptId}) {

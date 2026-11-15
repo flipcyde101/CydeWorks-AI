@@ -9,6 +9,7 @@ CydeWorks AI is an experimental, open-source AI workspace. The goal is to bring 
 - **Scoped tasks and review:** Create a brief or a one-file change proposal, approve the source snapshot, inspect structural checks, and accept or reject a result. The synthetic fixture exercises this flow without an AI model. Citation-number and text checks do not prove factual or code correctness.
 - **Local records and recovery holds:** Tasks and review history are stored locally in SQLite. Uncertain provider outcomes hold automatic retry so an interrupted request is not silently dispatched again.
 - **Attention, progress and usage:** The preview groups attention by task, distinguishes waiting and possible stalls, and shows available per-attempt usage fields. Missing provider data is shown as unavailable rather than zero.
+- **Route readiness:** The route list explains unavailable Ollama inventory, unknown or enabled cloud status, and missing OpenCode files. These checks do not qualify the model or verify a network boundary.
 - **Data controls:** Preview and export minimal metadata, or separately confirm removal of a task record from the active workspace database. Removal does not erase OpenCode files, backups or provider copies and is not secure erasure.
 - **Terminal observation:** A read-only event panel exposes Take, Release, Detach, Reattach and Stop controls. The interaction design was demonstrated separately in a synthetic prototype; the current live sequence and writable terminal still need qualification.
 
@@ -64,7 +65,7 @@ The Electron desktop directory is source and a dependency lockfile only. Native 
 
 ## Tests
 
-From `harness`, run `npm test`. The latest complete run of the source used for this snapshot passed 76 synthetic tests. These tests do not establish model quality, protected repository execution or a signed desktop release.
+From `harness`, run `npm test`. The latest complete run of the source used for this snapshot passed 86 synthetic tests. These tests do not establish model quality, protected repository execution or a signed desktop release.
 
 ## License
 

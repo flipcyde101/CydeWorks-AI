@@ -24,12 +24,19 @@ function discardBody(response) {
   try {void response.body?.cancel().catch(()=>{});} catch { /* The response may already be closed. */ }
 }
 async function fetchBoundedJson(path,limit,transport) {
-  const response=await transport(endpoint+path,{redirect:'error',signal:AbortSignal.timeout(3000)});
-  if(!response.ok) {
-    discardBody(response);
-    throw Error('The local provider returned an unsuccessful response.');
+  const signal=AbortSignal.timeout(3000);
+  try {
+    const response=await transport(endpoint+path,{redirect:'error',signal});
+    if(!response.ok) {
+      discardBody(response);
+      throw Error('The local provider returned an unsuccessful response.');
+    }
+    return await boundedJson(response,limit);
+  } catch(error) {
+    if(path==='/api/tags'&&(error?.name==='TimeoutError'||signal.reason?.name==='TimeoutError'))
+      throw Error('The local model inventory check timed out. Check the service and refresh routes.');
+    throw error;
   }
-  return boundedJson(response,limit);
 }
 
 export const fixture = {
@@ -52,8 +59,7 @@ const number = value => Number.isSafeInteger(value) && value >= 0 ? value : null
 const millis = value => number(value) === null ? null : value / 1e6;
 
 export function createOllama({transport=directLocalFetch}={}) {
-  return {
-  async models() {
+  async function inspect() {
     const [inventoryResult,statusResult]=await Promise.allSettled([
       fetchBoundedJson('/api/tags',2000000,transport),fetchBoundedJson('/api/status',32000,transport),
     ]);
@@ -63,13 +69,17 @@ export function createOllama({transport=directLocalFetch}={}) {
     let cloudDisabled=null;
     const status=statusResult.status==='fulfilled'?statusResult.value:null;
     if(typeof status?.cloud?.disabled==='boolean')cloudDisabled=status.cloud.disabled;
-    return models.filter(model => model&&validModelName(model.name))
+    const installed=models.filter(model => model&&validModelName(model.name))
       .map(model => ({id:model.name, label:model.name, digest:digest(model.digest),
         bytes:Number.isSafeInteger(model.size)&&model.size>0?model.size:null,
         remote:hasRemote(model.remote_host)||hasRemote(model.remote_model)||/(:cloud|-cloud)$/i.test(model.name),
         cloudDisabled,
         quantization:displayText(model.details?.quantization_level)}));
-  },
+    return {models:installed,cloudDisabled};
+  }
+  return {
+  inspect,
+  async models() {return (await inspect()).models;},
   async run(task, {signal, progress}) {
     const schema = {type:'object', properties:{summary:{type:'string'},content:{type:'string'}}, required:['summary','content']};
     const system = task.kind === 'change'

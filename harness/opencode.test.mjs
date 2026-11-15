@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {collectOpenCode,classifyDiagnostic,classifyOutput} from './opencode.mjs';
+import {collectOpenCode,classifyDiagnostic,classifyOutput,opencode} from './opencode.mjs';
 import {recordObservedUsage,recordOutcomeUncertainty} from './recovery.mjs';
 
 test('a stopped OpenCode run preserves the observed step receipt without marking the provider settled',async()=>{
@@ -48,4 +48,18 @@ test('OpenCode diagnostics disclose only a fixed safe category',()=>{
   const result=classifyOutput({code:1,output:'',kind:'change',diagnostic:hint});
   assert.match(result.problem,/refused connection/);
   assert.doesNotMatch(result.problem,/PRIVATE_SENTINEL/);
+});
+
+test('OpenCode recheck and spawn failures do not disclose a local path',async t=>{
+  t.mock.method(opencode,'availability',async()=> 'unknown');
+  await assert.rejects(()=>opencode.models(),error=>/could not be checked/i.test(error.message)&&!/PRIVATE_SYNTHETIC_PATH|Users[\\/]/i.test(error.message));
+  const child=new EventEmitter();
+  child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.kill=()=>{};
+  const running=collectOpenCode(child,{kind:'change',request:'Synthetic'},
+    {signal:new AbortController().signal,progress(){},terminal(){}});
+  queueMicrotask(()=>{
+    child.stdout.end();child.stderr.end();
+    child.emit('error',Object.assign(Error('spawn PRIVATE_SYNTHETIC_PATH failed'),{code:'ENOENT'}));
+  });
+  await assert.rejects(running,error=>/could not start/i.test(error.message)&&!/PRIVATE_SYNTHETIC_PATH/.test(error.message));
 });

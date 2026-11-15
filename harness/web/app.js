@@ -3,6 +3,7 @@ import {bindExportDialog} from './export-dialog.js';
 import {summarizeUsage} from './usage.js';
 import {describeProgress,progressAnnouncement} from './progress.js';
 import {bindRemovalDialog} from './removal-dialog.js';
+import {diagnosticMessages} from './route-diagnostics.js';
 const $ = id => document.getElementById(id);
 const form = $('create');
 const field = name => form.elements.namedItem(name);
@@ -159,9 +160,8 @@ function populateRoutes(inventory,preferred) {
   const unavailable=models.filter(model=>!model.readiness?.eligible).map(model=>
     element('li',(model.engine==='opencode'?'OpenCode · ':model.engine==='ollama'?'Ollama · ':'')+
       model.label+': '+(model.readiness?.reason??'Availability is unknown.')));
-  if(!models.some(model=>model.engine!=='fixture'))
-    unavailable.push(element('li','No supported local models were discovered. Check Ollama and refresh the route list.'));
-  $('route-exclusions').replaceChildren(...unavailable);
+  const diagnosticRows=diagnosticMessages(inventory).map(message=>element('li',message));
+  $('route-exclusions').replaceChildren(...diagnosticRows,...unavailable);
   const selected=models.find(model=>routeKey(model)===preferred&&model.readiness?.eligible) ??
     models.find(model=>model.id===task?.model&&model.engine===task.attempts.at(-1)?.provider&&model.readiness?.eligible) ??
     [...models].filter(model=>model.bytes&&model.readiness?.eligible).sort((a,b)=>a.bytes-b.bytes)[0] ??
