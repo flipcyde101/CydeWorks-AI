@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BFE Harness+</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="top"><a href="/" class="brand"><span class="mark" aria-hidden="true">◈</span> BFE Harness+</a><span class="mode">Local workspace</span></header>
+  <section id="unlock" class="panel">
+    <h1>Open workspace</h1>
+    <p>Choose <code>harness/.state/access.key</code> from the project folder.</p>
+    <label>Workspace access file<input id="access-file" type="file" accept=".key"></label>
+    <p id="access-status" role="status"></p>
+  </section>
+  <div class="workspace" id="workspace" hidden>
+    <aside class="rail">
+      <button id="new-task" class="primary">New task</button>
+      <section aria-labelledby="attention-title"><h2 id="attention-title">Needs you</h2><ul id="attention"></ul></section>
+      <nav aria-label="Workspace tasks"><ul id="tasks"></ul></nav>
+    </aside>
+    <main id="main">
+      <p id="notice" role="status" aria-live="polite"></p>
+      <section id="connection" class="panel" hidden aria-label="Workspace connection">
+        <p id="connection-message" role="status" aria-live="polite"></p>
+        <button id="reconnect" type="button">Reconnect now</button>
+      </section>
+      <section id="compose">
+        <h1>Create a task</h1>
+        <p class="muted">Supply the exact text you want the local model to use.</p>
+        <form id="create">
+          <div class="pair"><label>Task name<input name="title" required maxlength="120" value="Intake handoff"></label>
+          <label>Workflow<select name="kind"><option value="brief">Source brief</option><option value="change">File change proposal</option></select></label></div>
+          <label>Request<textarea name="request" rows="2" required maxlength="800">Summarize the handoff and flag what still needs a decision.</textarea></label>
+          <label>Approved source<textarea name="source" rows="7" required maxlength="5000">The intake checklist is drafted. Riley owns the review.
+The team has not decided who will approve the final checklist.</textarea></label>
+          <label>Load one text file into the source field<input type="file" id="file" accept=".txt,.md,.json,.js,.ts,.py,.csv,.html,.css,.yaml,.yml"></label>
+          <div class="pair" id="change-fields" hidden><label>File name<input name="filename" maxlength="100"></label>
+          <label>Expected text in the proposal<input name="expected" maxlength="400"></label></div>
+          <button type="submit" class="primary">Review scope</button>
+        </form>
+      </section>
+      <section id="detail" hidden>
+        <div class="heading"><h1 id="task-title" tabindex="-1"></h1><span id="status" class="pill"></span></div>
+        <p id="progress-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+        <div id="progress" class="panel" hidden></div>
+        <section id="terminal" class="panel" hidden aria-labelledby="terminal-title">
+          <div class="heading"><h2 id="terminal-title">OpenCode terminal</h2><span id="terminal-owner" class="pill"></span></div>
+          <p id="terminal-note" class="muted"></p>
+          <pre id="terminal-log" tabindex="0"></pre>
+          <div class="actions">
+            <button id="terminal-take">Take control</button><button id="terminal-release">Release</button>
+            <button id="terminal-status">Check status</button><button id="terminal-stop">Stop</button>
+            <button id="terminal-detach">Detach</button><button id="terminal-attach">Reattach</button>
+          </div>
+        </section>
+        <details class="panel" id="scope" open>
+          <summary>Scope and data</summary>
+          <dl id="scope-meta"></dl>
+          <p>Source snapshot</p><pre id="source"></pre>
+          <button id="edit" type="button">Edit draft scope</button>
+          <form id="run">
+            <label>Route<select id="model" required></select></label>
+            <button id="refresh-routes" type="button">Refresh routes</button>
+            <p id="destination" class="muted"></p>
+            <ul id="route-exclusions" class="muted" aria-label="Unavailable routes"></ul>
+            <label class="check"><input id="approve" type="checkbox" required> I approve this source snapshot for the selected route.</label>
+            <button class="primary" id="run-button" type="submit">Approve and run</button>
+          </form>
+        </details>
+        <section id="result" class="panel" hidden>
+          <h2>Review proposal</h2>
+          <p id="summary"></p>
+          <div id="comparison">
+            <div><h3>Approved source</h3><pre id="before"></pre></div>
+            <div><h3 id="proposal-label">Proposed result</h3><pre id="artifact"></pre></div>
+          </div>
+          <ul id="checks"></ul>
+          <p id="review-guidance" class="muted">These are structural checks only. Review accuracy, source support and whether the result actually completes your request before accepting.</p>
+          <details id="patch-review" hidden><summary>Unified patch</summary><pre id="patch"></pre></details>
+          <div class="actions">
+            <button id="accept" class="primary">Accept proposal</button><button id="reject">Reject</button>
+            <button id="download" hidden>Download accepted result</button>
+            <button id="download-patch" hidden>Download patch</button>
+          </div>
+        </section>
+        <section class="panel"><h2>Usage and attempts</h2><div id="usage"></div><div class="actions"><button id="export">Preview metadata export</button><button id="remove-task">Review task removal</button></div></section>
+        <details class="panel"><summary>Task history</summary><ol id="events"></ol></details>
+      </section>
+    </main>
+  </div>
+  <dialog id="export-dialog" aria-labelledby="export-title">
+    <h2 id="export-title">Preview metadata export</h2>
+    <p class="muted">Review exactly what will be downloaded. This does not remove data from your workspace or provider.</p>
+    <label>Export detail<select id="export-mode"><option value="minimal">Minimal metadata</option><option value="standard">Standard metadata</option></select></label>
+    <p id="export-description" class="muted"></p>
+    <p id="export-status" role="status" aria-live="polite"></p>
+    <pre id="export-preview" tabindex="0"></pre>
+    <div class="actions"><button id="export-save" class="primary" disabled>Download shown JSON</button><button id="export-close">Close</button></div>
+  </dialog>
+  <dialog id="removal-dialog" aria-labelledby="removal-title">
+    <h2 id="removal-title">Review task removal</h2>
+    <p id="removal-target"></p>
+    <p>Read what will be removed and what will remain. This does not securely erase files or remove provider copies.</p>
+    <p>After removal, the task form in this window will reset, including any unsaved text in that form.</p>
+    <pre id="removal-preview" tabindex="0"></pre>
+    <p id="removal-status" role="status" aria-live="polite"></p>
+    <label>Type REMOVE to confirm<input id="removal-confirmation" autocomplete="off"></label>
+    <div class="actions"><button id="removal-submit" disabled>Remove task record</button><button id="removal-close">Cancel</button></div>
+  </dialog>
+</body>
+</html>

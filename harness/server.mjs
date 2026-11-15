@@ -1,0 +1,387 @@
+import http from 'node:http';
+import {createHash, randomUUID, randomBytes, timingSafeEqual} from 'node:crypto';
+import {readFile, mkdir, writeFile} from 'node:fs/promises';
+import {freemem} from 'node:os';
+import {DatabaseSync} from 'node:sqlite';
+import {fileURLToPath} from 'node:url';
+import {resolve, dirname} from 'node:path';
+import {fixture, ollama, ollamaEndpoint} from './providers.mjs';
+import {unifiedPatch} from './patch.mjs';
+import {opencode} from './opencode.mjs';
+import {retryHold,recordInterruption,recordOutcomeUncertainty,recordObservedUsage} from './recovery.mjs';
+import {acquireWorkspaceLock} from './workspace-lock.mjs';
+import {exportTask} from './export.mjs';
+import {attentionFor} from './attention.mjs';
+import {assessRoute,matchesModelIdentity} from './route.mjs';
+import {createOwnerLease} from './owner-lease.mjs';
+import {previewRemoval,verifyRemoval} from './removal.mjs';
+
+const root = dirname(fileURLToPath(import.meta.url));
+const port = Number(process.env.BFE_PORT || 15371);
+if (!Number.isInteger(port)||port<0||port>65535) throw Error('The workspace port is invalid.');
+let host = '127.0.0.1:' + port;
+let origin = 'http://' + host;
+const database = process.env.BFE_TEST_MEMORY === '1' ? ':memory:' : resolve(root,'.state','workspace.sqlite');
+if (database !== ':memory:') await mkdir(dirname(database), {recursive:true});
+const workspaceLock=acquireWorkspaceLock(database);
+process.once('exit',()=>workspaceLock.close());
+const keyPath=resolve(root,'.state','access.key');
+let key=process.env.BFE_TEST_KEY;
+if (database !== ':memory:') {
+  try { await writeFile(keyPath,randomBytes(32).toString('hex'),{flag:'wx',mode:0o600}); }
+  catch (error) { if (error.code!=='EEXIST') throw error; }
+  key=(await readFile(keyPath,'utf8')).trim();
+}
+if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
+const session=randomBytes(32).toString('hex');
+const removalSecret=randomBytes(32);
+function equal(candidate, expected) {
+  return typeof candidate==='string' && /^[a-f0-9]{64}$/.test(candidate) &&
+    timingSafeEqual(Buffer.from(candidate),Buffer.from(expected));
+}
+const db = new DatabaseSync(database);
+db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+  CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, updated TEXT NOT NULL, data TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS task_removal_audit (id INTEGER PRIMARY KEY, reference TEXT NOT NULL, removed_at TEXT NOT NULL, scope TEXT NOT NULL)`);
+const saveRow = db.prepare('INSERT INTO tasks VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET updated=excluded.updated,data=excluded.data');
+const find = db.prepare('SELECT data FROM tasks WHERE id=?');
+const list = db.prepare('SELECT data FROM tasks ORDER BY updated DESC');
+const all = () => list.all().map(row => JSON.parse(row.data));
+const now = () => new Date().toISOString();
+const hash = value => createHash('sha256').update(value).digest('hex');
+const providers = {fixture, ollama, opencode};
+const assets = new Map(await Promise.all([
+  ['/', 'index.html','text/html'], ['/app.js','app.js','text/javascript'], ['/style.css','style.css','text/css'],
+  ['/observer.js','observer.js','text/javascript'],
+  ['/export-dialog.js','export-dialog.js','text/javascript'],
+  ['/usage.js','usage.js','text/javascript'],
+  ['/progress.js','progress.js','text/javascript'],
+  ['/removal-dialog.js','removal-dialog.js','text/javascript'],
+].map(async ([route,file,type]) => [route,{data:await readFile(resolve(root,'web',file)),type}])));
+let active;
+
+function save(task, event) {
+  task.version++;
+  const at = now();
+  task.events.push({seq:task.version, at, event});
+  saveRow.run(task.id,at,JSON.stringify(task));
+}
+function fail(status, message) {
+  throw Object.assign(Error(message), {status});
+}
+function need(value, max, label, allowEmpty = false) {
+  if (typeof value !== 'string' || value.length > max || (!allowEmpty && !value.trim())) fail(400,'Invalid ' + label + '.');
+  return value;
+}
+function latest(task) {
+  return task.attempts.at(-1);
+}
+function currentLease(run) {
+  if (run.lease && run.lease.expires<=Date.now()) run.lease=undefined;
+  return run.lease;
+}
+function view(task) {
+  const run=active?.taskId===task.id ? active : null;
+  const hold=retryHold(task);
+  return {...task, recovery:hold?{blocked:true,message:hold}:null, live:run ? {chars:run.chars,heartbeat:now(),lastActivity:run.lastActivity,
+    stopping:run.controller.signal.aborted,terminal:run.terminal,owner:currentLease(run) ? 'Operator' : 'None'} : null};
+}
+function scope(data) {
+  if (!['change','brief'].includes(data.kind)) fail(400,'Choose a supported workflow.');
+  const title=need(data.title,120,'title'), request=need(data.request,800,'request'), source=need(data.source,5000,'source');
+  const filename=data.kind==='change' ? need(data.filename,100,'file name') : null;
+  if (filename && (!/^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/.test(filename) || filename.endsWith('.'))) fail(400,'Enter a single file name without folders.');
+  const expected=data.kind==='change' ? need(data.expected,400,'expected text') : null;
+  return {kind:data.kind,title,request,source,filename,expected,sourceHash:hash(source)};
+}
+function inspect(task, result) {
+  const artifact = result.artifact;
+  if (!artifact || typeof artifact.summary !== 'string' || typeof artifact.content !== 'string' ||
+      !artifact.content.trim() || artifact.content.length > 12000 || artifact.summary.length > 1200) {
+    return {artifact:null, checks:[], problem:result.problem ?? 'The model returned an invalid proposal.'};
+  }
+  const checks = task.kind === 'change'
+    ? [{name:'Proposed content differs from the approved snapshot', pass:artifact.content !== task.source},
+       {name:'Contains the operator’s expected text', pass:artifact.content.includes(task.expected)}]
+    : [{name:'Every citation points to a supplied source and at least one is present', pass:(() => {
+      const refs = [...artifact.content.matchAll(/\[(\d+)\]/g)];
+      const count = task.source.split(/\n+/).filter(line => line.trim()).length;
+      return refs.length > 0 && refs.every(ref => +ref[1] >= 1 && +ref[1] <= count);
+    })()}];
+  const patch=task.kind==='change' ? unifiedPatch(task.filename,task.source,artifact.content) : null;
+  return {artifact:{summary:artifact.summary,content:artifact.content,sha256:hash(artifact.content),patch},checks};
+}
+
+async function execute(task, run) {
+  const attempt = latest(task);
+  try {
+    const adapter = providers[attempt.provider];
+    const choices = await adapter.models();
+    const selected = choices.find(model => model.id === task.model);
+    if (!selected) throw Error('The selected local model is unavailable or exceeds the configured model limit.');
+    if(attempt.provider!=='fixture'&&!matchesModelIdentity(attempt.approvedModelDigest,selected.digest))
+      throw Error('The model identity changed or is unavailable. Refresh routes and approve the current model again.');
+    run.controller.signal.throwIfAborted();
+    const readiness=assessRoute({...selected,engine:attempt.provider},freemem());
+    if(!readiness.eligible)throw Error(readiness.reason);
+    attempt.modelDigest = selected.digest;
+    attempt.quantization = selected.quantization ?? null;
+    run.controller.signal.throwIfAborted();
+    attempt.execution.phase='dispatching';
+    attempt.execution.dispatchedAt=now();
+    // Persist before crossing the provider boundary. A crash after this point
+    // is conservatively treated as an unknown outcome.
+    save(task,'attempt.dispatching');
+    const result = await adapter.run(task, {
+      attemptId:attempt.id,
+      signal:AbortSignal.any([run.controller.signal, AbortSignal.timeout(120000)]),
+      progress(chars) { if (chars !== run.chars) { run.chars=chars; run.lastActivity=now(); } },
+      terminal(message) { addTerminal(run,message); },
+    });
+    attempt.usage = result.usage;
+    if (result.settled===true) attempt.execution.phase='settled';
+    else recordOutcomeUncertainty(attempt,now());
+    if (result.sessionId) attempt.engineSessionId=result.sessionId;
+    Object.assign(attempt,inspect(task,result));
+    task.status = attempt.artifact ? 'review' : 'failed';
+  } catch (error) {
+    recordObservedUsage(attempt,error);
+    recordOutcomeUncertainty(attempt,now());
+    task.status = run.controller.signal.aborted ? 'cancelled' : 'failed';
+    attempt.problem = run.controller.signal.aborted
+      ? error.processExited ? error.message : 'Harness+ ended its request. Provider process termination has not been verified.'
+      : error.name === 'TimeoutError' ? 'The local request exceeded 120 seconds. Check the recovery status before trying again.'
+      : error instanceof TypeError || error instanceof SyntaxError ? 'The local provider connection or response was invalid.'
+      : error.message;
+  } finally {
+    addTerminal(run,'Attempt '+task.status+'.');
+    attempt.terminal=run.terminal;
+    attempt.status=task.status;
+    attempt.ended=now();
+    attempt.elapsedMs=Date.parse(attempt.ended)-Date.parse(attempt.started);
+    save(task,'attempt.'+task.status);
+    active=undefined;
+  }
+}
+
+function addTerminal(run,message) {
+  if (run.terminal.at(-1)?.message===message) return;
+  run.terminal.push({at:now(),message});
+  if (run.terminal.length>150) run.terminal.shift();
+}
+
+async function jsonBody(request) {
+  if (request.headers['content-type']?.split(';')[0] !== 'application/json') fail(415,'Use application/json.');
+  const chunks = [];
+  let size=0;
+  for await (const chunk of request) {
+    size+=chunk.length;
+    if (size>48000) fail(413,'Request exceeds the input limit.');
+    chunks.push(chunk);
+  }
+  try {
+    const data=JSON.parse(Buffer.concat(chunks).toString());
+    if (!data || typeof data !== 'object' || Array.isArray(data)) fail(400,'Expected a JSON object.');
+    return data;
+  } catch {
+    fail(400,'Invalid JSON request.');
+  }
+}
+
+const server=http.createServer(async (req,res) => {
+  const send=(status,value) => {
+    res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});
+    res.end(JSON.stringify(value));
+  };
+  res.setHeader('Cache-Control','no-store');
+  res.setHeader('X-Content-Type-Options','nosniff');
+  res.setHeader('Content-Security-Policy',"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'");
+  try {
+    if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== origin) ||
+        req.headers['sec-fetch-site'] === 'cross-site' || req.headers['sec-fetch-site'] === 'same-site') fail(403,'Use the Harness+ loopback address.');
+    const url=new URL(req.url,origin);
+    const path=url.pathname;
+    if (req.method==='GET' && assets.has(path)) {
+      const asset=assets.get(path);
+      res.writeHead(200,{'Content-Type':asset.type+'; charset=utf-8'});
+      return res.end(asset.data);
+    }
+    if (req.method==='POST' && req.headers.origin !== origin) fail(403,'A same-origin approval is required.');
+    if (req.method==='POST' && path==='/api/session') {
+      const data=await jsonBody(req);
+      if (!equal(data.key,key)) fail(401,'Choose this workspace’s access.key file.');
+      res.setHeader('Set-Cookie','bfe_session='+session+'; HttpOnly; SameSite=Strict; Path=/api');
+      return send(200,{authorized:true});
+    }
+    const cookie=req.headers.cookie?.split(';').map(value=>value.trim()).find(value=>value.startsWith('bfe_session='));
+    if (!equal(cookie?.slice('bfe_session='.length),session)) fail(401,'Unlock this workspace with its local access.key file.');
+    if (req.method==='GET' && path==='/api/models') {
+      const [installed,engines]=await Promise.all([ollama.models().catch(()=>[]),opencode.models().catch(()=>[])]);
+      const available=freemem();
+      const models=[...engines.map(model=>({...model,engine:'opencode'})),
+        ...installed.map(model=>({...model,engine:'ollama'})),
+        ...(await fixture.models()).map(model=>({...model,engine:'fixture'}))];
+      return send(200,{models:models.map(model=>({...model,endpoint:model.engine==='fixture'?null:ollamaEndpoint,
+        readiness:assessRoute(model,available)}))});
+    }
+    if (req.method==='GET' && path==='/api/tasks') {
+      return send(200,{tasks:all().map(({id,title,kind,status}) => ({id,title,kind,status}))});
+    }
+    if (req.method==='GET' && path==='/api/attention') {
+      return send(200,{tasks:all().map(attentionFor).filter(Boolean)});
+    }
+    if (req.method==='GET' && path==='/api/removal-audit') {
+      return send(200,{records:db.prepare('SELECT reference,removed_at AS removedAt,scope FROM task_removal_audit ORDER BY id DESC LIMIT 100').all()});
+    }
+    if (req.method==='POST' && path==='/api/tasks') {
+      const data=await jsonBody(req);
+      if (all().length>=100) fail(409,'This workspace has reached its 100-task capacity.');
+      const task={id:randomUUID(),version:0,status:'draft',...scope(data),model:null,attempts:[],events:[]};
+      save(task,'task.created');
+      return send(201,view(task));
+    }
+    const match=/^\/api\/tasks\/([a-f0-9-]{36})(?:\/(scope|run|cancel|review|export|terminal|removal-preview|remove))?$/.exec(path);
+    if (!match) fail(404,'Route not found.');
+    const [,id,action]=match;
+    if (req.method==='GET' && (!action || action==='export' || action==='removal-preview')) {
+      const row=find.get(id);
+      if (!row) fail(404,'Task not found.');
+      const task=JSON.parse(row.data);
+      return send(200,action==='export' ? exportTask(task,url.searchParams.get('mode')??'standard')
+        :action==='removal-preview'?previewRemoval(task,{secret:removalSecret,active:active?.taskId===id}):view(task));
+    }
+    if (req.method!=='POST') fail(405,'Unsupported method.');
+    const data=await jsonBody(req);
+    // Read after awaiting the body, so concurrent submissions use current state.
+    const row=find.get(id);
+    if (!row) fail(404,'Task not found.');
+    const task=JSON.parse(row.data);
+    if (action==='terminal') {
+      if (active?.taskId!==id || latest(task)?.provider!=='opencode') fail(409,'No active OpenCode terminal.');
+      const run=active;
+      const lease=currentLease(run);
+      if (data.command==='take') {
+        if (run.controller.signal.aborted || (lease && data.confirm!==true)) fail(409,'The terminal is already controlled or stopping.');
+        run.lease={id:randomUUID(),expires:Date.now()+15000};
+        addTerminal(run,lease?'Operator transferred control to this view.':'Operator took control.');
+        return send(200,{lease:run.lease.id});
+      }
+      if (!lease || data.lease!==lease.id) fail(409,'Terminal control expired or belongs to another view.');
+      if (data.command==='heartbeat') lease.expires=Date.now()+15000;
+      else if (data.command==='release' || data.command==='detach') {
+        run.lease=undefined;
+        addTerminal(run,data.command==='release'?'Operator released control.':'Operator detached. OpenCode continues.');
+      } else if (data.command==='status') addTerminal(run,run.controller.signal.aborted?'Stop is pending.':'OpenCode is running.');
+      else if (data.command==='stop' && data.confirm===true) {
+        run.lease=undefined;
+        addTerminal(run,'Operator requested Stop.');
+        run.controller.abort();
+      } else fail(400,'Choose a supported terminal control.');
+      return send(200,{accepted:true});
+    }
+    if (data.version!==task.version) fail(409,'This task changed. Refresh and review its current state.');
+    if (action==='remove') {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const currentRow=find.get(id);
+        if(!currentRow)fail(404,'Task not found.');
+        const current=JSON.parse(currentRow.data);
+        verifyRemoval(current,data,{secret:removalSecret,active:active?.taskId===id});
+        const removed=db.prepare('DELETE FROM tasks WHERE id=?').run(id);
+        if(removed.changes!==1)fail(409,'The task changed. Refresh before trying again.');
+        db.prepare('INSERT INTO task_removal_audit (reference,removed_at,scope) VALUES (?,?,?)')
+          .run(hash('task-removal:'+id),now(),'workspace-record-only-v1');
+        db.exec('COMMIT');
+      } catch(error) {db.exec('ROLLBACK');throw error;}
+      return send(200,{removed:true,scope:'workspace-record-only-v1'});
+    } else if (action==='scope') {
+      if (task.status!=='draft') fail(409,'Create a new task to change an already approved scope.');
+      Object.assign(task,scope(data));
+      save(task,'scope.updated');
+      return send(200,view(task));
+    } else if (action==='run') {
+      if (active) fail(409,'Another attempt is still active.');
+      if (['running','cancelling','review'].includes(task.status)) fail(409,'Resolve the current attempt before starting another.');
+      const hold=retryHold(task);
+      if (hold) fail(409,hold);
+      if (task.attempts.length>=20) fail(409,'This task has reached its 20-attempt capacity.');
+      if (data.approve!==true || data.sourceHash!==task.sourceHash) fail(409,'Confirm the current source snapshot.');
+      task.model=need(data.model,100,'model');
+      const provider=data.engine ?? (task.model==='fixture'?'fixture':'ollama');
+      if (!Object.hasOwn(providers,provider) || (provider==='fixture')!==(task.model==='fixture')) fail(400,'Choose a supported route.');
+      const approvedModelDigest=provider==='fixture'?null:data.modelDigest;
+      if(provider!=='fixture'&&!matchesModelIdentity(approvedModelDigest,approvedModelDigest))
+        fail(400,'Refresh routes and select a model with a reported digest.');
+      const attempt={id:randomUUID(), model:task.model,provider,started:now(),status:'running', usage:null,
+        approvedModelDigest,scopeHash:hash(JSON.stringify([task.sourceHash,task.request,task.expected,task.kind,task.model,provider,approvedModelDigest]))};
+      attempt.execution={phase:'claimed',claimId:attempt.id,claimedAt:now()};
+      task.attempts.push(attempt);
+      task.status='running';
+      save(task,'attempt.approved_and_started');
+      const run={taskId:id,controller:new AbortController(),chars:0,lastActivity:now(),terminal:[],lease:undefined};
+      addTerminal(run,'Scope approved. Checking the selected route.');
+      active=run;
+      send(202,view(task));
+      void execute(task,run);
+    } else if (action==='cancel') {
+      if (active?.taskId!==id || task.status!=='running') fail(409,'No active request can be cancelled.');
+      if (latest(task)?.provider==='opencode') fail(409,'Use Stop in the OpenCode terminal.');
+      // The executor owns its in-memory copy and records the final outcome.
+      active.controller.abort();
+      return send(202,{status:'cancelling'});
+    } else if (action==='review') {
+      const attempt=latest(task);
+      if (task.status!=='review' || data.artifactHash!==attempt?.artifact?.sha256) fail(409,'The proposal changed or is no longer reviewable.');
+      if (!['accepted','rejected'].includes(data.decision)) fail(400,'Choose Accept or Reject.');
+      if (data.decision==='accepted' && attempt.checks.some(check => !check.pass)) fail(409,'Resolve failed checks before accepting.');
+      task.status=attempt.status=data.decision;
+      save(task,'review.'+data.decision);
+      return send(200,view(task));
+    } else fail(404,'Route not found.');
+  } catch (error) {
+    if (!res.headersSent) send(error.status || 500,{error:error.status ? error.message : 'Harness+ could not complete this operation.'});
+    else res.end();
+  }
+});
+
+const utilityParent=process.env.BFE_DESKTOP_BOOTSTRAP==='1'?process.parentPort:null;
+const nodeParent=process.env.BFE_DESKTOP_BOOTSTRAP==='1'&&process.channel&&process.send?true:false;
+const testTimeout=database===':memory:'?Number(process.env.BFE_TEST_OWNER_TIMEOUT_MS):NaN;
+const ownerTimeout=Number.isInteger(testTimeout)&&testTimeout>=100&&testTimeout<=10000?testTimeout:15000;
+const ownerLease=utilityParent?createOwnerLease(ownerTimeout):null;
+function desktopSend(message) {
+  if(utilityParent)utilityParent.postMessage(message);
+  else if(nodeParent&&process.connected)process.send(message);
+}
+function closeOrphanedWorkspace() {
+  server.closeAllConnections();
+  server.close();
+  process.exit(0);
+}
+function desktopMessage(message) {
+    if(ownerLease?.expired()){closeOrphanedWorkspace();return;}
+    if(message?.type==='bfe-owner-heartbeat' && ownerLease && !ownerLease.renew()){closeOrphanedWorkspace();return;}
+    if(message?.type==='bfe-status-query' && typeof message.id==='string' &&
+      /^[a-f0-9-]{36}$/.test(message.id)) {
+      desktopSend({type:'bfe-status-result',id:message.id,active:!!active});
+    }
+}
+if(utilityParent) {
+  utilityParent.on('message',event=>desktopMessage(event.data));
+  const watchdog=setInterval(()=>{if(ownerLease.expired())closeOrphanedWorkspace();},Math.min(2000,Math.max(50,ownerTimeout/2)));
+  watchdog.unref();
+} else if(nodeParent) {
+  process.on('message',desktopMessage);
+  process.once('disconnect',closeOrphanedWorkspace);
+}
+
+server.listen(port,'127.0.0.1',() => {
+  host='127.0.0.1:'+server.address().port;
+  origin='http://'+host;
+  for (const task of all().filter(task => task.status==='running')) {
+    recordInterruption(task,now());
+    save(task,'attempt.interrupted');
+  }
+  console.log('BFE Harness+ is available at '+origin);
+  if(utilityParent||nodeParent)desktopSend({type:'bfe-desktop-ready',port:server.address().port,session});
+});
