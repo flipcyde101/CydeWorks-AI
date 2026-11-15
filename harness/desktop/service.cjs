@@ -4,7 +4,7 @@ const {randomUUID}=require('node:crypto');
 const {EventEmitter}=require('node:events');
 
 function createUtilityWorker(utilityProcess,serverPath,env) {
-  const worker=utilityProcess.fork(serverPath,[],{env,stdio:'pipe',serviceName:'BFE Harness workspace'});
+  const worker=utilityProcess.fork(serverPath,[],{env,stdio:'pipe',serviceName:'CydeWorks AI workspace'});
   const child=new EventEmitter();
   Object.assign(child,{connected:true,exitCode:null,signalCode:null,killed:false,stdout:worker.stdout,stderr:worker.stderr});
   child.send=(message,callback)=>{

@@ -12,7 +12,7 @@ export function acquireWorkspaceLock(database) {
   } catch(error) {
     lock.close();
     if (/database is (?:locked|busy)/i.test(error.message)) {
-      throw new Error('This workspace is already open in another Harness+ service.');
+      throw new Error('This workspace is already open in another CydeWorks AI service.');
     }
     throw error;
   }

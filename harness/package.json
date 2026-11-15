@@ -1,5 +1,5 @@
 {
-  "name": "bfe-harness-plus",
+  "name": "cydeworks-ai",
   "private": true,
   "type": "module",
   "scripts": {"start":"node server.mjs","test":"node --test"}

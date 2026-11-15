@@ -116,7 +116,7 @@ export const opencode={
     const config={
       enabled_providers:['harness-ollama'],model,small_model:model,autoupdate:false,share:'disabled',
       permission:{'*':'deny',external_directory:'deny'},
-      provider:{'harness-ollama':{npm:'@ai-sdk/openai-compatible',name:'Harness+ local Ollama',
+      provider:{'harness-ollama':{npm:'@ai-sdk/openai-compatible',name:'CydeWorks AI local Ollama',
         options:{baseURL:ollamaEndpoint+'/v1'},
         models:{[task.model]:{name:task.model,limit:{context:4096,output:768},
           options:{reasoningEffort:'none',reasoning_effort:'none'}}},
@@ -132,7 +132,7 @@ export const opencode={
       OPENCODE_DISABLE_DEFAULT_PLUGINS:'true',OPENCODE_DISABLE_LSP_DOWNLOAD:'true',
       OPENCODE_DISABLE_NONINTERACTIVE_TTY:'true'});
     signal.throwIfAborted();
-    const child=spawn(executable,['run','--pure','--format','json','--model',model,'--file',input,'--title','Harness+ approved task'],{
+    const child=spawn(executable,['run','--pure','--format','json','--model',model,'--file',input,'--title','CydeWorks AI approved task'],{
       cwd:dir,env,windowsHide:true,stdio:['pipe','pipe','pipe'],
     });
     // Keep the approved request out of the operating system's command-line listing.

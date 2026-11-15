@@ -1,6 +1,8 @@
-# BFE Harness+
+# CydeWorks AI
 
-BFE Harness+ is an experimental, local-first workspace for reviewing AI-assisted briefs and single-file change proposals. This is the latest tested preview snapshot, not a stable release or a finished autonomous coding product.
+**Your AI. Your agents. Your work.**
+
+CydeWorks AI is an experimental, local-first workspace for reviewing AI-assisted briefs and single-file change proposals. This is the latest tested preview snapshot, not a stable release or a finished autonomous coding product.
 
 ## What works in this preview
 
@@ -37,6 +39,6 @@ From `harness`, run `npm test`. The latest complete run of the source used for t
 
 ## License
 
-The BFE Harness+ source in this repository is available under the [MIT License](LICENSE).
+The CydeWorks AI source in this repository is available under the [MIT License](LICENSE).
 
 OpenCode and Ollama are external candidate integrations. Electron is an optional development dependency. None of their source or binaries is bundled in this snapshot, and those projects have their own licenses.

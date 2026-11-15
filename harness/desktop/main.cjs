@@ -66,7 +66,7 @@ async function createWorkspace() {
   service.session=undefined;
   if(!serviceAlive)throw Error('The local workspace stopped during startup.');
   window=new BrowserWindow({width:1280,height:850,minWidth:720,minHeight:560,show:false,
-    title:'BFE Harness+',webPreferences:{session:browserSession,nodeIntegration:false,contextIsolation:true,
+    title:'CydeWorks AI',webPreferences:{session:browserSession,nodeIntegration:false,contextIsolation:true,
       sandbox:true,webSecurity:true,webviewTag:false}});
   window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   window.webContents.on('will-navigate',(event,url)=>{
@@ -107,7 +107,7 @@ async function createWorkspace() {
   window.show();
 }
 app.whenReady().then(createWorkspace).catch(error=>{
-  dialog.showErrorBox('BFE Harness+ could not open',error.message);
+  dialog.showErrorBox('CydeWorks AI could not open',error.message);
   app.quit();
 });
 app.on('window-all-closed',()=>app.quit());

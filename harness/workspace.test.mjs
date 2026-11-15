@@ -35,7 +35,7 @@ test(liveOpenCode?'live OpenCode and Ollama approval, terminal controls, review 
     once(child.stdout,'data').then(([chunk])=>chunk.toString()),
     once(child,'exit').then(([code])=>{throw Error('Workspace exited with '+code);}),
   ]);
-  assert.match(started,/BFE Harness\+/);
+  assert.match(started,/CydeWorks AI/);
   const send=(path,body,headers={})=>fetch(origin+path,{
     method:body===undefined?'GET':'POST',
     headers:{Origin:origin,'Content-Type':'application/json',...headers},

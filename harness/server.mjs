@@ -149,7 +149,7 @@ async function execute(task, run) {
     recordOutcomeUncertainty(attempt,now());
     task.status = run.controller.signal.aborted ? 'cancelled' : 'failed';
     attempt.problem = run.controller.signal.aborted
-      ? error.processExited ? error.message : 'Harness+ ended its request. Provider process termination has not been verified.'
+      ? error.processExited ? error.message : 'CydeWorks AI ended its request. Provider process termination has not been verified.'
       : error.name === 'TimeoutError' ? 'The local request exceeded 120 seconds. Check the recovery status before trying again.'
       : error instanceof TypeError || error instanceof SyntaxError ? 'The local provider connection or response was invalid.'
       : error.message;
@@ -198,7 +198,7 @@ const server=http.createServer(async (req,res) => {
   res.setHeader('Content-Security-Policy',"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'");
   try {
     if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== origin) ||
-        req.headers['sec-fetch-site'] === 'cross-site' || req.headers['sec-fetch-site'] === 'same-site') fail(403,'Use the Harness+ loopback address.');
+        req.headers['sec-fetch-site'] === 'cross-site' || req.headers['sec-fetch-site'] === 'same-site') fail(403,'Use the CydeWorks AI loopback address.');
     const url=new URL(req.url,origin);
     const path=url.pathname;
     if (req.method==='GET' && assets.has(path)) {
@@ -339,7 +339,7 @@ const server=http.createServer(async (req,res) => {
       return send(200,view(task));
     } else fail(404,'Route not found.');
   } catch (error) {
-    if (!res.headersSent) send(error.status || 500,{error:error.status ? error.message : 'Harness+ could not complete this operation.'});
+    if (!res.headersSent) send(error.status || 500,{error:error.status ? error.message : 'CydeWorks AI could not complete this operation.'});
     else res.end();
   }
 });
@@ -382,6 +382,6 @@ server.listen(port,'127.0.0.1',() => {
     recordInterruption(task,now());
     save(task,'attempt.interrupted');
   }
-  console.log('BFE Harness+ is available at '+origin);
+  console.log('CydeWorks AI is available at '+origin);
   if(utilityParent||nodeParent)desktopSend({type:'bfe-desktop-ready',port:server.address().port,session});
 });
