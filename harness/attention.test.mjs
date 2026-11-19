@@ -6,24 +6,25 @@ import {describeProgress} from './web/progress.js';
 const start = '2026-11-14T12:00:00.000Z';
 const then = Date.parse(start);
 
-function makeRunningTask({
-  id = 'task-1',
-  title = 'Synthetic task',
-  status = 'running',
-  attemptId = 'attempt-2',
-  attemptStatus = 'running',
-  executionPhase = 'dispatching',
-  dispatchedAt = start,
-  started = start,
-  ended = undefined,
-  recovery = undefined,
-  live = undefined,
-  extraAttempts = [],
-} = {}) {
+function makeRunningTask(options = {}) {
+  const has = key => Object.prototype.hasOwnProperty.call(options, key);
+  const id = has('id') ? options.id : 'task-1';
+  const title = has('title') ? options.title : 'Synthetic task';
+  const status = has('status') ? options.status : 'running';
+  const attemptId = has('attemptId') ? options.attemptId : 'attempt-2';
+  const attemptStatus = has('attemptStatus') ? options.attemptStatus : 'running';
+  const executionPhase = has('executionPhase') ? options.executionPhase : 'dispatching';
+  const dispatchedAt = has('dispatchedAt') ? options.dispatchedAt : start;
+  const started = has('started') ? options.started : start;
+  const ended = has('ended') ? options.ended : undefined;
+  const recovery = has('recovery') ? options.recovery : undefined;
+  const live = has('live') ? options.live : undefined;
+  const extraAttempts = has('extraAttempts') ? options.extraAttempts : [];
+
   const currentAttempt = {
-    id: attemptId,
     provider: 'opencode',
-    started,
+    ...(attemptId !== undefined ? {id: attemptId} : {}),
+    ...(started !== undefined ? {started} : {}),
     ...(attemptStatus !== undefined ? {status: attemptStatus} : {}),
     ...(ended !== undefined ? {ended} : {}),
     ...(recovery !== undefined ? {recovery} : {}),
@@ -261,11 +262,18 @@ test('claimed/preflight, missing execution, and settled attempt states never rep
   const claimedTask = makeRunningTask({attemptId: 'att-claimed', executionPhase: 'claimed'});
   assert.equal(attentionFor(claimedTask, {attemptId: 'att-claimed', progress: stalledSnapshot}), null);
 
+  const preflightTask = makeRunningTask({attemptId: 'att-preflight', executionPhase: 'preflight'});
+  assert.equal(attentionFor(preflightTask, {attemptId: 'att-preflight', progress: stalledSnapshot}), null);
+
   const missingExecTask = makeRunningTask({attemptId: 'att-no-exec', executionPhase: undefined});
   assert.equal(attentionFor(missingExecTask, {attemptId: 'att-no-exec', progress: stalledSnapshot}), null);
 
   const settledExecTask = makeRunningTask({attemptId: 'att-settled', executionPhase: 'settled'});
   assert.equal(attentionFor(settledExecTask, {attemptId: 'att-settled', progress: stalledSnapshot}), null);
+
+  const settledFlagTask = makeRunningTask({attemptId: 'att-settled-flag', executionPhase: 'dispatching'});
+  settledFlagTask.attempts[0].execution.settled = true;
+  assert.equal(attentionFor(settledFlagTask, {attemptId: 'att-settled-flag', progress: stalledSnapshot}), null);
 });
 
 test('missing and mismatched attempt IDs never trigger a stall', () => {
@@ -303,6 +311,7 @@ test('missing and mismatched attempt IDs never trigger a stall', () => {
   // Attempt record missing its own id
   const noAttemptIdTask = makeRunningTask({attemptId: undefined});
   assert.equal(attentionFor(noAttemptIdTask, {attemptId: 'att-current', progress: stalledSnapshot}), null);
+  assert.equal(attentionFor(noAttemptIdTask, {attemptId: 'attempt-2', progress: stalledSnapshot}), null);
 
   // Matching current attemptId succeeds
   const matched = attentionFor(task, {attemptId: 'att-current', progress: stalledSnapshot});
@@ -493,10 +502,17 @@ test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fa
       throw new Error('trap');
     },
   });
+  const protoThrowingProxy = new Proxy({}, {
+    getPrototypeOf() {
+      throw new Error('proto-trap');
+    },
+  });
   assert.equal(attentionFor(throwingProxy), null);
+  assert.equal(attentionFor(protoThrowingProxy), null);
 
   const validTask = makeRunningTask({id: 'guard-1', attemptId: 'att-guard'});
   assert.equal(attentionFor(validTask, throwingProxy), null);
+  assert.equal(attentionFor(validTask, protoThrowingProxy), null);
   assert.equal(attentionFor(validTask, {attemptId: 'att-guard', progress: throwingProxy}), null);
 
   // Malformed attempts / checks do not throw on existing statuses.
@@ -535,6 +551,7 @@ test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fa
     {...baseStall, lastActivity: then - 1_000}, // before attempt start
     {...baseStall, lastActivityAt: new Date(then + 9_000).toISOString()}, // mismatches lastActivity
     {...baseStall, idleMs: 59_999},
+    {...baseStall, elapsedMs: null},
     {...baseStall, idleMs: 70_000, elapsedMs: 65_000}, // idle exceeds elapsed
     {...baseStall, stopping: true},
     {...baseStall, failed: true},

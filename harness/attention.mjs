@@ -138,11 +138,11 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
   if (attempt.status !== undefined && attempt.status !== 'running') return false;
   if (attempt.ended !== undefined && attempt.ended !== null) return false;
   if (attempt.recovery?.state === 'unresolved') return false;
-  if (attempt.execution?.phase !== 'dispatching') return false;
-
-  if (!isPlainObject(options)) return false;
+  if (attempt.execution?.phase !== 'dispatching' || attempt.execution?.settled === true) return false;
 
   try {
+    if (!isPlainObject(options)) return false;
+
     const rawProgress = ownData(options, 'progress');
     if (!isPlainObject(rawProgress)) return false;
 
@@ -238,16 +238,25 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
       return false;
     }
 
-    const elapsedMs = ownData(rawProgress, 'elapsedMs');
-    if (elapsedMs !== undefined && elapsedMs !== null) {
-      if (typeof elapsedMs !== 'number' || !Number.isFinite(elapsedMs) || elapsedMs < 0 || idleMs > elapsedMs) {
-        return false;
-      }
-    }
-
     const attemptStartedMs = parseTimestampMs(attempt.started);
     if (attemptStartedMs === null || lastActivity < attemptStartedMs) {
       return false;
+    }
+
+    const elapsedMs = ownData(rawProgress, 'elapsedMs');
+    if (elapsedMs === null) {
+      return false;
+    }
+    if (elapsedMs !== undefined) {
+      if (
+        typeof elapsedMs !== 'number'
+        || !Number.isFinite(elapsedMs)
+        || elapsedMs < 0
+        || idleMs > elapsedMs
+        || (lastActivity - attemptStartedMs) + idleMs > elapsedMs
+      ) {
+        return false;
+      }
     }
 
     if (attempt.execution.dispatchedAt !== undefined && attempt.execution.dispatchedAt !== null) {
@@ -292,8 +301,6 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
  *   are never surfaced.
  */
 export function attentionFor(task, options = undefined) {
-  if (!isPlainObject(task)) return null;
-
   let id;
   let title;
   let status;
@@ -302,6 +309,8 @@ export function attentionFor(task, options = undefined) {
   let liveStopping = false;
 
   try {
+    if (!isPlainObject(task)) return null;
+
     const rawId = ownData(task, 'id');
     if (typeof rawId !== 'string' || CONTROL_CHARS_RE.test(rawId)) return null;
     const trimmedId = rawId.trim();
@@ -332,8 +341,19 @@ export function attentionFor(task, options = undefined) {
     }
 
     const rawLive = ownData(task, 'live');
-    if (isPlainObject(rawLive) && ownData(rawLive, 'stopping') === true) {
-      liveStopping = true;
+    if (isPlainObject(rawLive)) {
+      const liveError = ownData(rawLive, 'error');
+      const liveEndedAt = ownData(rawLive, 'endedAt');
+      if (
+        ownData(rawLive, 'stopping') === true
+        || ownData(rawLive, 'failed') === true
+        || ownData(rawLive, 'complete') === true
+        || (liveEndedAt !== undefined && liveEndedAt !== null)
+        || (typeof liveError === 'string' && liveError.trim().length > 0)
+        || isPlainObject(liveError)
+      ) {
+        liveStopping = true;
+      }
     }
 
     const rawAttempts = ownData(task, 'attempts');
@@ -376,11 +396,13 @@ export function attentionFor(task, options = undefined) {
         if (isPlainObject(rawExecution)) {
           const phase = ownData(rawExecution, 'phase');
           const dispatchedAt = ownData(rawExecution, 'dispatchedAt');
+          const settled = ownData(rawExecution, 'settled');
           execution = {
             phase: typeof phase === 'string' ? phase : undefined,
-            dispatchedAt: typeof dispatchedAt === 'string' || typeof dispatchedAt === 'number'
+            settled: settled === true,
+            dispatchedAt: dispatchedAt === undefined || dispatchedAt === null
               ? dispatchedAt
-              : undefined,
+              : (typeof dispatchedAt === 'string' || typeof dispatchedAt === 'number' ? dispatchedAt : Number.NaN),
           };
         }
 
@@ -388,7 +410,11 @@ export function attentionFor(task, options = undefined) {
           id: typeof rawAttemptId === 'string' && !CONTROL_CHARS_RE.test(rawAttemptId)
             ? rawAttemptId.trim()
             : undefined,
-          status: typeof rawAttemptStatus === 'string' ? rawAttemptStatus.trim() : undefined,
+          status: rawAttemptStatus === undefined
+            ? undefined
+            : typeof rawAttemptStatus === 'string'
+              ? rawAttemptStatus.trim()
+              : null,
           provider: typeof rawProvider === 'string' ? rawProvider : undefined,
           started: typeof rawStarted === 'string' || typeof rawStarted === 'number' ? rawStarted : undefined,
           ended: rawEnded === undefined ? undefined : rawEnded,
