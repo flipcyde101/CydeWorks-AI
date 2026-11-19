@@ -32,7 +32,9 @@ These are coordinator operating rules, not a verified automatic quota watcher or
 
 ## Current route hold
 
-On November 19 at 10:41 a.m. America/Denver, `claudeAgent / claude-opus-5-5` run 2 in thread `mcp:606c30e3-a6b5-44c9-a742-fe03ed17ebac` reported its five-hour limit and a 12:30 p.m. America/Denver reset. Hold that route and any possibly shared Claude pool whose allowance is uncertain. Do not retry before the reported reset. Afterward, a single supervised real-work attempt may establish whether the route is usable; elapsed time alone does not clear the hold. Do not use paid fallback.
+On November 19 at 10:41 a.m. America/Denver, `claudeAgent / claude-opus-5-5` run 2 in thread `mcp:606c30e3-a6b5-44c9-a742-fe03ed17ebac` reported its five-hour limit and a 12:30 p.m. America/Denver reset. The route was held until one supervised post-reset real-work attempt could establish whether it was usable. Elapsed time alone does not clear a hold, and other possibly shared Claude pools remain uncertain. Do not use paid fallback.
+
+At 2:28 p.m. America/Denver, run 3 on that exact direct Claude Opus route completed a real read-only design task without a reported quota, authentication or billing error. That outcome clears the observed five-hour hold for this route at that time; it is not a live quota guarantee or proof about other Claude pools. Continue the pre-dispatch checks and do not use paid fallback.
 
 An owner-provided Antigravity usage screenshot received November 19 showed Gemini at 100% of its five-hour allowance and 34% weekly remaining, Gemini 4 Argon at 0% weekly remaining, and the Antigravity Claude and GPT shared pool at 100% five-hour and 49% weekly remaining. Hold Argon until its reported reset and a supervised real-work attempt confirms readiness. These are screenshot observations, not a live quota guarantee. The Antigravity Claude and GPT pool is a separate route from the direct Claude Pro failure above; do not clear one hold based on the other pool.
 
