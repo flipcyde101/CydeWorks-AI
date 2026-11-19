@@ -210,6 +210,16 @@ test('failure or abort during record never sends dispatch and stops held namespa
       nonce: NONCE_1,
       record: identity => {
         identity.init = null;
+        const view = adapter.getSession(NONCE_1);
+        assert.ok(view);
+        assert.equal(view.child, undefined);
+        assert.equal(view.stdin, undefined);
+        assert.equal(view.stdout, undefined);
+        assert.equal(view.stderr, undefined);
+        assert.equal(view.kill, undefined);
+        assert.equal(view.closedPromise, undefined);
+        assert.equal(view.identity.init.pid, 302);
+        view.identity.init.pid = 1;
         throw Error('Disk full while persisting ownership record');
       },
     }),
@@ -217,6 +227,8 @@ test('failure or abort during record never sends dispatch and stops held namespa
   );
   assert.equal(log.serveFrames.some(f => f.op === 'dispatch'), false);
   assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm']);
+  assert.equal(log.oneshotCalls[0].payload.identity.init.pid, 302);
+  assert.equal(log.oneshotCalls[0].payload.identity.birthIdentity, `${BOOT_ID}:302:88002:pid:[4026532500]`);
   assert.equal(log.oneshotCalls[0].payload.expectedNonce, NONCE_1);
   assert.equal(log.oneshotCalls[1].payload.expectedNonce, NONCE_1);
   await assert.rejects(
@@ -433,6 +445,63 @@ test('concurrent stopAndVerify calls coalesce single-flight and independent conf
   const failConfirm = await adapter.stopAndVerify(savedIdentity, NONCE_1);
   assert.equal(failConfirm.cleanup, 'unknown');
   assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm', 'stop', 'confirm']);
+});
+
+test('pending Stop keeps the private identity after caller and session-view mutation', async () => {
+  let releaseSessionStop = null;
+  const {spawnGuest, log} = createFakeSpawn({
+    onServeFrame(frame, child) {
+      if (frame.op === 'start') {
+        const {digest, ...identity} = makeIdentity(frame.nonce);
+        child.stdout.write(JSON.stringify({event: 'held', nonce: frame.nonce, identity, digest}) + '\n');
+      } else if (frame.op === 'dispatch') {
+        child.stdout.write(JSON.stringify({event: 'dispatched', nonce: frame.nonce}) + '\n');
+      } else if (frame.op === 'stop') {
+        releaseSessionStop = () => {
+          child.stdout.write(JSON.stringify({event: 'stopped', nonce: frame.nonce, cleanup: 'verified'}) + '\n');
+          child.stdout.end();
+          queueMicrotask(() => child.emit('close', 0));
+        };
+      }
+    },
+    onOneshot(mode, _payload, child) {
+      const reply = mode === 'stop'
+        ? {event: 'stopped', cleanup: 'verified'}
+        : {event: 'confirmed', absent: true};
+      child.stdout.write(JSON.stringify(reply) + '\n');
+      child.stdout.end();
+      queueMicrotask(() => child.emit('close', 0));
+    },
+  });
+
+  const adapter = createOpenCodeStopWslAdapter({spawnGuest});
+  let savedIdentity;
+  await adapter.start({
+    nonce: NONCE_1,
+    record: id => {
+      savedIdentity = id;
+    },
+  });
+
+  const pending = adapter.stopAndVerify(savedIdentity, NONCE_1);
+  savedIdentity.init.pid = 1;
+  savedIdentity.birthIdentity = 'mutated-while-stop-pending';
+  savedIdentity.identityDigest = 'f'.repeat(64);
+  const view = adapter.getSession(NONCE_1);
+  assert.ok(view);
+  assert.equal(view.child, undefined);
+  assert.equal(view.stdin, undefined);
+  assert.equal(view.identity.init.pid, 302);
+  view.identity.init.pid = 9;
+  assert.equal(typeof releaseSessionStop, 'function');
+  releaseSessionStop();
+
+  const result = await pending;
+  assert.equal(result.cleanup, 'verified');
+  const stopCall = log.oneshotCalls.find(call => call.mode === 'stop');
+  assert.equal(stopCall.payload.identity.init.pid, 302);
+  assert.equal(stopCall.payload.identity.birthIdentity, `${BOOT_ID}:302:88002:pid:[4026532500]`);
+  assert.equal(stopCall.payload.expectedNonce, NONCE_1);
 });
 
 test('canonicalJson and digestIdentity match Python canonical sha256', () => {

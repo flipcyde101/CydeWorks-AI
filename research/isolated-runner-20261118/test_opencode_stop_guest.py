@@ -420,6 +420,65 @@ class OpenCodeStopGuestUnitTests(unittest.TestCase):
                 if not stream.closed:
                     stream.close()
 
+    def test_workload_drain_cannot_delay_stop_or_lifetime(self):
+        # Many complete workload lines plus a slow successful emit. An unbounded
+        # drain would publish every line before the next control or lifetime check.
+        line_count = 120
+        payload = b"line\n" * line_count
+        sleep_s = 0.02
+
+        def run_case(lifetime, write_stop):
+            in_r, in_w = os.pipe()
+            wl_r, wl_w = os.pipe()
+            in_read = os.fdopen(in_r, "rb", buffering=0)
+            wl_read = os.fdopen(wl_r, "rb", buffering=0)
+            os.write(wl_w, payload)
+            frames = []
+            factory, expected_digest, records = self._make_pipe_supervisor_factory(wl_read, NONCE_A)
+            emitted = {"n": 0}
+
+            def slow_emit(frame):
+                if frame.get("event") == "workload":
+                    emitted["n"] += 1
+                    time.sleep(sleep_s)
+                frames.append(frame)
+                return True
+
+            try:
+                os.write(in_w, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
+                os.write(in_w, (json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": expected_digest}) + "\n").encode())
+                if write_stop:
+                    os.write(in_w, (json.dumps({"op": "stop", "nonce": NONCE_A}) + "\n").encode())
+                started = time.monotonic()
+                GUEST.serve(
+                    stdin=in_read,
+                    emit=slow_emit,
+                    supervisor_factory=factory,
+                    hold=2.0,
+                    lifetime=lifetime,
+                )
+                return time.monotonic() - started, emitted["n"], records["stop_reasons"]
+            finally:
+                for fd in (in_w, wl_w):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                for stream in (in_read, wl_read):
+                    if not stream.closed:
+                        stream.close()
+
+        elapsed, emitted, reasons = run_case(5.0, True)
+        self.assertEqual(reasons, ["stop"])
+        self.assertLess(emitted, line_count)
+        self.assertLessEqual(emitted, GUEST.WORKLOAD_DRAIN_BATCH)
+        self.assertLess(elapsed, 1.0)
+
+        elapsed, emitted, reasons = run_case(0.25, False)
+        self.assertEqual(reasons, ["lifetime-expired"])
+        self.assertLess(emitted, line_count)
+        self.assertLess(elapsed, 1.0)
+
     def test_serve_partial_stdin_line_does_not_block_hold_or_start_timeout(self):
         # Partial control frame after start must still hit hold-expired without wedging.
         in_r, in_w = os.pipe()
