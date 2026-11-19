@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {exportReceipt} from './receipt-export.mjs';
-import {validateReceiptExport} from './receipt-contract.mjs';
+import {UNAVAILABLE_REASONS,validateReceiptExport} from './receipt-contract.mjs';
 import {summarizeReceiptExports} from './receipt-analytics.mjs';
 import {compareRuns,summarizeRun} from './test-support/inspector-v1/accounting.mjs';
-import {acceptedTask,clone,deepFreeze,sha} from './test-support/receipt-synthetic.mjs';
+import {acceptedTask,clone,deepFreeze,draft,sha} from './test-support/receipt-synthetic.mjs';
+import {coverageSummary,receiptCoverage,usageRow} from './web-experience/logic/usage-rows.js';
 
 // This fixture mirrors work/continuity-before/server.mjs. That server wrote
 // a six-field source approval hash before recording a backend or model digest.
@@ -134,4 +135,66 @@ test('unrecorded legacy provider outcomes cannot establish complete timing total
   const comparison=compareRuns(receipt.run,candidate.run);
   assert.equal(comparison.time.available,false);
   assert.equal(comparison.cost.available,false);
+});
+
+test('synthetic current, projected legacy, and unavailable receipts keep separate coverage',()=>{
+  const currentTask=acceptedTask({id:'00000000-0000-4000-8000-000000000002'});
+  const current=exportReceipt(currentTask,{charges:[{attemptId:currentTask.attempts[0].id,amountMicros:120000,
+    currency:'USD',evidence:'estimated',complete:true}]});
+  const projectedTask=legacyTask();
+  const projected=exportReceipt(projectedTask);
+  const failedTask=legacyTask({id:'00000000-0000-4000-8000-000000000003'});
+  failedTask.request='Changed synthetic value';
+  const unavailable=exportReceipt(failedTask);
+  assert.equal(current.available,true,JSON.stringify(current.reasons));
+  assert.equal(current.formatVersion,2);
+  assert.equal(projected.available,true,JSON.stringify(projected.reasons));
+  assert.equal(unavailable.available,false);
+  assert.deepEqual(unavailable.reasons.map(reason=>reason.code),['approved-input-mismatch']);
+  const currentExport=JSON.stringify(current),projectedExport=JSON.stringify(projected);
+  const entries=[
+    {taskId:currentTask.id,envelope:current,summary:summarizeRun(current.run)},
+    {taskId:projectedTask.id,envelope:projected,summary:summarizeRun(projected.run)},
+    {taskId:failedTask.id,envelope:unavailable,summary:null},
+  ];
+  const rows=entries.map(entry=>usageRow({id:entry.taskId,attempts:null,status:'accepted'},entry));
+  assert.deepEqual(rows.map(row=>row.coverage),['current','projected-legacy','unavailable']);
+  assert.deepEqual(rows.map(row=>row.coverageLabel),['Current v2','Projected legacy','Unavailable']);
+  assert.equal(rows[0].time.state,'measured');
+  assert.equal(rows[0].time.text,'Measured 4.0 s.');
+  assert.equal(rows[0].cost.state,'estimated');
+  assert.equal(rows[0].cost.text,'0.12 USD');
+  assert.equal(rows[0].note,undefined);
+  assert.equal(rows[1].time.state,'recorded');
+  assert.equal(rows[1].time.text,'Measured window 4.0 s. Complete total unknown.');
+  assert.equal(rows[1].cost.text,'Unknown, not zero.');
+  assert.match(rows[1].note,/not an established total/);
+  assert.match(rows[1].note,/unknown, not zero/i);
+  assert.equal(rows[1].attempts,1);
+  assert.equal(rows[2].kind,'receipt-unavailable');
+  assert.equal(rows[2].attempts,null);
+  assert.equal(rows[2].time,undefined);
+  assert.equal(rows[2].text,'Unknown, not zero.');
+  assert.equal(rows[2].note,UNAVAILABLE_REASONS['approved-input-mismatch']+' Its usage figures are unknown, not zero.');
+  const counts=receiptCoverage(entries);
+  assert.deepEqual(counts,{listed:3,current:1,projectedLegacy:1,unavailable:1,measuredWindows:2,unknownWindows:0,
+    establishedTotals:1,recordedCharges:1,unknownCharges:1});
+  const summary=coverageSummary(counts);
+  assert.equal(summary,'Receipts in this list: 3. Current version 2: 1. Projected legacy: 1. Unavailable: 1. Measured execution windows: 2. Unknown execution windows: 0. Established execution totals: 1. Recorded charges: 1. Unknown charges: 1. Unavailable receipts are left out of the window and charge counts. An unknown charge or window is not zero.');
+  assert.equal(JSON.stringify(current),currentExport);
+  assert.equal(JSON.stringify(projected),projectedExport);
+  assert.equal(JSON.stringify(rows).includes('synthetic-legacy-model'),false);
+  assert.equal(JSON.stringify([summary,...rows.map(row=>row.note)]).includes('\u2014'),false);
+});
+
+test('a draft unavailable receipt states its plain reason and stays out of charge totals',()=>{
+  const task=draft();
+  const envelope=exportReceipt(task);
+  const entry={taskId:task.id,envelope,summary:null};
+  const row=usageRow({id:task.id,attempts:null,status:'draft'},entry);
+  assert.equal(row.kind,'none');
+  assert.equal(row.text,'No attempts');
+  assert.equal(row.note,UNAVAILABLE_REASONS['no-attempts-recorded']+' Its usage figures are unknown, not zero.');
+  assert.deepEqual(receiptCoverage([entry]),{listed:1,current:0,projectedLegacy:0,unavailable:1,
+    measuredWindows:0,unknownWindows:0,establishedTotals:0,recordedCharges:0,unknownCharges:0});
 });

@@ -1,21 +1,13 @@
 import {h, swap, stableKey} from '../core/dom.js';
 import {button, chip, notice, kv, panel, emptyState, simulated} from '../ui/primitives.js';
-import {describeCost, formatCount, formatDuration, formatMicros, formatSignedMicros} from '../core/format.js';
+import {formatCount, formatDuration, formatMicros, formatSignedMicros} from '../core/format.js';
 import {mode} from '../core/mode.js';
-import {usageRow, coverageNotice} from '../logic/usage-rows.js';
-import {receiptSummary, comparisonView, costDifferenceInput, receiptView} from '../adapters/slots.js';
+import {usageRow, coverageNotice, receiptCoverage, coverageSummary} from '../logic/usage-rows.js';
+import {comparisonView, costDifferenceInput, receiptView} from '../adapters/slots.js';
 import {STATUS_LABEL} from '../logic/situation.js';
 import {openReceiptDialog} from './dialogs.js';
 
 const pick = {baseline: null, candidate: null};
-
-function totals(summary) {
-  if (!summary) return {time: 'Unavailable', cost: describeCost(null)};
-  const cost = summary.totalCost.available
-    ? describeCost({amountMicros: summary.totalCost.value, currency: summary.totalCost.currency, evidence: summary.totalCost.evidence, complete: true})
-    : describeCost(null);
-  return {time: summary.wallTime.available ? formatDuration(summary.wallTime.value) : 'Unavailable', cost};
-}
 
 // The cost sentence comes from the reviewed formatter behind POST /api/cost-presentation (Qwen's
 // describeCostDifference), shown as plain text exactly as returned. Until it answers, or if it
@@ -112,29 +104,33 @@ function workspaceTotals(report) {
 export function renderUsage(main, ctx) {
   const {state} = ctx, data = state.cache.usage;
   const acceptedRuns = data?.receipts.filter(item => item.envelope.available && item.envelope.run?.accepted === true) ?? [];
+  const coverageText = data ? coverageSummary(receiptCoverage(data.receipts)) : null;
   const rerender = () => { if (state.path[0] !== 'usage' || !state.session.unlocked) return; delete main.dataset.swapKey; renderUsage(main, ctx); };
   swap(main, stableKey(['usage', data, state.tasks, pick]), () => h('div', {class: 'page'},
     h('div', {class: 'page-head'}, h('h1', null, 'Usage'),
-      h('p', null, 'What each task used, attempt by attempt. Every figure says whether it was reported by a provider, estimated, or is unavailable. An unavailable figure is never shown as zero.')),
+      h('p', null, 'What each task used, attempt by attempt. Every figure says whether it was measured, reported by a provider, estimated, or unknown. An unknown figure is never shown as zero.')),
     !data ? h('p', {class: 'loading', role: 'status'}, 'Reading usage records.') : [
       workspaceTotals(data.analytics),
       coverageNotice(data) ? notice('warn', h('p', {dataset: {fid: 'usage-partial'}}, coverageNotice(data))) : null,
       panel([h('h2', null, 'By task'), simulated()],
-        state.tasks.length ? h('div', {class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Usage by task'}, h('table', null,
+        coverageText ? h('p', {id: 'usage-receipt-coverage', dataset: {fid: 'usage-receipt-coverage'}}, coverageText) : null,
+        state.tasks.length ? h('div', {class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Usage by task',
+          'aria-describedby': coverageText ? 'usage-receipt-coverage' : undefined}, h('table', null,
           h('thead', null, h('tr', null, ['Task', 'State', 'Attempts', 'Execution window', 'Total cost', 'Evidence', 'Receipt'].map(name => h('th', {scope: 'col'}, name)))),
           h('tbody', null, state.tasks.map(task => {
             const entry = data.receipts.find(item => item.taskId === task.id);
             const missing = data.unavailable?.find(item => item.taskId === task.id) ?? (data.omitted?.some(item => item.taskId === task.id) ? {reason: 'omitted'} : null);
             const row = usageRow(task, entry, missing);
-            const view = row.kind === 'receipt' ? totals(receiptSummary(entry.summary)) : null;
             const status = entry?.envelope?.evidence?.task?.status;
             const label = Object.hasOwn(STATUS_LABEL, status) ? STATUS_LABEL[status] : STATUS_LABEL[task.status];
+            const showCharge = row.cost?.label && row.cost.state !== 'unknown';
             return h('tr', {dataset: {fid: 'usage-row-' + task.id}}, h('th', {scope: 'row'}, h('a', {href: '#/task/' + task.id}, task.title)), h('td', null, label),
               h('td', null, row.attempts === null ? 'Unknown' : String(row.attempts)),
-              h('td', null, view ? view.time : row.text),
-              h('td', null, view ? view.cost.primary : row.text),
-              h('td', null, view ? chip(view.cost.label, view.cost.kind === 'estimated' ? 'warn' : 'neutral') : chip(row.chip, row.kind === 'unknown' ? 'warn' : 'neutral'),
-                row.note ? h('span', {class: 'faint'}, ' ' + row.note) : null),
+              h('td', null, row.time?.text ?? row.text),
+              h('td', null, row.cost?.text ?? row.text),
+              h('td', null, chip(row.coverageLabel ?? row.chip, row.kind === 'unknown' || row.coverage === 'unavailable' ? 'warn' : 'neutral'),
+                showCharge ? [' ', chip(row.cost.label, row.cost.kind === 'estimated' ? 'warn' : 'neutral')] : null,
+                row.note ? h('p', {class: 'faint'}, row.note) : null),
               h('td', null, entry ? button('Inspect', {fid: 'receipt-' + entry.key, onClick: event => openReceiptDialog(ctx, {title: entry.title, envelope: entry.envelope}, event.currentTarget)})
                 : h('span', {class: 'faint'}, mode.synthetic && !missing ? 'Not in demo' : 'Unavailable')));
           }))))
