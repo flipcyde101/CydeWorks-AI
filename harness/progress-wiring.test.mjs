@@ -4,6 +4,7 @@ import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {loadBrowserAssets} from './browser-assets.mjs';
 import {renderTask} from './web-experience/views/task.js';
+import {describeProgress} from './web/progress.js';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 
@@ -15,6 +16,18 @@ test('both browser modes serve the same pinned progress modules', async () => {
     assert.deepEqual(legacy.assets.get('/' + name)?.data, original);
     assert.deepEqual(experience.assets.get('/vendor/harness-web/' + name)?.data, original);
   }
+});
+
+test('the host claim timestamp before dispatch is valid while waiting for first output', () => {
+  const start = '2026-11-14T12:00:00.000Z';
+  const then = Date.parse(start);
+  const task = {status: 'running', live: {chars: 0, lastActivity: start, heartbeat: new Date(then + 2000).toISOString()}};
+  const attempt = {started: start, execution: {phase: 'dispatching', dispatchedAt: new Date(then + 1000).toISOString()}};
+  const progress = describeProgress(task, attempt, then + 3000);
+  assert.equal(progress.clockAnomaly, false);
+  assert.equal(progress.elapsedMs, 3000);
+  assert.equal(progress.lastActivity, then + 1000);
+  assert.equal(progress.phase, 'waiting');
 });
 
 class TestNode {
@@ -132,9 +145,16 @@ test('experience progress shows measured values, preserves focus, and hides stal
   assert.equal(panel.querySelector('[data-fid="cancel-request"]').disabled, true);
   assert.match(panel.textContent, /Overall ETA.*Unavailable/i);
 
+  task.live.error = 'Synthetic failure';
+  renderTask(container, ctx);
+  panel = container.querySelector('#run-progress');
+  assert.equal(panel.querySelector('[data-fid="cancel-request"]').disabled, true);
+  assert.ok(panel.descendants().some(node => node.className?.includes('pulse-off')));
+
   task.status = 'review';
   attempt.status = 'completed';
   task.live.stopping = false;
+  delete task.live.error;
   renderTask(container, ctx);
   assert.match(liveRegion.textContent, /incomplete termination/i);
 });
