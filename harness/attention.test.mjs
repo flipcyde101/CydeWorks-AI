@@ -1,7 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {attentionFor} from './attention.mjs';
+import {retryHold} from './recovery.mjs';
 import {describeProgress} from './web/progress.js';
+
+function legacyAttentionFor(task) {
+  const reasons = [];
+  if (task.status === 'draft') reasons.push('Approval needed');
+  if (task.status === 'review') {
+    reasons.push('Proposal needs review');
+    if (task.attempts?.at(-1)?.checks?.some(check => !check.pass)) reasons.push('A check failed');
+  }
+  if (task.status === 'failed') reasons.push('Run failed');
+  if (task.status === 'interrupted') reasons.push('Run interrupted');
+  if (retryHold(task)) reasons.push('Earlier outcome needs recovery');
+  return reasons.length ? {id: task.id, title: task.title, status: task.status, reasons} : null;
+}
 
 const start = '2026-11-14T12:00:00.000Z';
 const then = Date.parse(start);
@@ -98,6 +112,55 @@ test('existing one-argument behavior and reason ordering are preserved', () => {
   // Array.prototype.map(attentionFor) passes numeric index as 2nd argument and remains unaffected.
   const mapped = [failedTask, oneArgRunning, draft].map(attentionFor).filter(Boolean);
   assert.deepEqual(mapped.map(entry => entry.id), ['one', 'four']);
+});
+
+test('differential parity with legacy one-argument attentionFor across whitespace, non-string fields, prototypes, and Array.map', () => {
+  const protoCheck = Object.create({pass: false});
+  const protoAttempt = Object.create({checks: [protoCheck]});
+  const protoTask = Object.create({
+    id: ' proto-task ',
+    title: '  Proto title  ',
+    status: 'review',
+    attempts: [protoAttempt],
+  });
+
+  const legacyCases = [
+    {id: ' task-1 ', title: '  Existing title  ', status: 'draft'},
+    {id: 42, title: 99, status: 'draft'},
+    {id: '', status: 'draft'},
+    {title: null, status: 'draft'},
+    {id: 'ctrl', title: 'Line1\n\tLine2  ', status: 'draft'},
+    {id: 'ws-status', title: 'Space status', status: ' draft '},
+    {id: 'long-' + 'a'.repeat(250), title: 'Long ' + 'b'.repeat(250), status: 'draft'},
+    {id: 'int-no-attempts', title: 'Interrupted without attempts', status: 'interrupted'},
+    {id: 'cancelled-hold', title: 'Cancelled unresolved', status: 'cancelled', attempts: [{provider: 'opencode'}]},
+    {
+      id: 'cancelled-safe-retry',
+      title: 'Cancelled safe',
+      status: 'cancelled',
+      attempts: [{provider: 'opencode', recovery: {state: 'retry-safe'}}],
+    },
+    {
+      id: 'cancelled-unresolved-nonstring',
+      title: 'Unresolved truthy',
+      status: 'cancelled',
+      attempts: [{recovery: {state: 'unresolved', message: 'Held message'}}],
+    },
+    {id: 'failed-fixture', title: 'Fixture fail', status: 'failed', attempts: [{provider: 'fixture'}]},
+    {id: 'failed-str-attempts', title: 'String attempts', status: 'failed', attempts: 'not-array'},
+    protoTask,
+  ];
+
+  for (const sample of legacyCases) {
+    assert.deepEqual(attentionFor(sample), legacyAttentionFor(sample));
+  }
+
+  assert.deepEqual(legacyCases.map(attentionFor), legacyCases.map(legacyAttentionFor));
+
+  const wsDraft = attentionFor({id: ' task-1 ', title: '  Existing title  ', status: 'draft'});
+  assert.strictEqual(wsDraft.id, ' task-1 ');
+  assert.strictEqual(wsDraft.title, '  Existing title  ');
+  assert.deepEqual(wsDraft.reasons, ['Approval needed']);
 });
 
 test('active measured stall produces a single possible-stall reason for the active attempt', () => {
@@ -484,7 +547,7 @@ test('repeated polling is idempotent, pure, and clears immediately once progress
 });
 
 test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fail closed', () => {
-  for (const bad of [null, undefined, 'running', 42, ['a'], new Date(), {}, {id: '', status: 'draft'}, {id: 'x', status: ''}]) {
+  for (const bad of [null, undefined, 'running', 42, ['a'], new Date(), {}, {id: '', status: 'accepted'}, {id: 'x', status: ''}]) {
     assert.equal(attentionFor(bad), null);
   }
 
@@ -496,6 +559,13 @@ test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fa
     },
   });
   assert.equal(attentionFor(throwingTask), null);
+
+  const throwingGetTask = new Proxy({}, {
+    get() {
+      throw new Error('get-trap');
+    },
+  });
+  assert.equal(attentionFor(throwingGetTask), null);
 
   const throwingProxy = new Proxy({}, {
     getOwnPropertyDescriptor() {
@@ -516,7 +586,7 @@ test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fa
   assert.equal(attentionFor(validTask, {attemptId: 'att-guard', progress: throwingProxy}), null);
 
   // Malformed attempts / checks do not throw on existing statuses.
-  assert.deepEqual(attentionFor({id: 'bad-att', title: 'Bad attempts', status: 'failed', attempts: 'not-array'}).reasons, ['Run failed']);
+  assert.deepEqual(attentionFor({id: 'bad-att', title: 'Bad attempts', status: 'failed', attempts: {}}).reasons, ['Run failed']);
   assert.deepEqual(attentionFor({id: 'bad-chk', title: 'Bad checks', status: 'review', attempts: [{checks: [null, {pass: true}]}]}).reasons, ['Proposal needs review']);
 
   // String/boolean caller labels cannot manufacture trusted host provenance or bypass validation.
@@ -563,7 +633,7 @@ test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fa
   }
 });
 
-test('error-data minimization omits raw diagnostics, secrets, paths, and provider error text', () => {
+test('error-data minimization omits raw progress diagnostics, recovery messages, secrets, paths, and provider error text', () => {
   const secret = 'sk-secretvalue1234567890abcd';
   const bearer = 'Bearer supersecrettokenvalue123';
   const winPath = 'C:\\Users\\alice\\private\\key.pem';
@@ -571,7 +641,7 @@ test('error-data minimization omits raw diagnostics, secrets, paths, and provide
 
   const sensitiveTask = {
     id: 'min-1',
-    title: `Review ${bearer} at ${unixPath}`,
+    title: 'Sensitive diagnostic task',
     status: 'failed',
     error: `Provider failure ${secret}`,
     live: {error: `Stack at fn (${winPath}:12:3)`},
@@ -609,7 +679,42 @@ test('error-data minimization omits raw diagnostics, secrets, paths, and provide
   assert.deepEqual(entry.reasons, ['Run failed', 'Earlier outcome needs recovery']);
 
   const serialized = JSON.stringify(entry);
-  for (const leaked of [secret, 'supersecrettokenvalue123', winPath, unixPath, 'Provider crashed', 'Provider failure', 'Detailed trace']) {
+  for (const leaked of [secret, 'supersecrettokenvalue123', winPath, unixPath, 'Provider crashed', 'Provider failure', 'Detailed trace', 'Raw recovery diagnostic', 'Rejected', 'Omitted']) {
     assert.equal(serialized.includes(leaked), false, `must not expose ${leaked}`);
+  }
+
+  // Active stalled path also omits all raw progress diagnostics and provider error/problem fields.
+  const stalledSensitiveTask = makeRunningTask({
+    id: 'min-run',
+    title: '  Active task  ',
+    attemptId: 'att-min-run',
+  });
+  stalledSensitiveTask.error = `Background error ${secret}`;
+  stalledSensitiveTask.attempts[0].problem = `Diagnostic ${bearer} at ${winPath}`;
+
+  const stalledEntry = attentionFor(stalledSensitiveTask, {
+    attemptId: 'att-min-run',
+    progress: {
+      phase: 'stalled',
+      stalled: true,
+      clockAnomaly: false,
+      lastActivity: then + 4_000,
+      idleMs: 61_000,
+      elapsedMs: 65_000,
+      stepSamplesValid: true,
+      status: `Progress status ${secret}`,
+      explanation: `Detailed trace ${winPath}`,
+      stepRejectionReason: `Rejected ${bearer}`,
+      unavailableReasons: {completion: `Omitted ${unixPath}`},
+    },
+  });
+
+  assert.deepEqual(Object.keys(stalledEntry).sort(), ['id', 'reasons', 'status', 'title']);
+  assert.strictEqual(stalledEntry.title, '  Active task  ');
+  assert.deepEqual(stalledEntry.reasons, ['Active run may be stalled']);
+
+  const stalledSerialized = JSON.stringify(stalledEntry);
+  for (const leaked of [secret, 'supersecrettokenvalue123', winPath, unixPath, 'Background error', 'Progress status', 'Detailed trace', 'Rejected', 'Omitted']) {
+    assert.equal(stalledSerialized.includes(leaked), false, `must not expose ${leaked}`);
   }
 });

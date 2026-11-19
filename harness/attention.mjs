@@ -2,10 +2,7 @@ import {retryHold} from './recovery.mjs';
 
 const STALL_THRESHOLD_MS = 60_000;
 const MAX_DATE_MS = 8_640_000_000_000_000;
-const MAX_ID_LENGTH = 200;
-const MAX_TITLE_LENGTH = 200;
 const CONTROL_CHARS_RE = /[\u0000-\u001F\u007F-\u009F]/;
-const CONTROL_CHARS_GLOBAL_RE = /[\u0000-\u001F\u007F-\u009F]+/g;
 
 const POSSIBLE_STALL_REASON = 'Active run may be stalled';
 
@@ -62,37 +59,6 @@ function ownData(obj, key) {
   return descriptor.value;
 }
 
-function sanitizeText(value, maxLength = MAX_TITLE_LENGTH) {
-  if (typeof value !== 'string') return null;
-  let text = value.replace(CONTROL_CHARS_GLOBAL_RE, ' ').replace(/\s+/g, ' ').trim();
-  if (!text) return null;
-
-  const stackIdx = text.search(/\s+at\s+(?:async\s+)?[^\s(]+\s*\((?:file:\/\/\/|node:|\/|[A-Za-z]:[\\/])[^)]+:\d+:\d+\)/);
-  if (stackIdx > 0) {
-    text = text.slice(0, stackIdx).trim();
-  } else if (stackIdx === 0 || /^(?:TypeError|ReferenceError|SyntaxError|RangeError|Error):\s*.*\bat\s+/.test(text)) {
-    return 'Task';
-  }
-
-  text = text
-    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, '[redacted credential]')
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]')
-    .replace(/(["']?)(api[_-]?key|access[_-]?key|secret|password|passwd|token|authorization|cookie|session[_-]?key)\1\s*([:=])\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;'"`}\]]+)/gi, '$1$2$1$3[redacted]')
-    .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,}|gho_[A-Za-z0-9]{12,}|AIza[A-Za-z0-9_-]{16,})\b/g, '[redacted credential]')
-    .replace(/\b(https?:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, '$1[redacted]@')
-    .replace(/\bfile:\/\/\/[^\s,;)]+/gi, '[redacted path]')
-    .replace(/(^|[\s(])[A-Za-z]:[\\/][^\s,;)]+/g, '$1[redacted path]')
-    .replace(/(^|[\s(])\/(?:Users|home|var|etc|tmp|opt|srv|root)\/[^\s,;)]+/g, '$1[redacted path]')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!text) return null;
-  if (text.length > maxLength) {
-    return text.slice(0, Math.max(1, maxLength - 3)).trimEnd() + '...';
-  }
-  return text;
-}
-
 function parseTimestampMs(value) {
   if (typeof value === 'number') {
     return Number.isFinite(value) && value >= 0 && value <= MAX_DATE_MS ? value : null;
@@ -131,17 +97,65 @@ function pushUniqueReason(reasons, reason) {
   }
 }
 
-function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, options) {
-  if (status !== 'running') return false;
-  if (recoveryBlocked || liveStopping) return false;
-  if (!attempt || typeof attempt.id !== 'string' || !attempt.id) return false;
-  if (attempt.status !== undefined && attempt.status !== 'running') return false;
-  if (attempt.ended !== undefined && attempt.ended !== null) return false;
-  if (attempt.recovery?.state === 'unresolved') return false;
-  if (attempt.execution?.phase !== 'dispatching' || attempt.execution?.settled === true) return false;
-
+function hasGenuineActiveStall(task, options) {
   try {
     if (!isPlainObject(options)) return false;
+    if (ownData(task, 'status') !== 'running') return false;
+
+    const rawRecovery = ownData(task, 'recovery');
+    if (isPlainObject(rawRecovery) && (
+      ownData(rawRecovery, 'blocked') === true
+      || ownData(rawRecovery, 'state') === 'unresolved'
+    )) {
+      return false;
+    }
+
+    const rawLive = ownData(task, 'live');
+    if (isPlainObject(rawLive)) {
+      const liveError = ownData(rawLive, 'error');
+      const liveEndedAt = ownData(rawLive, 'endedAt');
+      if (
+        ownData(rawLive, 'stopping') === true
+        || ownData(rawLive, 'failed') === true
+        || ownData(rawLive, 'complete') === true
+        || (liveEndedAt !== undefined && liveEndedAt !== null)
+        || (typeof liveError === 'string' && liveError.trim().length > 0)
+        || (liveError !== null && typeof liveError === 'object')
+      ) {
+        return false;
+      }
+    }
+
+    const rawAttempts = ownData(task, 'attempts');
+    if (!Array.isArray(rawAttempts) || rawAttempts.length === 0) return false;
+    const attempt = rawAttempts[rawAttempts.length - 1];
+    if (!isPlainObject(attempt)) return false;
+
+    const attemptId = ownData(attempt, 'id');
+    if (typeof attemptId !== 'string' || CONTROL_CHARS_RE.test(attemptId) || !attemptId.trim()) {
+      return false;
+    }
+    const cleanAttemptId = attemptId.trim();
+
+    const attemptStatus = ownData(attempt, 'status');
+    if (attemptStatus !== undefined && attemptStatus !== 'running') return false;
+
+    const attemptEnded = ownData(attempt, 'ended');
+    if (attemptEnded !== undefined && attemptEnded !== null) return false;
+
+    const rawAttemptRecovery = ownData(attempt, 'recovery');
+    if (isPlainObject(rawAttemptRecovery) && ownData(rawAttemptRecovery, 'state') === 'unresolved') {
+      return false;
+    }
+
+    const rawExecution = ownData(attempt, 'execution');
+    if (
+      !isPlainObject(rawExecution)
+      || ownData(rawExecution, 'phase') !== 'dispatching'
+      || ownData(rawExecution, 'settled') === true
+    ) {
+      return false;
+    }
 
     const rawProgress = ownData(options, 'progress');
     if (!isPlainObject(rawProgress)) return false;
@@ -166,7 +180,7 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
       return false;
     }
     const boundAttemptId = cleanOptId ?? cleanProgId;
-    if (!boundAttemptId || boundAttemptId !== attempt.id) {
+    if (!boundAttemptId || boundAttemptId !== cleanAttemptId) {
       return false;
     }
 
@@ -238,7 +252,7 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
       return false;
     }
 
-    const attemptStartedMs = parseTimestampMs(attempt.started);
+    const attemptStartedMs = parseTimestampMs(ownData(attempt, 'started'));
     if (attemptStartedMs === null || lastActivity < attemptStartedMs) {
       return false;
     }
@@ -259,8 +273,9 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
       }
     }
 
-    if (attempt.execution.dispatchedAt !== undefined && attempt.execution.dispatchedAt !== null) {
-      const dispatchedAtMs = parseTimestampMs(attempt.execution.dispatchedAt);
+    const dispatchedAt = ownData(rawExecution, 'dispatchedAt');
+    if (dispatchedAt !== undefined && dispatchedAt !== null) {
+      const dispatchedAtMs = parseTimestampMs(dispatchedAt);
       if (dispatchedAtMs === null || dispatchedAtMs < attemptStartedMs || lastActivity < dispatchedAtMs) {
         return false;
       }
@@ -286,8 +301,10 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
  *
  * Caller boundary and trust model:
  * - One-argument calls `attentionFor(task)` (including `tasks.map(attentionFor)`,
- *   where the second argument is a numeric index) preserve existing behavior and
- *   never infer a stall from `task.live`, `task.progress`, or elapsed time.
+ *   where the second argument is a numeric index) preserve exact pre-existing
+ *   behavior, returning `{ id: task.id, title: task.title, status: task.status, reasons }`
+ *   without trimming/modifying existing task fields or inferring a stall from
+ *   `task.live`, `task.progress`, or elapsed time.
  * - The optional `options` object `{ attemptId, progress }` is an in-process
  *   trusted host boundary. Arbitrary caller strings or booleans (such as
  *   `trusted: true`, `provenance: 'host'`, or `source: 'worker'`) do not prove
@@ -296,159 +313,30 @@ function hasGenuineActiveStall(status, attempt, recoveryBlocked, liveStopping, o
  *   compute `progress` server-side from authoritative host-observed run state
  *   via `describeProgress(...)`, bind `attemptId` to the server-owned current
  *   attempt, and never pass raw client, browser, or provider payloads here.
- * - Output is minimized to `{ id, title, status, reasons }` using static
- *   generic reason labels so raw diagnostics, secrets, and provider error text
- *   are never surfaced.
+ * - `reasons` only uses static generic reason labels so raw progress diagnostics,
+ *   recovery hold messages, secrets, and provider error text are never passed through.
  */
 export function attentionFor(task, options = undefined) {
-  let id;
-  let title;
-  let status;
-  let safeLatestAttempt = null;
-  let recoveryBlocked = false;
-  let liveStopping = false;
+  if (task === null || typeof task !== 'object') return null;
 
   try {
-    if (!isPlainObject(task)) return null;
-
-    const rawId = ownData(task, 'id');
-    if (typeof rawId !== 'string' || CONTROL_CHARS_RE.test(rawId)) return null;
-    const trimmedId = rawId.trim();
-    if (!trimmedId || trimmedId.length > MAX_ID_LENGTH) return null;
-    id = trimmedId;
-
-    const rawStatus = ownData(task, 'status');
-    if (typeof rawStatus !== 'string' || !rawStatus.trim() || CONTROL_CHARS_RE.test(rawStatus)) return null;
-    status = rawStatus.trim();
-
-    const rawTitle = ownData(task, 'title');
-    if (rawTitle === undefined) {
-      title = undefined;
-    } else if (rawTitle === null) {
-      title = null;
-    } else if (typeof rawTitle === 'string') {
-      title = sanitizeText(rawTitle, MAX_TITLE_LENGTH) ?? '';
-    } else {
-      return null;
-    }
-
-    const rawRecovery = ownData(task, 'recovery');
-    if (isPlainObject(rawRecovery) && (
-      ownData(rawRecovery, 'blocked') === true
-      || ownData(rawRecovery, 'state') === 'unresolved'
-    )) {
-      recoveryBlocked = true;
-    }
-
-    const rawLive = ownData(task, 'live');
-    if (isPlainObject(rawLive)) {
-      const liveError = ownData(rawLive, 'error');
-      const liveEndedAt = ownData(rawLive, 'endedAt');
-      if (
-        ownData(rawLive, 'stopping') === true
-        || ownData(rawLive, 'failed') === true
-        || ownData(rawLive, 'complete') === true
-        || (liveEndedAt !== undefined && liveEndedAt !== null)
-        || (typeof liveError === 'string' && liveError.trim().length > 0)
-        || isPlainObject(liveError)
-      ) {
-        liveStopping = true;
+    const reasons = [];
+    if (task.status === 'draft') pushUniqueReason(reasons, 'Approval needed');
+    if (task.status === 'review') {
+      pushUniqueReason(reasons, 'Proposal needs review');
+      if (task.attempts?.at?.(-1)?.checks?.some?.(check => check && !check.pass)) {
+        pushUniqueReason(reasons, 'A check failed');
       }
     }
-
-    const rawAttempts = ownData(task, 'attempts');
-    if (Array.isArray(rawAttempts) && rawAttempts.length > 0) {
-      const candidate = rawAttempts[rawAttempts.length - 1];
-      if (isPlainObject(candidate)) {
-        const rawAttemptId = ownData(candidate, 'id');
-        const rawAttemptStatus = ownData(candidate, 'status');
-        const rawProvider = ownData(candidate, 'provider');
-        const rawStarted = ownData(candidate, 'started');
-        const rawEnded = ownData(candidate, 'ended');
-        const rawChecks = ownData(candidate, 'checks');
-        const rawAttemptRecovery = ownData(candidate, 'recovery');
-        const rawExecution = ownData(candidate, 'execution');
-
-        let checks;
-        if (Array.isArray(rawChecks)) {
-          checks = [];
-          for (let i = 0; i < rawChecks.length; i += 1) {
-            const check = rawChecks[i];
-            if (isPlainObject(check)) {
-              checks.push({pass: Boolean(ownData(check, 'pass'))});
-            }
-          }
-        }
-
-        let recovery;
-        if (isPlainObject(rawAttemptRecovery)) {
-          const state = ownData(rawAttemptRecovery, 'state');
-          const rawMessage = ownData(rawAttemptRecovery, 'message');
-          recovery = {
-            state: typeof state === 'string' ? state : undefined,
-            message: typeof rawMessage === 'string' && rawMessage.length > 0
-              ? 'Earlier outcome needs recovery.'
-              : undefined,
-          };
-        }
-
-        let execution;
-        if (isPlainObject(rawExecution)) {
-          const phase = ownData(rawExecution, 'phase');
-          const dispatchedAt = ownData(rawExecution, 'dispatchedAt');
-          const settled = ownData(rawExecution, 'settled');
-          execution = {
-            phase: typeof phase === 'string' ? phase : undefined,
-            settled: settled === true,
-            dispatchedAt: dispatchedAt === undefined || dispatchedAt === null
-              ? dispatchedAt
-              : (typeof dispatchedAt === 'string' || typeof dispatchedAt === 'number' ? dispatchedAt : Number.NaN),
-          };
-        }
-
-        safeLatestAttempt = {
-          id: typeof rawAttemptId === 'string' && !CONTROL_CHARS_RE.test(rawAttemptId)
-            ? rawAttemptId.trim()
-            : undefined,
-          status: rawAttemptStatus === undefined
-            ? undefined
-            : typeof rawAttemptStatus === 'string'
-              ? rawAttemptStatus.trim()
-              : null,
-          provider: typeof rawProvider === 'string' ? rawProvider : undefined,
-          started: typeof rawStarted === 'string' || typeof rawStarted === 'number' ? rawStarted : undefined,
-          ended: rawEnded === undefined ? undefined : rawEnded,
-          checks,
-          recovery,
-          execution,
-        };
-      }
+    if (task.status === 'failed') pushUniqueReason(reasons, 'Run failed');
+    if (task.status === 'interrupted') pushUniqueReason(reasons, 'Run interrupted');
+    if (retryHold(task)) pushUniqueReason(reasons, 'Earlier outcome needs recovery');
+    if (hasGenuineActiveStall(task, options)) {
+      pushUniqueReason(reasons, POSSIBLE_STALL_REASON);
     }
+
+    return reasons.length ? {id: task.id, title: task.title, status: task.status, reasons} : null;
   } catch {
     return null;
   }
-
-  const safeTask = {
-    id,
-    title,
-    status,
-    attempts: safeLatestAttempt ? [safeLatestAttempt] : [],
-  };
-
-  const reasons = [];
-  if (status === 'draft') pushUniqueReason(reasons, 'Approval needed');
-  if (status === 'review') {
-    pushUniqueReason(reasons, 'Proposal needs review');
-    if (safeLatestAttempt?.checks?.some(check => !check.pass)) {
-      pushUniqueReason(reasons, 'A check failed');
-    }
-  }
-  if (status === 'failed') pushUniqueReason(reasons, 'Run failed');
-  if (status === 'interrupted') pushUniqueReason(reasons, 'Run interrupted');
-  if (retryHold(safeTask)) pushUniqueReason(reasons, 'Earlier outcome needs recovery');
-  if (hasGenuineActiveStall(status, safeLatestAttempt, recoveryBlocked, liveStopping, options)) {
-    pushUniqueReason(reasons, POSSIBLE_STALL_REASON);
-  }
-
-  return reasons.length ? {id, title, status, reasons} : null;
 }
