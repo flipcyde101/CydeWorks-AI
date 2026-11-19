@@ -16,9 +16,9 @@ const SELF = fileURLToPath(import.meta.url);
 const SCOPE = Object.freeze({baseRevision: 'synthetic-rev-1', fileDigests: ['a'.repeat(64), 'b'.repeat(64)],
   modelId: 'synthetic-model', engine: 'synthetic-engine', protectionCases: 'c'.repeat(64), deadlineMs: 5000});
 const OTHER_SCOPE = Object.freeze({...SCOPE, fileDigests: ['a'.repeat(64), 'd'.repeat(64)]});
-const BIRTH = Object.freeze({pid: 4242, creationTime: 'synthetic-creation-0001'});
+const BIRTH = Object.freeze({pid: 4242, creationTime: 'synthetic-creation-0001', bootId: 'synthetic-boot-0001'});
 const HOST_DONE = Object.freeze({authority: 'host', cleanup: 'verified', inference: 'settled', resultHash: 'e'.repeat(64)});
-const CONTINUE = Object.freeze({authority: 'host', decision: 'continue-pre-dispatch'});
+const CONTINUE = Object.freeze({authority: 'host', decision: 'continue-pre-dispatch', observedGeneration: 1});
 
 // Child mode: open the temporary store and run a bounded synthetic sequence.
 // A crash point kills the process abruptly (no close, no rollback by us).
@@ -32,6 +32,12 @@ if (process.argv[2] === 'durable-claims-child') {
     }});
     if (spec.startAt) while (Date.now() < spec.startAt) Atomics.wait(sleeper, 0, 0, 2);
     const base = {requestId: spec.requestId, scope: spec.scope};
+    if (spec.mode === 'continue') {
+      const resumed = registry.hostContinuePreDispatch({...base, hostDecision: spec.hostDecision});
+      emit({step: 'continue', generation: resumed.claim.generation, dispatchAuthorized: resumed.dispatchAuthorized});
+      registry.close();
+      process.exit(0);
+    }
     const reserved = registry.reserve(base);
     emit({step: 'reserve', outcome: reserved.outcome, dispatchAuthorized: reserved.dispatchAuthorized,
       ownerToken: reserved.ownerToken ?? null, claim: reserved.claim});
@@ -78,11 +84,11 @@ function runChild(spec) {
 }
 
 function withStore(body, {initialize = true} = {}) {
-  return async () => {
+  return async t => {
     const dir = mkdtempSync(join(tmpdir(), 'cw-durable-claims-'));
     const path = join(dir, 'claims.sqlite');
     if (initialize) openClaimRegistry(path, {initialize: true}).close();
-    try { await body({dir, path}); }
+    try { await body({dir, path, t}); }
     finally { rmSync(dir, {recursive: true, force: true, maxRetries: 5, retryDelay: 50}); }
   };
 }
@@ -258,6 +264,8 @@ for (const [crashAt, expected] of CRASH_POINTS) {
         const resumed = registry.hostContinuePreDispatch({...base, hostDecision: CONTINUE});
         assert.equal(resumed.dispatchAuthorized, false);
         assert.equal(resumed.claim.generation, 2);
+        assert.throws(() => registry.hostContinuePreDispatch({...base, hostDecision: CONTINUE}), code('STALE_DECISION'));
+        assert.equal(registry.inspect(base).claim.generation, 2);
         assert.equal(registry.inspect(base).claim.state, 'claimed');
       } else {
         assert.throws(() => registry.recordDispatchIntent({...base, ownerToken: freshToken()}), code('INVALID_TRANSITION'));
@@ -289,6 +297,10 @@ test('worker identity requires the dispatch nonce and a non-PID birth component'
     const {ownerToken} = registry.reserve(base);
     const {nonce} = registry.recordDispatchIntent({...base, ownerToken});
     assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce, birthIdentity: {pid: 4242}}), code('INSUFFICIENT_IDENTITY'));
+    assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce, birthIdentity: {pid: 4242, creationTime: BIRTH.creationTime}}), code('INSUFFICIENT_IDENTITY'));
+    assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce, birthIdentity: {pid: 4242, bootId: BIRTH.bootId}}), code('INSUFFICIENT_IDENTITY'));
+    assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce, birthIdentity: {...BIRTH, bootId: ''}}), code('INVALID_INPUT'));
+    assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce, birthIdentity: {...BIRTH, pid: '4242'}}), code('INVALID_INPUT'));
     assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce, birthIdentity: {...BIRTH, env: 'X=1'}}), code('INVALID_INPUT'));
     const otherNonce = nonce.replace(/^./, nonce[0] === 'a' ? 'b' : 'a');
     assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce: otherNonce, birthIdentity: BIRTH}), code('NONCE_MISMATCH'));
@@ -298,15 +310,25 @@ test('worker identity requires the dispatch nonce and a non-PID birth component'
     assert.throws(() => registry.recordWorkerIdentity({...base, ownerToken, nonce, birthIdentity: BIRTH}), code('INVALID_TRANSITION'));
 
     const assess = observedBirthIdentity => registry.assessWorkerIdentity({...base, observedBirthIdentity});
-    const stale = assess({pid: BIRTH.pid, creationTime: 'synthetic-creation-0002'});
+    const stale = assess({...BIRTH, creationTime: 'synthetic-creation-0002'});
     assert.equal(stale.verdict, 'mismatch');
-    const wrong = assess({pid: 9999, creationTime: BIRTH.creationTime});
+    const rebooted = assess({...BIRTH, bootId: 'synthetic-boot-0002'});
+    assert.equal(rebooted.verdict, 'mismatch');
+    const wrong = assess({...BIRTH, pid: 9999});
     assert.equal(wrong.verdict, 'mismatch');
     const pidOnly = assess({pid: BIRTH.pid});
     assert.equal(pidOnly.verdict, 'insufficient-identity');
+    // The shape that used to compare differently: same pid and creation time
+    // without bootId is now insufficient, never a mismatch or a match.
+    const noBoot = assess({pid: BIRTH.pid, creationTime: BIRTH.creationTime});
+    assert.equal(noBoot.verdict, 'insufficient-identity');
+    const extra = assess({...BIRTH, parentPid: 1});
+    assert.equal(extra.verdict, 'invalid-identity');
     const same = assess(BIRTH);
     assert.equal(same.verdict, 'matches-recorded');
-    for (const result of [stale, wrong, pidOnly, same]) {
+    const reordered = assess({bootId: BIRTH.bootId, creationTime: BIRTH.creationTime, pid: BIRTH.pid});
+    assert.equal(reordered.verdict, 'matches-recorded');
+    for (const result of [stale, rebooted, wrong, pidOnly, noBoot, extra, same, reordered]) {
       assert.equal(result.osProcessProof, 'not-established');
       assert.equal(result.workerDeathInferred, false);
       assert.equal(result.redispatchAllowed, false);
@@ -509,4 +531,171 @@ test('persisted bytes and errors stay privacy-safe', withStore(({dir, path}) => 
       assert.equal(text.includes(dir), false);
     }
   }
+}));
+
+test('competing continuation decisions for one generation: at most one rotates ownership', withStore(async ({path}) => {
+  const base = {requestId: 'synthetic-req-continue-race', scope: SCOPE};
+  const seed = openClaimRegistry(path);
+  const {ownerToken: originalToken} = seed.reserve(base);
+  seed.close();
+  const startAt = Date.now() + 1500;
+  const results = await Promise.all(Array.from({length: 6}, () =>
+    runChild({db: path, mode: 'continue', ...base, hostDecision: CONTINUE, startAt})));
+  const outcomes = results.map(lines => lines[0]);
+  assert.ok(outcomes.every(Boolean), 'every child must report an outcome');
+  const winners = outcomes.filter(item => item.step === 'continue');
+  assert.equal(winners.length, 1);
+  assert.equal(winners[0].generation, 2);
+  assert.equal(winners[0].dispatchAuthorized, false);
+  assert.deepEqual(outcomes.filter(item => item.step !== 'continue').map(item => item.error),
+    Array(5).fill('STALE_DECISION'));
+  const registry = openClaimRegistry(path);
+  try {
+    const found = registry.inspect(base);
+    assert.equal(found.claim.state, 'claimed');
+    assert.equal(found.claim.generation, 2);
+    assert.throws(() => registry.recordDispatchIntent({...base, ownerToken: originalToken}), code('OWNER_MISMATCH'));
+    assert.throws(() => registry.hostContinuePreDispatch({...base, hostDecision: CONTINUE}), code('STALE_DECISION'));
+    for (const observedGeneration of [0, 3, 1.5, '2', -1]) {
+      const hostDecision = {...CONTINUE, observedGeneration};
+      assert.throws(() => registry.hostContinuePreDispatch({...base, hostDecision}),
+        error => error instanceof ClaimRegistryError && ['HOST_AUTHORITY_REQUIRED', 'STALE_DECISION'].includes(error.code));
+    }
+    const missing = {authority: 'host', decision: 'continue-pre-dispatch'};
+    assert.throws(() => registry.hostContinuePreDispatch({...base, hostDecision: missing}), code('HOST_AUTHORITY_REQUIRED'));
+    assert.equal(registry.inspect(base).claim.generation, 2);
+    const next = registry.hostContinuePreDispatch({...base, hostDecision: {...CONTINUE, observedGeneration: 2}});
+    assert.equal(next.claim.generation, 3);
+    assert.equal(registry.recordDispatchIntent({...base, ownerToken: next.ownerToken}).dispatchAuthorized, true);
+  } finally { registry.close(); }
+}));
+
+test('noncanonical scope shapes are rejected instead of silently replaying', withStore(({path}) => {
+  const registry = openClaimRegistry(path);
+  const marker = 'GETTERMARKER91c2';
+  const calls = {count: 0};
+  const hostile = () => { calls.count++; throw new Error(`leak ${marker}`); };
+  const traps = {count: 0};
+  const handler = Object.fromEntries(['get', 'has', 'ownKeys', 'getOwnPropertyDescriptor', 'getPrototypeOf', 'defineProperty',
+    'set', 'deleteProperty', 'isExtensible', 'preventExtensions', 'setPrototypeOf']
+    .map(name => [name, () => { traps.count++; throw new Error(`trap ${marker}`); }]));
+  try {
+    const base = {requestId: 'synthetic-req-shape', scope: {...SCOPE, list: ['a', 'b'], nested: {inner: ['x']}}};
+    assert.equal(registry.reserve(base).outcome, 'created');
+    const withList = list => ({...base.scope, list});
+    const withInner = inner => ({...base.scope, nested: {inner}});
+
+    const extraTop = ['a', 'b']; extraTop.extra = 'changed';
+    const extraNested = ['x']; extraNested.changed = true;
+    const accessorElement = ['a', 'b']; Object.defineProperty(accessorElement, 1, {enumerable: true, get: hostile});
+    const nestedAccessor = ['x']; Object.defineProperty(nestedAccessor, 0, {enumerable: true, get: hostile});
+    const hiddenElement = ['a', 'b']; Object.defineProperty(hiddenElement, 1, {value: 'b', enumerable: false});
+    const symbolArray = ['a', 'b']; symbolArray[Symbol('s')] = 1;
+    class SubArray extends Array {}
+    const subclassed = SubArray.from(['a', 'b']);
+    const hiddenProp = {...base.scope}; Object.defineProperty(hiddenProp, 'hidden', {value: 1, enumerable: false});
+    const symbolProp = {...base.scope, [Symbol('s')]: 1};
+    const getterProp = {...base.scope}; Object.defineProperty(getterProp, 'late', {enumerable: true, get: hostile});
+    const {proxy: revoked, revoke} = Proxy.revocable({}, {});
+    revoke();
+    const shapes = [
+      withList(extraTop), withInner(extraNested), withList(accessorElement), withInner(nestedAccessor),
+      withList(hiddenElement), withList(symbolArray), withList(subclassed), withList(['a', , 'b']),
+      withList(new Proxy(['a', 'b'], handler)), withInner(new Proxy(['x'], handler)), new Proxy(base.scope, handler),
+      withList(revoked), hiddenProp, symbolProp, getterProp, {...base.scope, n: -0}, {...base.scope, when: new Date(0)},
+      {...base.scope, list: Object.create(Array.prototype)}, {...base.scope, re: /x/}, {...base.scope, buf: Buffer.from('ab')},
+    ];
+    for (const scope of shapes) {
+      let caught;
+      try { registry.reserve({requestId: base.requestId, scope}); } catch (error) { caught = error; }
+      assert.ok(caught instanceof ClaimRegistryError, 'shape must be rejected');
+      assert.equal(caught.code, 'INVALID_INPUT');
+      for (const text of [caught.message, String(caught.stack), JSON.stringify(caught)]) assert.equal(text.includes(marker), false);
+    }
+    // Getters and traps on argument records and host objects are never run.
+    const getterArgs = {requestId: base.requestId};
+    Object.defineProperty(getterArgs, 'scope', {enumerable: true, get: hostile});
+    assert.throws(() => registry.reserve(getterArgs), code('INVALID_INPUT'));
+    assert.throws(() => registry.reserve(new Proxy(base, handler)), code('INVALID_INPUT'));
+    const getterDecision = {authority: 'host', decision: 'continue-pre-dispatch'};
+    Object.defineProperty(getterDecision, 'observedGeneration', {enumerable: true, get: hostile});
+    assert.throws(() => registry.hostContinuePreDispatch({...base, hostDecision: getterDecision}), code('HOST_AUTHORITY_REQUIRED'));
+    const getterBirth = {pid: 1, bootId: 'b'};
+    Object.defineProperty(getterBirth, 'creationTime', {enumerable: true, get: hostile});
+    assert.equal(registry.assessWorkerIdentity({...base, observedBirthIdentity: getterBirth}).verdict, 'invalid-identity');
+    assert.equal(calls.count, 0);
+    assert.equal(traps.count, 0);
+    const kept = registry.inspect(base);
+    assert.equal(kept.claim.scopeHash, scopeHashOf(base.scope));
+    assert.equal(kept.claim.generation, 1);
+    // Plain equivalent data with a different key order still replays.
+    const reordered = {nested: {inner: ['x']}, list: ['a', 'b'], ...SCOPE};
+    assert.equal(registry.reserve({requestId: base.requestId, scope: reordered}).outcome, 'existing');
+    assert.throws(() => registry.reserve({requestId: base.requestId, scope: withList(['a', 'b', 'c'])}), code('SCOPE_MISMATCH'));
+  } finally { registry.close(); }
+}));
+
+test('integrity_check rejects an index entry that disagrees with its table row', withStore(({path, t}) => {
+  const base = {requestId: 'synthetic-req-index', scope: SCOPE};
+  const seed = openClaimRegistry(path);
+  seed.reserve(base);
+  seed.close();
+  // File-format assumption: TEXT columns are stored as raw UTF-8 and adjacent
+  // in the record body. The table record holds request_key followed directly
+  // by scope_hash; the autoindex record holds request_key followed by the
+  // rowid. Only copies not followed by scope_hash are edited, one hex digit
+  // each, so lengths and record headers stay unchanged.
+  const key = Buffer.from(requestKeyOf(base.requestId), 'utf8');
+  const scopeHash = Buffer.from(scopeHashOf(SCOPE), 'utf8');
+  const bytes = readFileSync(path);
+  let tableCopies = 0;
+  let edited = 0;
+  for (let at = bytes.indexOf(key); at !== -1; at = bytes.indexOf(key, at + 1)) {
+    const after = bytes.subarray(at + key.length, at + key.length + scopeHash.length);
+    if (after.equals(scopeHash)) { tableCopies++; continue; }
+    bytes[at] = bytes[at] === 0x30 ? 0x31 : 0x30;
+    edited++;
+  }
+  assert.equal(tableCopies, 1, 'expected exactly one table copy of the request key');
+  assert.ok(edited >= 1, 'expected at least one index copy of the request key');
+  writeFileSync(path, bytes);
+  const quick = raw(path, db => Object.values(db.prepare('PRAGMA quick_check(1)').all()[0])[0]);
+  t.diagnostic(`quick_check on the edited store reported: ${quick === 'ok' ? 'ok' : 'an error'}`);
+  assert.throws(() => openClaimRegistry(path), code('STORE_CORRUPT'));
+}));
+
+test('default capacity of 1024 claims is reachable and the next reservation fails closed', withStore(({path}) => {
+  const scopeHash = scopeHashOf(SCOPE);
+  raw(path, db => {
+    const rows = [];
+    const insert = db.prepare('INSERT INTO claims (request_key, scope_hash, state, generation, owner_hash, nonce, worker_hash, result_hash, row_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    db.exec('BEGIN IMMEDIATE');
+    for (let index = 0; index < 1023; index++) {
+      const row = {request_key: requestKeyOf(`synthetic-cap-${index}`), scope_hash: scopeHash, state: 'claimed', generation: 1,
+        owner_hash: _testing.ownerHashOf(freshToken()), nonce: null, worker_hash: null, result_hash: null};
+      row.row_digest = _testing.rowDigest(row);
+      insert.run(row.request_key, row.scope_hash, row.state, row.generation, row.owner_hash, row.nonce, row.worker_hash, row.result_hash, row.row_digest);
+      rows.push(row);
+    }
+    db.prepare("UPDATE meta SET value = ? WHERE key = 'row_count'").run(String(rows.length));
+    db.prepare("UPDATE meta SET value = ? WHERE key = 'aggregate'").run(_testing.aggregateDigest(rows));
+    db.exec('COMMIT');
+  });
+  let registry = openClaimRegistry(path);
+  try {
+    const last = registry.reserve({requestId: 'synthetic-cap-last', scope: SCOPE});
+    assert.equal(last.outcome, 'created');
+    assert.equal(last.claim.state, 'claimed');
+    const intent = registry.recordDispatchIntent({requestId: 'synthetic-cap-last', scope: SCOPE, ownerToken: last.ownerToken});
+    assert.equal(intent.dispatchAuthorized, true);
+    assert.throws(() => registry.reserve({requestId: 'synthetic-cap-over', scope: SCOPE}), code('STORE_FULL'));
+    assert.equal(registry.reserve({requestId: 'synthetic-cap-0', scope: SCOPE}).outcome, 'existing');
+  } finally { registry.close(); }
+  registry = openClaimRegistry(path);
+  try {
+    assert.equal(registry.inspect({requestId: 'synthetic-cap-last', scope: SCOPE}).claim.state, 'dispatch-intent');
+    assert.equal(registry.inspect({requestId: 'synthetic-cap-1022', scope: SCOPE}).found, true);
+    assert.equal(registry.inspect({requestId: 'synthetic-cap-over', scope: SCOPE}).found, false);
+  } finally { registry.close(); }
+  assert.ok(statSync(path).size < 2048 * 4096, 'default page bound must hold the default row bound');
 }));
