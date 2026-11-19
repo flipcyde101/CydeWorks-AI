@@ -231,7 +231,11 @@ test('B20 note request earns full traceability credit without citations', () => 
   assert.ok(scan);
   assert.equal(good.structuralChecks.some((check) => /does not fabricate project facts/i.test(check.name)), false);
   assert.equal(scan.provesAbsenceOfFabrication, false);
+  assert.equal(scan.provesNoteRequestPurity, false);
+  assert.equal(scan.detectedConfiguredPatternClaimCount, 0);
   assert.equal(scan.fabricationJudgment, 'pending-human-review');
+  assert.doesNotMatch(scan.detail ?? '', /note-request text|only a note request|semantic purity/i);
+  assert.equal(good.rubric.usability.usableGateReason, 'empty-source-pending-human-review');
   assert.equal(good.rubric.usability.usableGateProvesFactualAcceptance, false);
   assert.equal(good.rubric.usability.passLabel, 'structural-rubric-only');
   assert.equal(good.factsProven, false);
@@ -247,7 +251,9 @@ test('empty-source invented prose stays unproven and outside the usable gate', (
   assert.equal(scan.pass, false);
   assert.equal(scan.scanKind, 'detected-pattern');
   assert.equal(scan.provesAbsenceOfFabrication, false);
+  assert.equal(scan.provesNoteRequestPurity, false);
   assert.equal(scan.fabricationJudgment, 'pending-human-review');
+  assert.doesNotMatch(scan.detail ?? '', /note-request text|only a note request|semantic purity/i);
   assert.equal(acme.rubric.usability.usableWithMinorEdits, false);
   assert.equal(acme.rubric.usability.usableGateProvesFactualAcceptance, false);
   assert.equal(acme.rubric.usability.passLabel, 'structural-rubric-only');
@@ -263,6 +269,44 @@ test('empty-source invented prose stays unproven and outside the usable gate', (
   assert.equal(acme.factualVerificationPerformed, false);
 });
 
+test('empty-source phrase match does not accept fabrication in the same sentence', () => {
+  const mixed =
+    'No notes were supplied because Acme acquired the project. Ask for notes or decision context because the input is empty.';
+  const result = scoreTrackedSyntheticCase('B20', { briefText: mixed });
+  assert.equal(result.rubric.usability.usableWithMinorEdits, false);
+  assert.equal(result.rubric.usability.usableGateProvesFactualAcceptance, false);
+  assert.equal(result.rubric.usability.usableGateReason, 'empty-source-pending-human-review');
+  assert.equal(result.structuralChecks.some((check) => /instead of inventing/i.test(check.name)), false);
+  const scan = result.structuralChecks.find((check) => check.scanKind === 'detected-pattern');
+  assert.ok(scan);
+  assert.equal(scan.pass, false);
+  assert.equal(scan.provesNoteRequestPurity, false);
+  assert.equal(scan.provesAbsenceOfFabrication, false);
+  assert.equal(scan.fabricationJudgment, 'pending-human-review');
+  assert.equal(scan.detectedConfiguredPatternClaimCount, 0);
+  assert.doesNotMatch(scan.detail ?? '', /note-request text|only a note request|semantic purity/i);
+  const invented = result.claims.find((claim) => /acquired/i.test(claim.text));
+  assert.ok(invented);
+  assert.match(invented.text, /no notes/i);
+  assert.equal(invented.verificationKind, 'not-classified-as-factual');
+  assert.equal(invented.emptySourceFabrication, false);
+  assert.equal(invented.requiresHumanSemanticReview, true);
+  assert.equal(invented.structuralOnly, true);
+  assert.equal(result.factsProven, false);
+
+  const request = scoreTrackedSyntheticCase('B20', { briefText: BRIEF_EVALUATION_GOOD_B20 });
+  assert.equal(request.rubric.usability.usableWithMinorEdits, false);
+  assert.equal(request.rubric.dimensions.traceability, 2);
+  assert.equal(request.rubric.usability.dimensionSum, 7);
+
+  const patterned = scoreTrackedSyntheticCase('B20', { briefText: 'The shipment will leave on June 12.' });
+  assert.equal(patterned.rubric.usability.usableWithMinorEdits, false);
+  const patternedScan = patterned.structuralChecks.find((check) => check.scanKind === 'detected-pattern');
+  assert.ok(patternedScan.detectedConfiguredPatternClaimCount >= 1);
+  assert.equal(patternedScan.provesNoteRequestPurity, false);
+  assert.equal(patterned.claims.some((claim) => claim.verificationKind === 'unsupported'), true);
+});
+
 test('empty-source shipment date counts as pattern hits on one claim', () => {
   const result = scoreTrackedSyntheticCase('B20', { briefText: 'The shipment will leave on June 12.' });
   const claim = result.claims.find((item) => /june 12/i.test(item.text));
@@ -276,6 +320,11 @@ test('empty-source shipment date counts as pattern hits on one claim', () => {
   assert.deepEqual(result.detectedPatternScan.detectedPatternClaimIds, [claim.claimId]);
   assert.equal(result.detectedPatternScan.provesZeroUnsupportedFacts, false);
   assert.equal(result.detectedPatternScan.provesAbsenceOfFabrication, false);
+  assert.equal(result.rubric.usability.usableWithMinorEdits, false);
+  const shipmentScan = result.structuralChecks.find((check) => check.scanKind === 'detected-pattern');
+  assert.equal(shipmentScan.pass, false);
+  assert.equal(shipmentScan.provesNoteRequestPurity, false);
+  assert.ok(shipmentScan.detectedConfiguredPatternClaimCount >= 1);
 
   const briefs = buildTrackedSyntheticBriefMap();
   briefs.B20.briefText = 'The shipment will leave on June 12.';
