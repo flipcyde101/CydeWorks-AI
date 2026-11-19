@@ -6,22 +6,32 @@ refused by a constant gate; only the inert fixture profile can dispatch.
 The supervisor runs as the unprivileged WSL launcher user and owns exactly one
 bubblewrap PID namespace per process lifetime:
 
-1. bwrap starts with --info-fd and --block-fd, so the namespace exists but the
-   workload command is held before exec.
-2. The supervisor opens a pidfd on the namespace init, verifies its identity
-   (boot id, PID, start time, PID namespace) and emits a "held" frame.
-3. The workload is released only after the Windows controller returns the
-   exact identity digest, which it sends only after its durable record fsyncs.
-4. Stop signals the namespace init through the verified pidfd. The kernel then
-   terminates every process in that PID namespace. Cleanup is "verified" only
-   when the pidfd reports exit and a scan finds no remaining member.
+1. bwrap starts with --info-fd. Its command is a fixed trusted bootstrap.
+   The inert payload is mounted read-only and is not executed yet.
+2. The supervisor opens a pidfd on the namespace init and verifies parentage,
+   boot id, PID, start time, and PID namespace before that pidfd may be
+   signalled. A failed check closes the candidate. Stop then handles only the
+   directly owned launcher.
+3. The bootstrap reads one line from the supervisor pipe. It executes the
+   payload only for the exact release token. EOF and every other input exit
+   without executing the payload. Bubblewrap --block-fd is not a release gate.
+4. Stop signals the namespace init only through a pidfd that still matches the
+   recorded identity. The kernel then terminates every process in that PID
+   namespace. Cleanup is "verified" only when the pidfd reports exit and a
+   scan finds no remaining member.
 
 Control frames come only from this supervisor. Workload stdout is JSON-encoded
 inside "workload" frames, so workload bytes can never be read as control.
+Guest stdout writes are bounded. A lost or backed-up reader cannot stall
+cleanup or the hold and lifetime deadlines. A frame that cannot be written
+inside that bound is dropped for the rest of the session. Healthy output
+remains one NDJSON object per line.
 Any ambiguity yields cleanup "unknown". Nothing here retries a dispatch.
 """
 
 from collections import deque
+import errno
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -48,6 +58,10 @@ HOLD_SECONDS = 10.0
 LIFETIME_SECONDS = {"inert-fixture": 30.0, "actual-opencode": 110.0}
 EXIT_WAIT_SECONDS = 3.0
 SETTLE_SECONDS = 2.0
+OUTPUT_WRITE_SECONDS = 0.25
+RELEASE_TOKEN = b"cydeworks-release-v1\n"
+BOOTSTRAP_PAYLOAD = "/stop-payload.py"
+BOOTSTRAP_GUEST = "/stop-guest.py"
 NONCE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 PID_NS_RE = re.compile(r"^pid:\[\d+\]$")
 BOOT_ID_RE = re.compile(r"^[0-9A-Za-z._-]{1,128}$")
@@ -112,6 +126,18 @@ class Ops:
     @staticmethod
     def exited(fd, seconds):
         return bool(select.select([fd], [], [], max(0.0, seconds))[0])
+
+    @staticmethod
+    def pidfd_pid(fd):
+        """Return the PID named by this pidfd, or raise OSError if it is unreadable."""
+        raw = Path(f"/proc/self/fdinfo/{fd}").read_text()
+        for line in raw.splitlines():
+            if line.startswith("Pid:"):
+                value = line.split(":", 1)[1].strip()
+                if value.isdigit():
+                    return int(value)
+                break
+        raise OSError("pidfd pid unreadable")
 
 
 def identify(proc, pid):
@@ -265,6 +291,21 @@ def validate_identity(identity):
     return identity
 
 
+def init_fd_verified(proc, ops, fd, expected, uid):
+    """Return True only when fd still names the recorded init process.
+
+    An unreadable or mismatched pidfd is not a signalling handle. Ambiguous
+    /proc reads propagate so the caller reports cleanup unknown.
+    """
+    try:
+        target = ops.pidfd_pid(fd)
+    except (AttributeError, OSError, ValueError):
+        return False
+    if type(target) is not int or target != expected["pid"]:
+        return False
+    return matches_expected(proc, expected, uid=uid)
+
+
 def stop_identity(proc, identity, ops, init_fd=None, expected_nonce=None, wait=EXIT_WAIT_SECONDS, settle=SETTLE_SECONDS):
     """Stop the namespace named by identity and report evidence.
 
@@ -285,11 +326,16 @@ def stop_identity(proc, identity, ops, init_fd=None, expected_nonce=None, wait=E
             return {"cleanup": "verified", "evidence": evidence}
         handles = []
         try:
+            verified_init = False
             if init_fd is not None:
-                evidence["init"] = "owned-fd"
-                handles.append(("init", init_fd, False))
+                if init_fd_verified(proc, ops, init_fd, identity["init"], identity["uid"]):
+                    evidence["init"] = "owned-fd"
+                    handles.append(("init", init_fd, False))
+                    verified_init = True
+                else:
+                    evidence["initFd"] = "rejected"
             for name in ("init", "bwrap"):
-                if name == "init" and init_fd is not None:
+                if name == "init" and verified_init:
                     continue
                 fd, state = open_verified(proc, identity[name], ops, uid=identity["uid"])
                 evidence[name] = state
@@ -366,13 +412,16 @@ def pinned_bwrap(sandbox, path):
     return str(path)
 
 
-def build_command(profile, sandbox, bwrap, info_fd, block_fd, payload=None):
-    """Build the bwrap argv for a profile with the hold and identity fds.
+def build_command(profile, sandbox, bwrap, info_fd, payload=None, guest=None):
+    """Build the bwrap argv for a profile with the identity fd.
 
     Reuses sandbox.command() so the namespace flags, mounts and pinned
     dependency checks stay identical to the pilot. The pilot's outer
     `timeout` wrapper is replaced by the supervisor's own hold and lifetime
     bounds, because the supervisor must be the direct parent of bwrap.
+    The inert profile runs a fixed bootstrap. The payload is mounted
+    read-only and is not the program after `--`. Bubblewrap --block-fd is
+    not a release gate.
     """
     original = sandbox.pinned
     sandbox.pinned = lambda name: bwrap if name == "runner-bwrap" else original(name)
@@ -384,18 +433,27 @@ def build_command(profile, sandbox, bwrap, info_fd, block_fd, payload=None):
         elif profile == "inert-fixture":
             args = sandbox.command("linger")
             split = args.index("--")
-            payload = Path(payload or ROOT / PAYLOAD)
-            if not payload.is_file() or payload.is_symlink():
+            payload_path = Path(payload or ROOT / PAYLOAD)
+            guest_path = Path(guest or ROOT / "opencode-stop-guest.py")
+            if not payload_path.is_file() or payload_path.is_symlink():
                 raise RuntimeError("BLOCKED: inert payload unavailable")
-            args = args[:split] + ["--ro-bind", str(payload), "/stop-payload.py", "--",
-                                   sandbox.PYTHON, "-I", "-B", "/stop-payload.py"]
+            if not guest_path.is_file() or guest_path.is_symlink():
+                raise RuntimeError("BLOCKED: trusted bootstrap unavailable")
+            args = args[:split] + [
+                "--ro-bind", str(guest_path), BOOTSTRAP_GUEST,
+                "--ro-bind", str(payload_path), BOOTSTRAP_PAYLOAD,
+                "--",
+                sandbox.PYTHON, "-I", "-B", BOOTSTRAP_GUEST, "bootstrap",
+            ]
         else:
             raise RuntimeError("BLOCKED: unknown profile")
     finally:
         sandbox.pinned = original
     if args[0] != bwrap or "--unshare-all" not in args or "--die-with-parent" not in args:
         raise RuntimeError("BLOCKED: unexpected sandbox launcher")
-    return [bwrap, "--info-fd", str(info_fd), "--block-fd", str(block_fd), *args[1:]]
+    if "--block-fd" in args:
+        raise RuntimeError("BLOCKED: block-fd is not a release gate")
+    return [bwrap, "--info-fd", str(info_fd), *args[1:]]
 
 
 def read_info(fd, seconds):
@@ -463,53 +521,68 @@ class Supervisor:
         self.lifetime = self.lifetime or LIFETIME_SECONDS[profile]
         info_read, info_write = os.pipe()
         try:
-            block_read, block_write = os.pipe()
+            release_read, release_write = os.pipe()
         except Exception:
             os.close(info_read)
             os.close(info_write)
             raise
         try:
             try:
-                argv = build_command(profile, self.sandbox, self.bwrap, info_write, block_read, self.payload)
-                self.process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                                stderr=subprocess.DEVNULL, pass_fds=(info_write, block_read),
+                argv = build_command(profile, self.sandbox, self.bwrap, info_write, self.payload)
+                self.process = subprocess.Popen(argv, stdin=release_read, stdout=subprocess.PIPE,
+                                                stderr=subprocess.DEVNULL, pass_fds=(info_write,),
                                                 close_fds=True, bufsize=0)
             finally:
                 os.close(info_write)
-                os.close(block_read)
-            self.release_fd = block_write
+                os.close(release_read)
+            self.release_fd = release_write
         except Exception:
             os.close(info_read)
             if self.release_fd is None:
-                os.close(block_write)
+                os.close(release_write)
             raise
         try:
             pid, reported_ns = read_info(info_read, self.hold)
         finally:
             os.close(info_read)
-        # The init is an unreaped child of our bwrap child, so its PID cannot be
-        # reused yet. Open the pidfd first, then verify parentage and namespace.
-        self.init_fd = self.ops.pidfd_open(pid)
-        state = self.proc.stat(pid)
-        if state["ppid"] != self.process.pid or state["state"] in ("Z", "X"):
-            raise RuntimeError("BLOCKED: namespace init parentage mismatch")
-        init = identify(self.proc, pid)
-        bwrap = identify(self.proc, self.process.pid)
-        own_ns = self.proc.pid_ns(os.getpid())
-        if init is None or bwrap is None or init["pidNs"] == bwrap["pidNs"] or bwrap["pidNs"] != own_ns:
-            raise RuntimeError("BLOCKED: namespace identity unavailable or not private")
-        if reported_ns is not None and init["pidNs"] != f"pid:[{reported_ns}]":
-            raise RuntimeError("BLOCKED: bwrap and /proc disagree on the namespace")
-        boot = self.proc.boot_id()
-        depth = len(self.proc.status(os.getpid()).get("NSpid", []))
-        if depth < 1:
-            raise RuntimeError("BLOCKED: namespace depth unavailable")
-        self.identity = {"schema": SCHEMA, "nonce": nonce, "profile": profile, "bootId": boot,
-                         "uid": os.getuid(), "depth": depth,
-                         "supervisor": identify(self.proc, os.getpid()), "bwrap": bwrap, "init": init,
-                         "birthIdentity": f"{boot}:{init['pid']}:{init['start']}:{init['pidNs']}"}
-        validate_identity(self.identity)
-        self.emit({"event": "held", "nonce": nonce, "identity": self.identity, "digest": digest(self.identity)})
+        # Open the pidfd first so the PID cannot be reused under this handle,
+        # then verify parentage and namespace. A failed check closes the
+        # candidate and never stores it for signalling.
+        candidate = None
+        try:
+            try:
+                candidate = self.ops.pidfd_open(pid)
+            except ProcessLookupError as error:
+                raise RuntimeError("BLOCKED: namespace init unavailable") from error
+            except OSError as error:
+                raise RuntimeError("BLOCKED: namespace init pidfd unavailable") from error
+            state = self.proc.stat(pid)
+            if state["ppid"] != self.process.pid or state["state"] in ("Z", "X"):
+                raise RuntimeError("BLOCKED: namespace init parentage mismatch")
+            init = identify(self.proc, pid)
+            bwrap_identity = identify(self.proc, self.process.pid)
+            own_ns = self.proc.pid_ns(os.getpid())
+            if (init is None or bwrap_identity is None or init["pidNs"] == bwrap_identity["pidNs"]
+                    or bwrap_identity["pidNs"] != own_ns):
+                raise RuntimeError("BLOCKED: namespace identity unavailable or not private")
+            if reported_ns is not None and init["pidNs"] != f"pid:[{reported_ns}]":
+                raise RuntimeError("BLOCKED: bwrap and /proc disagree on the namespace")
+            boot = self.proc.boot_id()
+            depth = len(self.proc.status(os.getpid()).get("NSpid", []))
+            if depth < 1:
+                raise RuntimeError("BLOCKED: namespace depth unavailable")
+            identity = {"schema": SCHEMA, "nonce": nonce, "profile": profile, "bootId": boot,
+                        "uid": os.getuid(), "depth": depth,
+                        "supervisor": identify(self.proc, os.getpid()), "bwrap": bwrap_identity, "init": init,
+                        "birthIdentity": f"{boot}:{init['pid']}:{init['start']}:{init['pidNs']}"}
+            validate_identity(identity)
+            self.identity = identity
+            self.init_fd = candidate
+            candidate = None
+            self.emit({"event": "held", "nonce": nonce, "identity": self.identity, "digest": digest(self.identity)})
+        finally:
+            if candidate is not None:
+                self.ops.close(candidate)
 
     def dispatch(self, nonce, identity_digest):
         if self.identity is None or self.dispatched or nonce != self.identity["nonce"]:
@@ -518,7 +591,12 @@ class Supervisor:
             raise RuntimeError("BLOCKED: controller did not record this identity")
         if not same(identify(self.proc, self.identity["init"]["pid"]), self.identity["init"]):
             raise RuntimeError("BLOCKED: namespace changed before dispatch")
-        os.write(self.release_fd, b"1")
+        pending = RELEASE_TOKEN
+        while pending:
+            wrote = os.write(self.release_fd, pending)
+            if wrote <= 0:
+                raise OSError("release token write failed")
+            pending = pending[wrote:]
         os.close(self.release_fd)
         self.release_fd = None
         self.dispatched = True
@@ -530,13 +608,14 @@ class Supervisor:
             self.release_fd = None
         try:
             if self.identity is None:
-                # No complete identity: kill only our own bwrap child and any
-                # opened init pidfd by handle, and report unknown because
-                # namespace members were never fully identified.
-                if self.init_fd is not None:
+                # No complete identity: close any leftover pidfd without
+                # signalling it, and stop only the directly owned launcher.
+                leftover = self.init_fd
+                self.init_fd = None
+                if leftover is not None:
                     try:
-                        self.ops.kill(self.init_fd)
-                    except (ProcessLookupError, OSError):
+                        self.ops.close(leftover)
+                    except OSError:
                         pass
                 if self.process and self.process.poll() is None:
                     self.process.kill()
@@ -698,11 +777,64 @@ def next_line_bounded(reader, deadline):
 
 
 def write_frame(frame):
+    """Write one NDJSON frame without letting a stalled reader block the caller.
+
+    Returns True when the full frame is written. Returns False on EAGAIN,
+    EPIPE, or the output deadline. Never raises BrokenPipeError. A frame
+    over FRAME_MAX is replaced by the existing blocked frame. Smaller frames
+    keep their bytes, including frames between PIPE_BUF and FRAME_MAX.
+    """
     data = canonical(frame).encode() + b"\n"
     if len(data) > FRAME_MAX:
         data = canonical({"event": "blocked", "reason": "frame too large"}).encode() + b"\n"
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
+    try:
+        fd = sys.stdout.buffer.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    except OSError:
+        return False
+    was_blocking = (flags & os.O_NONBLOCK) == 0
+    changed = False
+    view = memoryview(data)
+    sent = 0
+    deadline = time.monotonic() + OUTPUT_WRITE_SECONDS
+    try:
+        os.set_blocking(fd, False)
+        changed = True
+        while sent < len(view):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                writable = select.select([], [fd], [], remaining)[1]
+            except OSError as error:
+                if error.errno == errno.EINTR:
+                    continue
+                return False
+            if not writable:
+                return False
+            try:
+                wrote = os.write(fd, view[sent:])
+            except BrokenPipeError:
+                return False
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                    continue
+                return False
+            if wrote <= 0:
+                return False
+            sent += wrote
+        return True
+    except OSError:
+        return False
+    finally:
+        if changed:
+            try:
+                os.set_blocking(fd, was_blocking)
+            except OSError:
+                pass
 
 
 def serve(stdin=None, emit=write_frame, **options):
@@ -710,7 +842,22 @@ def serve(stdin=None, emit=write_frame, **options):
 
     Stdin EOF, an invalid frame, hold expiry, or lifetime expiry all Stop.
     A stale-nonce stop frame is rejected without disturbing the live namespace.
+    A stdout write that cannot finish inside OUTPUT_WRITE_SECONDS is dropped,
+    and later frames in this session are skipped, so cleanup is not stuck
+    on a full pipe.
     """
+    output_stalled = False
+
+    def publish(frame):
+        nonlocal output_stalled
+        if output_stalled:
+            return False
+        result = emit(frame)
+        if result is False:
+            output_stalled = True
+            return False
+        return True
+
     stdin = stdin or sys.stdin.buffer
     supervisor_factory = options.pop("supervisor_factory", Supervisor)
     start_hold = options.get("hold", HOLD_SECONDS)
@@ -726,7 +873,7 @@ def serve(stdin=None, emit=write_frame, **options):
         frame = parse_control_frame(first)
         if frame["op"] != "start":
             raise RuntimeError("BLOCKED: start frame required")
-        supervisor = supervisor_factory(emit, **options)
+        supervisor = supervisor_factory(publish, **options)
         supervisor.start(frame.get("nonce"), frame.get("profile"), frame.get("bwrap"))
         started = time.monotonic()
         workload_stream = supervisor.process.stdout if supervisor.process else None
@@ -750,7 +897,7 @@ def serve(stdin=None, emit=write_frame, **options):
                         break
                     if wline is False:
                         break
-                    emit({"event": "workload", "data": wline[:WORKLOAD_LINE_MAX].decode("utf-8", "replace")})
+                    publish({"event": "workload", "data": wline[:WORKLOAD_LINE_MAX].decode("utf-8", "replace")})
 
             cline = stdin_reader.pop_line()
             if cline is None:
@@ -766,7 +913,7 @@ def serve(stdin=None, emit=write_frame, **options):
                         reason = "stop"
                         break
                     stale_nonce = frame.get("nonce")
-                    emit({
+                    publish({
                         "event": "ignored",
                         "op": "stop",
                         "nonce": stale_nonce[:64] if isinstance(stale_nonce, str) else None,
@@ -802,7 +949,7 @@ def serve(stdin=None, emit=write_frame, **options):
                 stdin_reader.read_available()
     except Exception as error:  # Any failure stops the owned namespace.
         reason = "blocked"
-        emit({"event": "blocked", "reason": str(error)[:500]})
+        publish({"event": "blocked", "reason": str(error)[:500]})
     finally:
         if supervisor is not None:
             if supervisor.process is not None:
@@ -860,8 +1007,47 @@ def oneshot(op, stdin=None, emit=write_frame, proc=None, ops=Ops, timeout=HOLD_S
     return 0
 
 
+def run_bootstrap(stdin, payload=BOOTSTRAP_PAYLOAD, execv=None):
+    """Execute the inert payload only after the exact release token.
+
+    EOF and every other line return 0 without exec. Extra CLI arguments are
+    ignored by the caller: the payload path is this argument, and the CLI
+    always passes the fixed in-sandbox path. stdin is replaced with
+    /dev/null before exec so the payload cannot read the release pipe.
+    """
+    runner = os.execv if execv is None else execv
+    try:
+        line = stdin.readline(len(RELEASE_TOKEN) + 1)
+    except (OSError, ValueError):
+        return 0
+    if line != RELEASE_TOKEN:
+        return 0
+    path = Path(payload)
+    try:
+        if path.is_symlink() or not path.is_file():
+            return 0
+    except OSError:
+        return 0
+    try:
+        null_fd = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(null_fd, 0)
+        finally:
+            os.close(null_fd)
+    except OSError:
+        return 0
+    python = sys.executable
+    try:
+        runner(python, [python, "-I", "-B", str(path)])
+    except OSError:
+        return 0
+    return 0
+
+
 if __name__ == "__main__":
     mode = sys.argv[1:] or ["serve"]
+    if mode[:1] == ["bootstrap"]:
+        sys.exit(run_bootstrap(sys.stdin.buffer))
     if mode == ["serve"]:
         sys.exit(serve())
     if mode in (["confirm"], ["stop"]):

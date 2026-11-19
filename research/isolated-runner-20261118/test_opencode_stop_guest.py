@@ -5,12 +5,16 @@ network, empty allowlisted environment, read-only target and toolchain mounts,
 scratch-only /tmp and /work writes, and strict CPU/memory/process/time limits.
 """
 
+import fcntl
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import select
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -26,6 +30,61 @@ SPEC.loader.exec_module(GUEST)
 NONCE_A = "11111111-2222-4333-8444-555555555555"
 NONCE_B = "66666666-7777-4888-9999-aaaaaaaaaaaa"
 BOOT_ID = "01234567-89ab-cdef-0123-456789abcdef"
+RELEASE_TOKEN = b"cydeworks-release-v1\n"
+
+
+class CommandSandbox:
+    """Stand-in for sandbox.command() that still carries the launcher guardrails."""
+
+    PINNED = {"runner-bwrap": "0" * 64}
+    PYTHON = "/usr/bin/python3"
+
+    @staticmethod
+    def pinned(name):
+        return f"/{name}"
+
+    @staticmethod
+    def command(_mode):
+        return ["/fake-bwrap", "--unshare-all", "--unshare-user", "--disable-userns",
+                "--die-with-parent", "--new-session", "--clearenv", "--",
+                "/usr/bin/python3", "-I", "-B", "/guest.py", "linger"]
+
+
+class FakeLauncher:
+    """Direct child handle. kill() records the owned launcher, not a pidfd."""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.stdout = io.BytesIO()
+        self.killed = False
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+def drain_nonblocking(fds):
+    data = b""
+    for fd in fds:
+        os.set_blocking(fd, False)
+        try:
+            while True:
+                chunk = os.read(fd, 256)
+                if not chunk:
+                    break
+                data += chunk
+        except BlockingIOError:
+            continue
+    return data
 
 
 class FakeProc:
@@ -110,6 +169,11 @@ class FakeOps:
     def close(self, fd):
         self.open_fds.pop(fd, None)
         self.closed_fds.append(fd)
+
+    def pidfd_pid(self, fd):
+        if fd not in self.open_fds:
+            raise OSError(fd)
+        return self.open_fds[fd]
 
     def kill(self, fd):
         pid = self.open_fds[fd]
@@ -569,6 +633,302 @@ class OpenCodeStopGuestUnitTests(unittest.TestCase):
         reply_ok_c, _ = run_one("confirm", valid_env)
         self.assertEqual(reply_ok_c["event"], "confirmed")
         self.assertTrue(reply_ok_c["absent"])
+
+    def _capture_popen(self, captured):
+        def fake_popen(argv, stdin=None, pass_fds=(), **_kwargs):
+            captured["argv"] = list(argv)
+            captured["stdin"] = stdin
+            reads = []
+            candidates = []
+            if isinstance(stdin, int) and stdin >= 0:
+                candidates.append(stdin)
+            candidates.extend(pass_fds)
+            for fd in candidates:
+                cloned = os.dup(fd)
+                mode = fcntl.fcntl(cloned, fcntl.F_GETFL) & os.O_ACCMODE
+                if mode == os.O_WRONLY:
+                    os.close(cloned)
+                    continue
+                reads.append(cloned)
+            captured["reads"] = reads
+            launcher = FakeLauncher(419)
+            captured["launcher"] = launcher
+            return launcher
+        return fake_popen
+
+    def _held_namespace(self):
+        me = os.getpid()
+        own = "pid:[4026531836]"
+        guest_ns = "pid:[4026532500]"
+        proc = FakeProc(uid=os.getuid())
+        proc.add(419, "99001", own, ppid=me, nspid=(419,))
+        proc.add(420, "99002", guest_ns, ppid=419, nspid=(420, 1))
+        proc.add(me, "99000", own, ppid=1, nspid=(me,))
+        return proc, FakeOps(proc)
+
+    def test_failed_identity_closes_candidate_and_signals_only_owned_launcher(self):
+        proc = FakeProc()
+        proc.add(420, "99002", "pid:[4026532500]", ppid=1, nspid=(420, 1))
+        ops = FakeOps(proc)
+        captured = {}
+        sup = GUEST.Supervisor(lambda _frame: None, proc=proc, ops=ops, sandbox=CommandSandbox(),
+                               payload=str(ROOT / "opencode-stop-payload.py"))
+        try:
+            with mock.patch.object(GUEST, "pinned_bwrap", return_value="/fake-bwrap"), \
+                 mock.patch.object(GUEST.subprocess, "Popen", side_effect=self._capture_popen(captured)), \
+                 mock.patch.object(GUEST, "read_info", return_value=(420, 4026532500)):
+                with self.assertRaisesRegex(RuntimeError, "parentage"):
+                    sup.start(NONCE_A, "inert-fixture")
+            sup.stop("blocked")
+            self.assertEqual(ops.signalled_pids, [])
+            self.assertEqual(ops.open_fds, {})
+            self.assertTrue(captured["launcher"].killed)
+        finally:
+            for fd in captured.get("reads", ()):
+                os.close(fd)
+
+    def test_stop_identity_does_not_signal_unverified_init_fd(self):
+        proc = FakeProc()
+        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
+        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
+        proc.add(777, "105001", "pid:[4026531999]", nspid=(777,))
+        ops = FakeOps(proc)
+        foreign = ops.pidfd_open(777)
+        result = GUEST.stop_identity(proc, sample_identity(), ops, init_fd=foreign, wait=0.2, settle=0.2)
+        self.assertEqual(result["cleanup"], "verified")
+        self.assertNotIn(777, ops.signalled_pids)
+        self.assertIn(420, ops.signalled_pids)
+        self.assertIn(419, ops.signalled_pids)
+        self.assertIn(777, proc.table)
+
+        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
+        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
+        owned = ops.pidfd_open(420)
+        ops.signalled_pids.clear()
+        verified = GUEST.stop_identity(proc, sample_identity(), ops, init_fd=owned, wait=0.2, settle=0.2)
+        self.assertEqual(verified["cleanup"], "verified")
+        self.assertEqual(ops.signalled_pids, [420, 419])
+
+    def test_verified_release_writes_token_and_keeps_launcher_guardrails(self):
+        proc, ops = self._held_namespace()
+        captured = {}
+        frames = []
+        sup = GUEST.Supervisor(frames.append, proc=proc, ops=ops, sandbox=CommandSandbox(),
+                               payload=str(ROOT / "opencode-stop-payload.py"))
+        try:
+            with mock.patch.object(GUEST, "pinned_bwrap", return_value="/fake-bwrap"), \
+                 mock.patch.object(GUEST.subprocess, "Popen", side_effect=self._capture_popen(captured)), \
+                 mock.patch.object(GUEST, "read_info", return_value=(420, 4026532500)):
+                sup.start(NONCE_A, "inert-fixture")
+            argv = captured["argv"]
+            self.assertNotIn("--block-fd", argv)
+            self.assertNotEqual(captured["stdin"], subprocess.DEVNULL)
+            self.assertIn("--unshare-all", argv)
+            self.assertIn("--die-with-parent", argv)
+            self.assertIn("--disable-userns", argv)
+            self.assertIn("bootstrap", argv)
+            self.assertIn("/stop-payload.py", argv)
+            tail = argv[argv.index("--") + 1:]
+            self.assertEqual(tail[-2:], ["/stop-guest.py", "bootstrap"])
+            self.assertNotIn("/stop-payload.py", tail)
+            sup.dispatch(NONCE_A, frames[0]["digest"])
+            self.assertEqual(drain_nonblocking(captured["reads"]), RELEASE_TOKEN)
+            sup.stop("stop")
+            self.assertEqual(ops.signalled_pids, [420, 419])
+            self.assertNotIn(os.getpid(), ops.signalled_pids)
+        finally:
+            for fd in captured.get("reads", ()):
+                os.close(fd)
+
+    def test_cancel_before_release_sends_eof_and_does_not_write_token(self):
+        proc, ops = self._held_namespace()
+        captured = {}
+        sup = GUEST.Supervisor(lambda _frame: None, proc=proc, ops=ops, sandbox=CommandSandbox(),
+                               payload=str(ROOT / "opencode-stop-payload.py"))
+        try:
+            with mock.patch.object(GUEST, "pinned_bwrap", return_value="/fake-bwrap"), \
+                 mock.patch.object(GUEST.subprocess, "Popen", side_effect=self._capture_popen(captured)), \
+                 mock.patch.object(GUEST, "read_info", return_value=(420, 4026532500)):
+                sup.start(NONCE_A, "inert-fixture")
+            sup.stop("eof")
+            self.assertEqual(drain_nonblocking(captured["reads"]), b"")
+            self.assertEqual(ops.signalled_pids, [420, 419])
+        finally:
+            for fd in captured.get("reads", ()):
+                os.close(fd)
+
+    def _run_bootstrap(self, payload, stdin_bytes):
+        code = (
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('guest', {str(ROOT / 'opencode-stop-guest.py')!r})\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            f"sys.exit(mod.run_bootstrap(sys.stdin.buffer, payload={str(payload)!r}))\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-I", "-B", "-c", code],
+            input=stdin_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+
+    def test_release_token_executes_fixture_without_controller_forwarding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            marker = directory / "ran.txt"
+            payload = directory / "opencode-stop-payload.py"
+            payload.write_text(
+                "import json, os, pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+                "print(json.dumps({'payload':'inert-fixture','direct':True,'pid':os.getpid()}), flush=True)\n",
+                encoding="utf-8",
+            )
+            proc = self._run_bootstrap(payload, RELEASE_TOKEN)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            self.assertEqual(marker.read_text(encoding="utf-8"), "ran")
+            observed = json.loads(proc.stdout.decode())
+            self.assertEqual(observed["payload"], "inert-fixture")
+            self.assertTrue(observed["direct"])
+            self.assertGreater(observed["pid"], 1)
+            self.assertNotIn(b"workload", proc.stdout)
+
+    def test_eof_and_non_release_never_execute_payload(self):
+        samples = (b"", b"1\n", b"release\n", b"cydeworks-release-v1", b"cydeworks-release-v1!\n", b"\x00\n")
+        for sample in samples:
+            with self.subTest(sample=sample), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                marker = directory / "ran.txt"
+                payload = directory / "opencode-stop-payload.py"
+                payload.write_text(
+                    "import pathlib\n"
+                    f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+                    "print('executed', flush=True)\n",
+                    encoding="utf-8",
+                )
+                proc = self._run_bootstrap(payload, sample)
+                self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+                self.assertFalse(marker.exists())
+                self.assertNotIn(b"executed", proc.stdout)
+
+    def test_bootstrap_cli_ignores_extra_path_and_requires_fixed_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evil = Path(directory) / "evil.py"
+            evil.write_text("print('executed-evil', flush=True)\n", encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, "-I", "-B", str(ROOT / "opencode-stop-guest.py"), "bootstrap", str(evil)],
+                input=RELEASE_TOKEN,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn(b"executed-evil", combined)
+            self.assertEqual(proc.returncode, 0, combined.decode("utf-8", "replace"))
+
+    def test_real_inert_payload_is_observable_without_controller_forwarding(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-B", str(ROOT / "opencode-stop-payload.py")],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            ready = select.select([proc.stdout], [], [], 3)[0]
+            self.assertTrue(ready)
+            info = json.loads(proc.stdout.readline().decode())
+            self.assertEqual(info["payload"], "inert-fixture")
+            self.assertGreater(info["nsChildPid"], 0)
+            self.assertNotEqual(info["nsChildPid"], info["nsInitPid"])
+        finally:
+            if proc.stdout is not None and not proc.stdout.closed:
+                proc.stdout.close()
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=3)
+
+    def test_backed_up_stdout_does_not_stall_cleanup(self):
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        filler = b"x" * 65536
+        try:
+            while True:
+                os.write(write_fd, filler)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_fd, True)
+        raw = os.fdopen(write_fd, "wb", buffering=0)
+        held = sys.stdout
+        wrapper = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+        sys.stdout = wrapper
+        box = {}
+
+        def attempt():
+            try:
+                box["ok"] = GUEST.write_frame({"event": "stopped", "nonce": NONCE_A, "cleanup": "verified"})
+            except Exception as error:
+                box["error"] = type(error).__name__
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(1.0)
+        stalled = worker.is_alive()
+        sys.stdout = held
+        os.close(read_fd)
+        worker.join(1.0)
+        wrapper.close()
+        self.assertFalse(stalled)
+        self.assertIs(box.get("ok"), False)
+        self.assertNotIn("error", box)
+
+    def test_lost_stdout_does_not_stall_or_raise(self):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        raw = os.fdopen(write_fd, "wb", buffering=0)
+        held = sys.stdout
+        wrapper = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+        sys.stdout = wrapper
+        try:
+            started = time.monotonic()
+            try:
+                ok = GUEST.write_frame({"event": "stopped", "nonce": NONCE_A, "cleanup": "unknown"})
+            except BrokenPipeError:
+                ok = "raised"
+            elapsed = time.monotonic() - started
+        finally:
+            sys.stdout = held
+            wrapper.close()
+        self.assertIs(ok, False)
+        self.assertLess(elapsed, 1.0)
+
+    def test_kept_up_stdout_preserves_ndjson_frame(self):
+        read_fd, write_fd = os.pipe()
+        raw = os.fdopen(write_fd, "wb", buffering=0)
+        held = sys.stdout
+        wrapper = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+        sys.stdout = wrapper
+        frame = {"event": "stopped", "nonce": NONCE_A, "cleanup": "verified"}
+        try:
+            result = GUEST.write_frame(frame)
+            os.set_blocking(read_fd, False)
+            data = os.read(read_fd, 8192)
+        finally:
+            sys.stdout = held
+            os.close(read_fd)
+            wrapper.close()
+        self.assertTrue(data.endswith(b"\n"))
+        self.assertEqual(json.loads(data.decode()), frame)
+        self.assertIs(result, True)
+
+    def test_pidfd_pid_reads_own_process_without_signalling(self):
+        fd = os.pidfd_open(os.getpid())
+        try:
+            self.assertEqual(GUEST.Ops.pidfd_pid(fd), os.getpid())
+        finally:
+            os.close(fd)
 
 
 @unittest.skipUnless(
