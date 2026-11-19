@@ -28,10 +28,6 @@ def identity(pid):
 
 def main():
     binary = pinned()
-    print(json.dumps({'event': 'starting'}), flush=True)
-    if select.select([sys.stdin], [], [], 0.2)[0]:
-        print(json.dumps({'event': 'blocked', 'reason': 'Interrupted before launch'}), flush=True)
-        return
     args = [binary, '--unshare-all', '--unshare-user', '--disable-userns', '--die-with-parent',
             '--new-session', '--clearenv']
     for path in ('/usr/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib/python3.12', '/usr/bin/python3.12'):
@@ -41,6 +37,7 @@ def main():
              'import os,time; print(os.getpid(),flush=True); time.sleep(30)']
     process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
+        print(json.dumps({'event': 'starting', 'worker': identity(process.pid)}), flush=True)
         ready = select.select([process.stdout], [], [], 5)[0]
         frame = process.stdout.readline() if ready else b''
         if not frame.strip().isdigit():
