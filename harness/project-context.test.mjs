@@ -1726,3 +1726,99 @@ test('copies caller input into inert data before sampling the clock and never in
     /nesting depth/,
   );
 });
+
+test('bounds oversized strings before validation scans, UTF-8 encoding, clock, or state', () => {
+  let clockCalls = 0;
+  const base = makeClock();
+  const lib = createProjectContextLibrary({
+    clock: () => {
+      clockCalls += 1;
+      return base.clock();
+    },
+  });
+
+  // A very large string is rejected at the data-only boundary, before the
+  // clock is sampled, so no validation, regex scan, or UTF-8 encoding runs.
+  const huge = 'x'.repeat(2 ** 24);
+  clockCalls = 0;
+  assert.throws(
+    () => lib.registerEntry(makeMemoryInput({ entryId: 'mem-huge', content: huge })),
+    /maximum string length/,
+  );
+  assert.throws(
+    () => lib.previewPromptContext({ projectId: 'proj-alpha', entryIds: [huge] }),
+    /maximum string length/,
+  );
+  assert.equal(clockCalls, 0);
+  assert.equal(lib.getEntry({ projectId: 'proj-alpha', entryId: 'mem-huge' }), null);
+
+  // One code unit over the content limit fails at the boundary too.
+  assert.throws(
+    () => lib.registerEntry(makeMemoryInput({ entryId: 'mem-over', content: 'x'.repeat(65537) })),
+    /exceeds/,
+  );
+
+  // A field with a smaller byte limit is length-checked before the
+  // well-formedness scan: an over-length string containing a lone surrogate
+  // reports the length bound, not the Unicode error.
+  const registerTemplate = (templateId, requestText) =>
+    lib.createTaskTemplate({
+      projectId: 'proj-alpha',
+      templateId,
+      title: 'Request bound check',
+      workflowKind: 'brief',
+      inputs: { requestText, targetScopeLabels: ['docs'], selectedEntryRefs: [] },
+    });
+  assert.throws(() => registerTemplate('tpl-request-over', `${'r'.repeat(16384)}\uD800`), /exceeds allowed byte length/);
+  assert.throws(() => registerTemplate('tpl-request-surrogate', 'short \uD800'), /^Error: Invalid template\.inputs\.requestText\.$/);
+  assert.equal(registerTemplate('tpl-request-exact', 'r'.repeat(16384)).inputs.requestText.length, 16384);
+
+  // Multibyte content within the code-unit bound is still checked by UTF-8 bytes.
+  const exactTwoByte = 'é'.repeat(32768);
+  assert.equal(Buffer.byteLength(exactTwoByte, 'utf8'), 65536);
+  const fits = lib.registerEntry(makeMemoryInput({ entryId: 'mem-two-byte-exact', content: exactTwoByte }));
+  assert.equal(fits.content.length, 32768);
+  assert.throws(
+    () => lib.registerEntry(makeMemoryInput({ entryId: 'mem-two-byte-over', content: `${exactTwoByte}é` })),
+    /exceeds allowed byte length/,
+  );
+});
+
+test('rejects Proxy arrays whose reported keys are not exactly the canonical indexes', () => {
+  const lib = createProjectContextLibrary({ clock: makeClock().clock });
+  approveCurrent(lib, lib.registerEntry(makeMemoryInput({ entryId: 'mem-style' })));
+  approveCurrent(lib, lib.registerEntry(makeMemoryInput({ entryId: 'mem-other' })));
+
+  const withKeys = (keys) =>
+    new Proxy(['mem-style', 'mem-other'], {
+      ownKeys() {
+        return keys;
+      },
+    });
+
+  // Each list has length + 1 entries and includes "length", which the
+  // previous count-and-numeric check accepted for non-index keys.
+  for (const keys of [
+    ['0', '-1', 'length'],
+    ['0', '0.5', 'length'],
+    ['0', '01', 'length'],
+    ['0', '2', 'length'],
+    ['0', 'NaN', 'length'],
+  ]) {
+    assert.throws(
+      () => lib.previewPromptContext({ projectId: 'proj-alpha', entryIds: withKeys(keys) }),
+      /dense|extra/,
+      keys.join(','),
+    );
+  }
+
+  // Positive control: exactly the canonical keys, in any order, is accepted.
+  const preview = lib.previewPromptContext({
+    projectId: 'proj-alpha',
+    entryIds: withKeys(['length', '1', '0']),
+  });
+  assert.deepEqual(
+    preview.included.map((item) => item.entryId),
+    ['mem-other', 'mem-style'],
+  );
+});
