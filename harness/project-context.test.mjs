@@ -102,10 +102,15 @@ test('explicitly selected entries require owner approval before entering prompt 
     entryId: 'mem-style',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: mem.approvalDigest,
   });
   assert.equal(approvedMem.status, 'approved');
   assert.equal(approvedMem.approval.version, '1.0.0');
+  assert.equal(approvedMem.approval.revisionId, mem.revisionId);
   assert.equal(approvedMem.approval.approvalDigest, approvedMem.approvalDigest);
+  assert.equal(approvedMem.provenance.sourceHash, null);
+  assert.equal(approvedMem.provenance.sourceHashStatus, 'not-provided');
+  assert.equal(approvedMem.provenance.sourceHashVerified, false);
 
   const partialPreview = lib.previewPromptContext({
     projectId: 'proj-alpha',
@@ -335,7 +340,7 @@ test('enforces strict cross-project isolation across lookup, listing, approval, 
   const { clock } = makeClock();
   const lib = createProjectContextLibrary({ clock });
 
-  lib.registerEntry(
+  const alphaV1 = lib.registerEntry(
     makeMemoryInput({
       projectId: 'proj-alpha',
       entryId: 'mem-alpha-only',
@@ -347,9 +352,10 @@ test('enforces strict cross-project isolation across lookup, listing, approval, 
     entryId: 'mem-alpha-only',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: alphaV1.approvalDigest,
   });
 
-  lib.registerEntry(
+  const betaV1 = lib.registerEntry(
     makeMemoryInput({
       projectId: 'proj-beta',
       entryId: 'mem-beta-only',
@@ -361,6 +367,7 @@ test('enforces strict cross-project isolation across lookup, listing, approval, 
     entryId: 'mem-beta-only',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: betaV1.approvalDigest,
   });
 
   assert.equal(lib.getEntry({ projectId: 'proj-beta', entryId: 'mem-alpha-only' }), null);
@@ -376,6 +383,7 @@ test('enforces strict cross-project isolation across lookup, listing, approval, 
         entryId: 'mem-alpha-only',
         version: '1.0.0',
         approvedBy: 'owner-local',
+        expectedDigest: alphaV1.approvalDigest,
       }),
     /not found/i,
   );
@@ -407,7 +415,7 @@ test('excludes expired entries and blocks approving expired entries', () => {
   const { clock, advance } = makeClock(1_000_000);
   const lib = createProjectContextLibrary({ clock });
 
-  lib.registerEntry(
+  const shortLived = lib.registerEntry(
     makeMemoryInput({
       entryId: 'mem-short-lived',
       expiresAt: 1_060_000,
@@ -418,6 +426,7 @@ test('excludes expired entries and blocks approving expired entries', () => {
     entryId: 'mem-short-lived',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: shortLived.approvalDigest,
     expiresAt: 1_030_000,
   });
 
@@ -444,6 +453,7 @@ test('excludes expired entries and blocks approving expired entries', () => {
     entryId: 'mem-short-lived',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: shortLived.approvalDigest,
     expiresAt: 1_055_000,
   });
   assert.equal(
@@ -472,6 +482,7 @@ test('excludes expired entries and blocks approving expired entries', () => {
         entryId: 'mem-short-lived',
         version: '1.0.0',
         approvedBy: 'owner-local',
+        expectedDigest: shortLived.approvalDigest,
         expiresAt: 1_090_000,
       }),
     /expired/i,
@@ -482,12 +493,13 @@ test('revocation immediately excludes entry and blocks subsequent approvals or r
   const { clock } = makeClock();
   const lib = createProjectContextLibrary({ clock });
 
-  lib.registerEntry(makeMemoryInput());
+  const mem = lib.registerEntry(makeMemoryInput());
   lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'mem-style',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: mem.approvalDigest,
   });
 
   assert.equal(
@@ -526,6 +538,7 @@ test('revocation immediately excludes entry and blocks subsequent approvals or r
         entryId: 'mem-style',
         version: '1.0.0',
         approvedBy: 'owner-local',
+        expectedDigest: mem.approvalDigest,
       }),
     /revoked/i,
   );
@@ -551,16 +564,17 @@ test('produces deterministic canonical prompt preview and digests regardless of 
   const { clock } = makeClock(5_000_000);
   const lib = createProjectContextLibrary({ clock });
 
-  lib.registerEntry(makeSkillInput({ entryId: 'skill-z' }));
-  lib.registerEntry(makeMemoryInput({ entryId: 'mem-b', content: 'Memory B content.' }));
-  lib.registerEntry(makeMemoryInput({ entryId: 'mem-a', content: 'Memory A content.' }));
+  const skillZ = lib.registerEntry(makeSkillInput({ entryId: 'skill-z' }));
+  const memB = lib.registerEntry(makeMemoryInput({ entryId: 'mem-b', content: 'Memory B content.' }));
+  const memA = lib.registerEntry(makeMemoryInput({ entryId: 'mem-a', content: 'Memory A content.' }));
 
-  for (const entryId of ['skill-z', 'mem-b', 'mem-a']) {
+  for (const entry of [skillZ, memB, memA]) {
     lib.approveEntry({
       projectId: 'proj-alpha',
-      entryId,
+      entryId: entry.entryId,
       version: '1.0.0',
       approvedBy: 'owner-local',
+      expectedDigest: entry.approvalDigest,
     });
   }
 
@@ -603,19 +617,21 @@ test('templates preserve inputs for review and never store or transfer executabl
   const { clock } = makeClock();
   const lib = createProjectContextLibrary({ clock });
 
-  lib.registerEntry(makeMemoryInput());
+  const memV1 = lib.registerEntry(makeMemoryInput());
   lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'mem-style',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: memV1.approvalDigest,
   });
-  lib.registerEntry(makeSkillInput());
+  const skillV1 = lib.registerEntry(makeSkillInput());
   lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'skill-brief',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: skillV1.approvalDigest,
   });
 
   for (const forbidden of [
@@ -680,7 +696,7 @@ test('templates preserve inputs for review and never store or transfer executabl
 
   // Version bump + approval of skill-brief v2 still excludes it from a template pinned to v1
   // and revoking mem-style excludes it immediately from template draft instantiation.
-  lib.proposeEntryVersion({
+  const skillV2 = lib.proposeEntryVersion({
     projectId: 'proj-alpha',
     entryId: 'skill-brief',
     content: 'Updated v2 instructions.',
@@ -697,6 +713,7 @@ test('templates preserve inputs for review and never store or transfer executabl
     entryId: 'skill-brief',
     version: '2.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: skillV2.approvalDigest,
   });
   lib.revokeEntry({
     projectId: 'proj-alpha',
@@ -733,28 +750,31 @@ test('listEntries filters excluded entries when includeExcluded is false and cap
   const { clock, advance } = makeClock(2_000_000);
   const lib = createProjectContextLibrary({ clock });
 
-  lib.registerEntry(makeMemoryInput({ entryId: 'mem-active' }));
+  const memActive = lib.registerEntry(makeMemoryInput({ entryId: 'mem-active' }));
   lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'mem-active',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: memActive.approvalDigest,
   });
 
   lib.registerEntry(makeMemoryInput({ entryId: 'mem-pending' }));
-  lib.registerEntry(makeMemoryInput({ entryId: 'mem-expired', expiresAt: 2_010_000 }));
+  const memExpired = lib.registerEntry(makeMemoryInput({ entryId: 'mem-expired', expiresAt: 2_010_000 }));
   lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'mem-expired',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: memExpired.approvalDigest,
   });
-  lib.registerEntry(makeSkillInput({ entryId: 'skill-cap-change' }));
+  const skillReg = lib.registerEntry(makeSkillInput({ entryId: 'skill-cap-change' }));
   const skillV1 = lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'skill-cap-change',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: skillReg.approvalDigest,
   });
 
   advance(15_000);
@@ -790,19 +810,21 @@ test('template draft checks unapproved, expired, and kind-mismatched entry refer
   const lib = createProjectContextLibrary({ clock });
 
   lib.registerEntry(makeMemoryInput({ entryId: 'mem-unapproved' }));
-  lib.registerEntry(makeMemoryInput({ entryId: 'mem-expiring', expiresAt: 3_005_000 }));
+  const memExpiring = lib.registerEntry(makeMemoryInput({ entryId: 'mem-expiring', expiresAt: 3_005_000 }));
   lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'mem-expiring',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: memExpiring.approvalDigest,
   });
-  lib.registerEntry(makeSkillInput({ entryId: 'skill-wrong-kind' }));
+  const skillWrongKind = lib.registerEntry(makeSkillInput({ entryId: 'skill-wrong-kind' }));
   lib.approveEntry({
     projectId: 'proj-alpha',
     entryId: 'skill-wrong-kind',
     version: '1.0.0',
     approvedBy: 'owner-local',
+    expectedDigest: skillWrongKind.approvalDigest,
   });
 
   lib.createTaskTemplate({
@@ -841,3 +863,478 @@ test('template draft checks unapproved, expired, and kind-mismatched entry refer
   );
 });
 
+test('requires expectedDigest on approval and enforces immutable revision identity without version reuse', () => {
+  const { clock } = makeClock();
+  const lib = createProjectContextLibrary({ clock });
+
+  const v1 = lib.registerEntry(makeSkillInput({ entryId: 'skill-immutable' }));
+  assert.match(v1.revisionId, /^[a-f0-9]{64}$/);
+  assert.equal(v1.revisionNumber, 1);
+
+  assert.throws(
+    () =>
+      lib.approveEntry({
+        projectId: 'proj-alpha',
+        entryId: 'skill-immutable',
+        version: '1.0.0',
+        approvedBy: 'owner-local',
+      }),
+    /expectedDigest/i,
+  );
+
+  const approvedV1 = lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'skill-immutable',
+    version: '1.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: v1.approvalDigest,
+    expectedRevisionId: v1.revisionId,
+  });
+  assert.equal(approvedV1.approval.revisionId, v1.revisionId);
+
+  const v2 = lib.proposeEntryVersion({
+    projectId: 'proj-alpha',
+    entryId: 'skill-immutable',
+    content: 'v2 instructions.',
+    requestedCapabilities: ['read-only-source'],
+    provenance: {
+      selectionMode: 'explicit',
+      sourceKind: 'owner-authored',
+      sourceRef: 'skills/brief-grounding.md',
+      version: '2.0.0',
+    },
+  });
+  assert.notEqual(v2.revisionId, v1.revisionId);
+  assert.equal(v2.revisionNumber, 2);
+
+  // Reusing previously used version label '1.0.0' must fail even after moving to '2.0.0'.
+  assert.throws(
+    () =>
+      lib.proposeEntryVersion({
+        projectId: 'proj-alpha',
+        entryId: 'skill-immutable',
+        content: 'Malicious replacement disguised as 1.0.0.',
+        requestedCapabilities: ['read-only-source'],
+        provenance: {
+          selectionMode: 'explicit',
+          sourceKind: 'owner-authored',
+          sourceRef: 'skills/brief-grounding.md',
+          version: '1.0.0',
+        },
+      }),
+    /reused|immutable|version/i,
+  );
+
+  // Mismatched expectedRevisionId is rejected on approval even if digest matches.
+  assert.throws(
+    () =>
+      lib.approveEntry({
+        projectId: 'proj-alpha',
+        entryId: 'skill-immutable',
+        version: '2.0.0',
+        approvedBy: 'owner-local',
+        expectedDigest: v2.approvalDigest,
+        expectedRevisionId: v1.revisionId,
+      }),
+    /revision/i,
+  );
+
+  lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'skill-immutable',
+    version: '2.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: v2.approvalDigest,
+    expectedRevisionId: v2.revisionId,
+  });
+
+  // Template pinning by digest/revisionId rejects mismatched revisions.
+  lib.createTaskTemplate({
+    projectId: 'proj-alpha',
+    templateId: 'tpl-pinned-v1',
+    title: 'Pinned to v1 revision',
+    workflowKind: 'brief',
+    inputs: {
+      requestText: 'Use v1 only.',
+      targetScopeLabels: ['docs'],
+      selectedEntryRefs: [
+        {
+          entryId: 'skill-immutable',
+          pinnedVersion: '1.0.0',
+          pinnedDigest: v1.approvalDigest,
+          pinnedRevisionId: v1.revisionId,
+        },
+      ],
+    },
+  });
+  const pinnedDraft = lib.instantiateTemplateDraft({
+    projectId: 'proj-alpha',
+    templateId: 'tpl-pinned-v1',
+  });
+  assert.equal(pinnedDraft.contextPreview.included.length, 0);
+  assert.equal(pinnedDraft.entryChecks[0].reason, 'pinned-version-mismatch');
+});
+
+test('binds sourceHash into approvalDigest while labeling sourceHash provenance unverified', () => {
+  const { clock } = makeClock();
+  const lib = createProjectContextLibrary({ clock });
+  const hashA = 'a'.repeat(64);
+  const hashB = 'b'.repeat(64);
+
+  const entryA = lib.registerEntry(
+    makeMemoryInput({
+      entryId: 'mem-source-a',
+      provenance: {
+        selectionMode: 'explicit',
+        sourceKind: 'owner-selected-file',
+        sourceRef: 'docs/conventions.md',
+        version: '1.0.0',
+        sourceHash: hashA,
+      },
+    }),
+  );
+  const entryB = lib.registerEntry(
+    makeMemoryInput({
+      entryId: 'mem-source-b',
+      provenance: {
+        selectionMode: 'explicit',
+        sourceKind: 'owner-selected-file',
+        sourceRef: 'docs/conventions.md',
+        version: '1.0.0',
+        sourceHash: hashB,
+      },
+    }),
+  );
+  const entryNone = lib.registerEntry(
+    makeMemoryInput({
+      entryId: 'mem-source-none',
+    }),
+  );
+
+  assert.notEqual(entryA.approvalDigest, entryB.approvalDigest);
+  assert.notEqual(entryA.approvalDigest, entryNone.approvalDigest);
+  assert.equal(entryA.provenance.sourceHash, hashA);
+  assert.equal(entryA.provenance.sourceHashStatus, 'claimed-unverified');
+  assert.equal(entryA.provenance.sourceHashVerified, false);
+
+  assert.throws(
+    () =>
+      lib.approveEntry({
+        projectId: 'proj-alpha',
+        entryId: 'mem-source-a',
+        version: '1.0.0',
+        approvedBy: 'owner-local',
+        expectedDigest: entryNone.approvalDigest,
+      }),
+    /digest/i,
+  );
+
+  lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'mem-source-a',
+    version: '1.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: entryA.approvalDigest,
+  });
+
+  const preview = lib.previewPromptContext({
+    projectId: 'proj-alpha',
+    entryIds: ['mem-source-a'],
+  });
+  assert.equal(preview.included[0].provenance.sourceHash, hashA);
+  assert.equal(preview.included[0].provenance.sourceHashStatus, 'claimed-unverified');
+  assert.equal(preview.included[0].provenance.sourceHashVerified, false);
+});
+
+test('enforces aggregate preview byte budget aligned with shared 256 KiB hasher limit', () => {
+  const { clock } = makeClock();
+  const lib = createProjectContextLibrary({ clock });
+
+  // Register 4 entries of 64 KiB (each individually <= 65536 bytes) and 1 small entry
+  // sized to hit the exact 262144-byte aggregate rendered preview boundary vs 262145 bytes.
+  const largeIds = ['mem-big-1', 'mem-big-2', 'mem-big-3', 'mem-big-4'];
+  for (const entryId of largeIds) {
+    const entry = lib.registerEntry(
+      makeMemoryInput({
+        entryId,
+        content: 'x'.repeat(65536),
+      }),
+    );
+    lib.approveEntry({
+      projectId: 'proj-alpha',
+      entryId,
+      version: '1.0.0',
+      approvedBy: 'owner-local',
+      expectedDigest: entry.approvalDigest,
+    });
+  }
+
+  // Four 64 KiB entries plus framing exceed 262144 bytes and must fail with an explicit budget error,
+  // not an internal hasher TypeError.
+  assert.throws(
+    () =>
+      lib.previewPromptContext({
+        projectId: 'proj-alpha',
+        entryIds: largeIds,
+      }),
+    /maxPreviewPromptBytes|preview.*budget|exceeds/i,
+  );
+
+  // Measure the exact framing overhead of 4 entries so we test 262144 bytes (pass) vs 262145 bytes (fail).
+  const probe = lib.previewPromptContext({
+    projectId: 'proj-alpha',
+    entryIds: ['mem-big-1', 'mem-big-2', 'mem-big-3'],
+  });
+  const threeEntriesBytes = Buffer.byteLength(probe.promptText, 'utf8');
+  const fillerEntryBase = lib.registerEntry(
+    makeMemoryInput({
+      entryId: 'mem-exact-fit',
+      content: 'a',
+    }),
+  );
+  lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'mem-exact-fit',
+    version: '1.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: fillerEntryBase.approvalDigest,
+  });
+  const fourProbe = lib.previewPromptContext({
+    projectId: 'proj-alpha',
+    entryIds: ['mem-big-1', 'mem-big-2', 'mem-big-3', 'mem-exact-fit'],
+  });
+  const baseFourBytes = Buffer.byteLength(fourProbe.promptText, 'utf8');
+  const remainingForExact256KiB = 262144 - baseFourBytes + 1;
+  assert.ok(remainingForExact256KiB > 1 && remainingForExact256KiB <= 65536);
+
+  const exactFitV2 = lib.proposeEntryVersion({
+    projectId: 'proj-alpha',
+    entryId: 'mem-exact-fit',
+    content: 'a'.repeat(remainingForExact256KiB),
+    provenance: {
+      selectionMode: 'explicit',
+      sourceKind: 'owner-selected-file',
+      sourceRef: 'docs/conventions.md',
+      version: '2.0.0',
+    },
+  });
+  lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'mem-exact-fit',
+    version: '2.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: exactFitV2.approvalDigest,
+  });
+
+  const exactPreview = lib.previewPromptContext({
+    projectId: 'proj-alpha',
+    entryIds: ['mem-big-1', 'mem-big-2', 'mem-big-3', 'mem-exact-fit'],
+  });
+  assert.equal(Buffer.byteLength(exactPreview.promptText, 'utf8'), 262144);
+  assert.ok(threeEntriesBytes < 262144);
+  assert.match(exactPreview.promptSha256, /^[a-f0-9]{64}$/);
+
+  const overByOneV3 = lib.proposeEntryVersion({
+    projectId: 'proj-alpha',
+    entryId: 'mem-exact-fit',
+    content: 'a'.repeat(remainingForExact256KiB + 1),
+    provenance: {
+      selectionMode: 'explicit',
+      sourceKind: 'owner-selected-file',
+      sourceRef: 'docs/conventions.md',
+      version: '3.0.0',
+    },
+  });
+  lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'mem-exact-fit',
+    version: '3.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: overByOneV3.approvalDigest,
+  });
+
+  assert.throws(
+    () =>
+      lib.previewPromptContext({
+        projectId: 'proj-alpha',
+        entryIds: ['mem-big-1', 'mem-big-2', 'mem-big-3', 'mem-exact-fit'],
+      }),
+    /maxPreviewPromptBytes|preview.*budget|exceeds/i,
+  );
+
+  lib.createTaskTemplate({
+    projectId: 'proj-alpha',
+    templateId: 'tpl-over-budget',
+    title: 'Over aggregate preview budget',
+    workflowKind: 'brief',
+    inputs: {
+      requestText: 'Check aggregate budget failure.',
+      targetScopeLabels: ['docs'],
+      selectedEntryRefs: [
+        { entryId: 'mem-big-1', pinnedVersion: '1.0.0' },
+        { entryId: 'mem-big-2', pinnedVersion: '1.0.0' },
+        { entryId: 'mem-big-3', pinnedVersion: '1.0.0' },
+        { entryId: 'mem-exact-fit', pinnedVersion: '3.0.0' },
+      ],
+    },
+  });
+  assert.throws(
+    () =>
+      lib.instantiateTemplateDraft({
+        projectId: 'proj-alpha',
+        templateId: 'tpl-over-budget',
+      }),
+    /maxPreviewPromptBytes|preview.*budget|exceeds/i,
+  );
+});
+
+test('instantiateTemplateDraft samples clock once so eligibility and preview agree at expiry boundary', () => {
+  let tick = 10_000;
+  const lib = createProjectContextLibrary({ clock: () => tick++ });
+
+  // tick 10000: registerEntry
+  const entry = lib.registerEntry(
+    makeMemoryInput({
+      entryId: 'mem-tick-boundary',
+      expiresAt: 10_003,
+    }),
+  );
+  // tick 10001: approveEntry
+  lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'mem-tick-boundary',
+    version: '1.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: entry.approvalDigest,
+  });
+  // tick 10002: createTaskTemplate (with single-tick clock, next call is 10002 -> wait, createTaskTemplate takes tick 10002!)
+  lib.createTaskTemplate({
+    projectId: 'proj-alpha',
+    templateId: 'tpl-tick',
+    title: 'Tick boundary template',
+    workflowKind: 'brief',
+    inputs: {
+      requestText: 'Check single evaluation timestamp.',
+      targetScopeLabels: ['docs'],
+      selectedEntryRefs: [{ entryId: 'mem-tick-boundary', pinnedVersion: '1.0.0' }],
+    },
+  });
+
+  // Reset tick to 10002 right before expiresAt (10003):
+  // The first clock read returns 10002 (eligible), and a second clock read would return 10003 (expired!).
+  // Single evaluation time ensures both entryChecks and contextPreview evaluate at 10002 and agree.
+  tick = 10_002;
+  const draft = lib.instantiateTemplateDraft({
+    projectId: 'proj-alpha',
+    templateId: 'tpl-tick',
+  });
+  assert.equal(draft.evaluatedAt, 10_002);
+  assert.equal(draft.contextPreview.evaluatedAt, 10_002);
+  assert.equal(draft.entryChecks[0].eligible, true);
+  assert.equal(draft.contextPreview.included.length, 1);
+  assert.equal(draft.contextPreview.excluded.length, 0);
+});
+
+test('validates dense arrays without invoking caller accessors, holes, or overridden array methods', () => {
+  const { clock } = makeClock();
+  const lib = createProjectContextLibrary({ clock });
+
+  const mem = lib.registerEntry(makeMemoryInput());
+  lib.approveEntry({
+    projectId: 'proj-alpha',
+    entryId: 'mem-style',
+    version: '1.0.0',
+    approvedBy: 'owner-local',
+    expectedDigest: mem.approvalDigest,
+  });
+
+  // 1. Accessor element on entryIds must never be invoked.
+  let invoked = false;
+  const accessorIds = [];
+  Object.defineProperty(accessorIds, '0', {
+    enumerable: true,
+    get() {
+      invoked = true;
+      return 'mem-style';
+    },
+  });
+  assert.throws(
+    () => lib.previewPromptContext({ projectId: 'proj-alpha', entryIds: accessorIds }),
+    /dense|accessor/i,
+  );
+  assert.equal(invoked, false);
+
+  // 2. Sparse array with hole must be rejected.
+  // eslint-disable-next-line no-sparse-arrays
+  const sparseIds = [, 'mem-style'];
+  assert.throws(
+    () => lib.previewPromptContext({ projectId: 'proj-alpha', entryIds: sparseIds }),
+    /dense|accessor/i,
+  );
+
+  // 3. Array with overridden .map or extra own property must be rejected without calling .map.
+  const evilScopeLabels = ['docs/notes.md'];
+  let mapCalled = false;
+  Object.defineProperty(evilScopeLabels, 'map', {
+    value() {
+      mapCalled = true;
+      return ['hijacked'];
+    },
+  });
+  assert.throws(
+    () =>
+      lib.createTaskTemplate({
+        projectId: 'proj-alpha',
+        templateId: 'tpl-evil-map',
+        title: 'Evil map test',
+        workflowKind: 'brief',
+        inputs: {
+          requestText: 'Check array safety.',
+          targetScopeLabels: evilScopeLabels,
+          selectedEntryRefs: [],
+        },
+      }),
+    /dense|extra/i,
+  );
+  assert.equal(mapCalled, false);
+
+  // 4. Accessor element on requestedCapabilities must never be invoked.
+  const evilCaps = [];
+  Object.defineProperty(evilCaps, '0', {
+    enumerable: true,
+    get() {
+      invoked = true;
+      return 'read-only-source';
+    },
+  });
+  assert.throws(
+    () => lib.registerEntry(makeSkillInput({ entryId: 'skill-evil-cap', requestedCapabilities: evilCaps })),
+    /dense|accessor/i,
+  );
+  assert.equal(invoked, false);
+
+  // 5. Overridden .map on selectedEntryRefs must be rejected without invoking it.
+  const evilRefs = [{ entryId: 'mem-style', pinnedVersion: '1.0.0' }];
+  Object.defineProperty(evilRefs, 'map', {
+    value() {
+      mapCalled = true;
+      return [];
+    },
+  });
+  assert.throws(
+    () =>
+      lib.createTaskTemplate({
+        projectId: 'proj-alpha',
+        templateId: 'tpl-evil-refs',
+        title: 'Evil refs test',
+        workflowKind: 'brief',
+        inputs: {
+          requestText: 'Check refs array safety.',
+          targetScopeLabels: ['docs'],
+          selectedEntryRefs: evilRefs,
+        },
+      }),
+    /dense|extra/i,
+  );
+  assert.equal(mapCalled, false);
+});
