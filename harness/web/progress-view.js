@@ -233,6 +233,24 @@ function ensureUnavailablePrefix(reason, fallback) {
   return `Unavailable: ${clean}`;
 }
 
+function formatWorkRateReason(reason, unitPair) {
+  if (!reason) return null;
+  if (reason === 'No measured step counters were supplied.') {
+    return 'No measured work counters.';
+  }
+  if (reason === 'Insufficient measured step samples to calculate rate.') {
+    return unitPair.known
+      ? `Insufficient measured ${unitPair.singular} samples to calculate rate.`
+      : 'Insufficient measured work samples to calculate rate.';
+  }
+  if (reason === 'Step samples do not span a positive elapsed interval.') {
+    if (!unitPair.known) return 'Work samples do not span a positive elapsed interval.';
+    const cap = unitPair.singular.charAt(0).toUpperCase() + unitPair.singular.slice(1);
+    return `${cap} samples do not span a positive elapsed interval.`;
+  }
+  return reason;
+}
+
 function row(key, label, value, available, reason = null) {
   return {
     key,
@@ -808,17 +826,21 @@ export function presentProgress(progress, options = undefined) {
     const value = parts.length > 1 ? `${parts[0]} (${parts.slice(1).join('; ')})` : parts[0];
     rows.push(row('rate', 'Rate', value, true));
   } else if (charRate !== null) {
+    const workCountersPresent = hasMeasuredOverallCounters || stepSamplesValid === true;
+    const workRateLabel = overallUnit.known ? `${overallUnit.singular} rate` : 'work rate';
+    const workRateNote = workCountersPresent ? formatWorkRateReason(reasonRate, overallUnit) : null;
     const stepDetail = stepRejectionReason
       ? ` (work counters rejected: ${stepRejectionReason})`
-      : reasonRate
-        ? ` (measured rate unavailable: ${reasonRate})`
+      : workRateNote
+        ? ` (${workRateLabel} unavailable: ${workRateNote})`
         : '';
     rows.push(row('rate', 'Rate', `${formatRate(charRate)} UTF-16 code units/s${stepDetail}`, true));
   } else if (stepRejectionReason) {
     const reason = ensureUnavailablePrefix(stepRejectionReason, 'Unavailable');
     rows.push(row('rate', 'Rate', reason, false, stepRejectionReason));
   } else {
-    const reason = reasonRate ?? (isTerminal ? 'Run is no longer active.' : 'Insufficient measured samples.');
+    const cleanReason = formatWorkRateReason(reasonRate, overallUnit);
+    const reason = cleanReason ?? (isTerminal ? 'Run is no longer active.' : 'Insufficient measured samples.');
     rows.push(row('rate', 'Rate', ensureUnavailablePrefix(reason, 'Unavailable'), false, reason));
   }
 
