@@ -1,4 +1,6 @@
 import {spawn} from 'node:child_process';
+import {openSync, writeSync, fsyncSync, closeSync, readFileSync} from 'node:fs';
+import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 // Fixed fixture only. No caller-supplied executable, source, or WSL arguments.
@@ -11,6 +13,41 @@ export async function qualifySandboxStop({requestId = 'default', interrupt = 'du
   const result = await runStop(interrupt);
   requests.set(requestId, result);
   return result;
+}
+
+// Exclusive, durable claim precedes dispatch. Incomplete records hold, never retry.
+function persist(path, value) {
+  const fd = openSync(path, 'wx');
+  try { writeSync(fd, JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
+}
+const fixturePath = fileURLToPath(new URL('./sandbox-stop-fixture.py', import.meta.url));
+const linuxPath = '/mnt/' + fixturePath[0].toLowerCase() + fixturePath.slice(2).replaceAll('\\', '/');
+export async function durableStop(directory, phase) {
+  if (!['startup', 'durable'].includes(phase)) throw new Error('Invalid phase');
+  const claim = join(directory, 'claim.json');
+  try { persist(claim, {request: 'fixed-inert-stop', controller: process.pid}); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    try {
+      const saved = JSON.parse(readFileSync(claim, 'utf8'));
+      const dispatched = JSON.parse(readFileSync(join(directory, 'dispatch.json'), 'utf8'));
+      if (saved.request !== 'fixed-inert-stop' || dispatched.dispatch !== 1 ||
+          dispatched.fixture !== 'sandbox-stop-fixture.py') throw new Error('Invalid record');
+    } catch { return {replay: true, cleanup: 'unknown', state: 'held', blocker: 'Incomplete claim or dispatch record'}; }
+    const ownership = join(directory, 'ownership.json');
+    let journal;
+    try { journal = JSON.parse(readFileSync(ownership, 'utf8')); } catch {}
+    const absent = journal?.event === 'ready' && await confirm(linuxPath, journal);
+    return {replay: true, dispatches: 1, cleanup: absent ? 'verified' : 'unknown',
+      state: absent ? 'resolved' : 'held', blocker: absent ? undefined : 'Incomplete identity or cleanup evidence', journal};
+  }
+  persist(join(directory, 'dispatch.json'), {fixture: 'sandbox-stop-fixture.py', dispatch: 1});
+  return runStop(phase, frame => {
+    if (frame.event === 'starting') persist(join(directory, 'startup.json'), frame);
+    if (frame.event === 'ready') persist(join(directory, 'ownership.json'), frame);
+    if ((phase === 'startup' && frame.event === 'starting') ||
+        (phase === 'durable' && frame.event === 'ready')) process.send?.({event: 'interruptible', phase});
+  }, true);
 }
 
 async function confirm(linux, journal) {
@@ -33,7 +70,7 @@ async function confirm(linux, journal) {
   });
 }
 
-async function runStop(interrupt) {
+async function runStop(interrupt, onFrame = () => {}, hold = false) {
   if (process.platform !== 'win32') return {cleanup: 'unknown', blocker: 'Windows required'};
   const path = fileURLToPath(new URL('./sandbox-stop-fixture.py', import.meta.url));
   const linux = '/mnt/' + path[0].toLowerCase() + path.slice(2).replaceAll('\\', '/');
@@ -55,6 +92,8 @@ async function runStop(interrupt) {
         const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
         try {
           const frame = JSON.parse(line);
+          onFrame(frame);
+          if (hold) { if (frame.event === 'ready') journal = frame; continue; }
           if (frame.event === 'starting' && interrupt === 'startup') child.stdin.end();
           else if (frame.event === 'ready' && !journal) {journal = frame; child.stdin.end();}
           else if (frame.event === 'stopped' && journal) result = frame;
@@ -69,4 +108,9 @@ async function runStop(interrupt) {
     });
   });
 }
-if (process.argv[1] === fileURLToPath(import.meta.url)) console.log(JSON.stringify(await qualifySandboxStop()));
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const result = process.argv[2] === '--controller'
+    ? await durableStop(process.argv[3], process.argv[4]) : await qualifySandboxStop();
+  console.log(JSON.stringify(result));
+  process.disconnect?.();
+}
