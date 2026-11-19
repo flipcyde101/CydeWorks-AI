@@ -814,6 +814,11 @@ test('staged restore rebuilds a fresh database from validated fields and drops d
 
   const verified=await verifyWorkspaceBackup({backupDir:dir});
   assert.equal(verified.ok,true);
+  // The archive input verifies but is known to retain a deleted cell, so it must not be reported as clean.
+  assert.equal(verified.consistency.sqlitePagesMayRetainDeletedData,'possible');
+  assert.equal(verified.consistency.archiveInputDeletedDataResidue,'possible-intra-page-residue-unverifiable-freelist-empty');
+  assert.equal(verified.consistency.manifestDeletedDataClaim,'unsigned-creator-claim-not-proven');
+  assert.equal(verified.cleanup.untrustedInputWritten,false);
 
   let restoredBytes=null;
   const restored=await restoreWorkspaceBackup({
@@ -825,6 +830,13 @@ test('staged restore rebuilds a fresh database from validated fields and drops d
   assert.equal(restored.cleanup.ok,true);
   assert.ok(Buffer.isBuffer(restoredBytes),'restore must expose rebuilt staged bytes to the test hook');
   assert.equal(restoredBytes.includes(sentinel),false,'restored staging database must be rebuilt, not page-copied');
+  assert.equal(restored.consistency.sqlitePagesMayRetainDeletedData,'possible','archive input status stays possible on restore');
+  assert.equal(restored.consistency.archiveInputDeletedDataResidue,'possible-intra-page-residue-unverifiable-freelist-empty');
+  assert.deepEqual(restored.consistency.rebuiltOutput,{
+    construction:'fresh-sqlite-database-from-validated-rows',
+    sqlitePagesMayRetainDeletedData:false,
+    location:'private-staging-only-not-published',
+  });
   assert.deepEqual(restored.database.tables,{task_draft_copies:1,task_removal_audit:1,tasks:2});
 });
 
@@ -958,4 +970,46 @@ test('native errors after staging keep the original cause and attach cleanup res
       error.cause===injected&&error.publication?.status==='disabled'&&
       error.cleanup?.ok===true&&error.cleanup.staged===true,
   );
+});
+
+test('rejected archive bytes are validated in memory and never reach staging, even when cleanup fails',async t=>{
+  const {root,validBackup}=await makeValidArchive(t,'bfe-bak-inmemory-');
+  const sentinel='SENTINEL_REJECTED_INPUT_9970';
+  const dir=join(root,'rejected');
+  await cp(validBackup,dir,{recursive:true});
+  await resignArchive(dir,{mutateDb(db) {
+    db.exec(`CREATE TABLE oauth_tokens (token TEXT); INSERT INTO oauth_tokens VALUES ('${sentinel}');`);
+  }});
+  assert.equal((await readFile(join(dir,'database','workspace.sqlite'))).includes(sentinel),true,
+    'precondition: rejected archive carries a synthetic credential sentinel');
+
+  for (const [name,run] of [
+    ['verify',hooks=>verifyWorkspaceBackup({backupDir:dir,_testHooks:hooks})],
+    ['restore',hooks=>restoreWorkspaceBackup({backupDir:dir,publish:false,_testHooks:hooks})],
+  ]) {
+    let residual=null;
+    let stageListing=null;
+    t.after(async()=>{if (residual) await rm(residual,{recursive:true,force:true});});
+    await assert.rejects(
+      ()=>run({
+        async onCleanupStage(stageRoot) {
+          residual=stageRoot;
+          stageListing=await readdir(stageRoot,{recursive:true});
+          throw new Error('simulated EBUSY during stage cleanup');
+        },
+      }),
+      error=>error instanceof BackupError&&error.code==='SECRET_LEAK_DETECTED'&&
+        omitsSentinel(error,sentinel)&&!String(error.cleanup?.error).includes(sentinel)&&
+        error.cleanup?.ok===false&&error.cleanup.residualPaths.length===1&&
+        error.cleanup.residualPaths[0]===residual&&error.cleanup.untrustedInputWritten===false,
+      `${name} should reject the archive with cleanup failure reported and no sentinel in diagnostics`,
+    );
+    assert.deepEqual(stageListing,[],`${name} must not write any archive bytes into staging`);
+    for (const entry of await readdir(residual,{recursive:true})) {
+      const info=await stat(join(residual,entry));
+      if (info.isFile()) {
+        assert.equal((await readFile(join(residual,entry))).includes(sentinel),false,`${name} residual staging leaked input`);
+      }
+    }
+  }
 });

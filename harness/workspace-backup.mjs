@@ -399,22 +399,6 @@ function validateSqliteHeaderBytes(bytes,label,{requireDeleteJournal=false}={}) 
   }
 }
 
-async function writePrivateVerifiedDbFile(stageRoot,filename,dbBytes,expectedSha256) {
-  const stagedPath=resolveContainedPath(stageRoot,filename,'staged database');
-  let handle;
-  try {
-    handle=await open(stagedPath,'wx',0o600);
-    await handle.writeFile(dbBytes);
-  } finally {
-    try { await handle?.close(); } catch {}
-  }
-  const bound=await readBoundFile(stagedPath,null,'staged verified database');
-  if (!timingSafeEqual(Buffer.from(bound.sha256,'hex'),Buffer.from(expectedSha256,'hex'))) {
-    fail('BACKUP_CORRUPTED','Private staged database bytes do not match verified digest.');
-  }
-  return stagedPath;
-}
-
 // ---------------------------------------------------------------------------
 // Strict redacted record shapes. Every value written to or accepted from a
 // redacted archive passes through one of these canonical builders, so the
@@ -805,6 +789,39 @@ function readDatabaseFile(dbPath,{redacted}) {
   }
 }
 
+// Validates untrusted archive SQLite bytes entirely in memory. The original
+// archive bytes are never written to staging or any other file. If the runtime
+// cannot deserialize in memory, verification fails closed instead of writing
+// unvalidated bytes to disk. SQLite messages can echo archive schema text, so
+// only the numeric SQLite error code is kept for diagnostics.
+function readArchiveDatabaseBytes(bytes) {
+  let db;
+  try {
+    db=new DatabaseSync(':memory:');
+    if (typeof db.deserialize!=='function') {
+      fail('IN_MEMORY_VALIDATION_UNAVAILABLE',
+        'This Node.js runtime cannot validate SQLite bytes in memory; verification fails closed rather than writing untrusted archive bytes to disk.');
+    }
+    if (typeof db.enableDefensive==='function') db.enableDefensive(true);
+    db.deserialize(bytes);
+    db.exec('PRAGMA temp_store=MEMORY');
+    db.exec('PRAGMA query_only=ON');
+    db.exec('BEGIN');
+    try {
+      return readWorkspaceDb(db,{redacted:true});
+    } finally {
+      try { db.exec('ROLLBACK'); } catch {}
+    }
+  } catch (error) {
+    if (error instanceof BackupError) throw error;
+    const wrapped=new BackupError('SQLITE_INTEGRITY_FAILED','Archive SQLite bytes failed in-memory validation.');
+    if (Number.isSafeInteger(error?.errcode)) wrapped.sqliteErrorCode=error.errcode;
+    throw wrapped;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
 // Writes a brand-new SQLite file from validated canonical rows only. No pages
 // are copied from any other database.
 function writeRedactedDatabase(dbPath,rows) {
@@ -960,9 +977,12 @@ function validateManifestSchema(manifest) {
 // Staging lifecycle.
 // ---------------------------------------------------------------------------
 
-const notStagedCleanup=()=>({ok:true,staged:false,stageDir:null,residualPaths:[],error:null});
+const notStagedCleanup=()=>({
+  ok:true,staged:false,stageDir:null,residualPaths:[],error:null,
+  untrustedInputWritten:false,residualContent:'none',
+});
 
-async function cleanupStageDirectory(stageRoot,onCleanupStage) {
+async function cleanupStageDirectory(stageRoot,onCleanupStage,residualContent) {
   let cleanupError=null;
   try {
     if (onCleanupStage) await onCleanupStage(stageRoot);
@@ -986,6 +1006,9 @@ async function cleanupStageDirectory(stageRoot,onCleanupStage) {
     stageDir:stageRoot,
     residualPaths,
     error:cleanupError,
+    // No code path writes untrusted archive or raw source bytes to staging.
+    untrustedInputWritten:false,
+    residualContent,
   };
 }
 
@@ -1000,7 +1023,7 @@ function attachStageOutcome(error,{publication,cleanup}) {
   return out;
 }
 
-async function runInStage(prefix,hooks,publication,work) {
+async function runInStage(prefix,hooks,publication,residualContent,work) {
   const stageRoot=await mkdtemp(join(tmpdir(),prefix));
   let result=null;
   let primaryError=null;
@@ -1009,7 +1032,7 @@ async function runInStage(prefix,hooks,publication,work) {
   } catch (error) {
     primaryError=error??new Error('Unknown staging failure.');
   }
-  const cleanup=await cleanupStageDirectory(stageRoot,hooks.onCleanupStage);
+  const cleanup=await cleanupStageDirectory(stageRoot,hooks.onCleanupStage,residualContent);
   if (primaryError) throw attachStageOutcome(primaryError,{publication,cleanup});
   return {...result,cleanup};
 }
@@ -1129,7 +1152,7 @@ export async function createWorkspaceBackup({
   // One read-only transaction; redacted rows are projected in memory and no raw copy is written.
   const projected=await openSourceDatabase(sourceRoot,dbFilename);
 
-  return runInStage('cydeworks-backup-stage-',_testHooks,publication,async stageRoot=>{
+  return runInStage('cydeworks-backup-stage-',_testHooks,publication,'validated-redacted-projection-only',async stageRoot=>{
     const stagedRedactedPath=resolveContainedPath(stageRoot,'redacted.sqlite','redacted database');
     writeRedactedDatabase(stagedRedactedPath,projected.rows);
     if (_testHooks.onStaged) await _testHooks.onStaged(stageRoot);
@@ -1220,8 +1243,9 @@ async function verifyWorkspaceBackupIntoStage({backupDir,dbFilename='workspace.s
   }
   validateSqliteHeaderBytes(dbBound.bytes,'database/workspace.sqlite',{requireDeleteJournal:true});
 
-  const stagedVerifiedDbPath=await writePrivateVerifiedDbFile(stageRoot,'verified-input.sqlite',dbBound.bytes,manifest.database.sha256);
-  const verifiedDb=readDatabaseFile(stagedVerifiedDbPath,{redacted:true});
+  // A matching checksum proves only that the bytes are the ones the manifest
+  // names; it does not make them safe. They are validated in memory only.
+  const verifiedDb=readArchiveDatabaseBytes(dbBound.bytes);
   if (!sameDatabaseFacts(verifiedDb,manifest.database)) {
     fail('BACKUP_CORRUPTED','Backup SQLite contents do not match manifest database summary or table digests.');
   }
@@ -1241,13 +1265,21 @@ async function verifyWorkspaceBackupIntoStage({backupDir,dbFilename='workspace.s
   return {
     manifest,
     manifestSha256:manifestBound.sha256,
-    consistency:manifest.consistency,
+    consistency:{
+      ...manifest.consistency,
+      // The manifest value is an unsigned creator claim. Freelist pages are
+      // rejected, but deleted-cell residue inside allocated archive pages
+      // cannot be ruled out, so the verified archive input is reported as possible.
+      sqlitePagesMayRetainDeletedData:'possible',
+      manifestDeletedDataClaim:'unsigned-creator-claim-not-proven',
+      archiveInputDeletedDataResidue:'possible-intra-page-residue-unverifiable-freelist-empty',
+    },
     verifiedDb,
   };
 }
 
 export async function verifyWorkspaceBackup({backupDir,dbFilename='workspace.sqlite',_testHooks={}}={}) {
-  return runInStage('cydeworks-verify-stage-',_testHooks,null,async stageRoot=>{
+  return runInStage('cydeworks-verify-stage-',_testHooks,null,'none-archive-validated-in-memory',async stageRoot=>{
     const verified=await verifyWorkspaceBackupIntoStage({backupDir,dbFilename,stageRoot,_testHooks});
     return {
       ok:true,
@@ -1285,7 +1317,7 @@ export async function restoreWorkspaceBackup({
     fail('ATOMIC_PUBLICATION_UNAVAILABLE',ATOMIC_PUBLICATION_LIMIT,null,{publication,cleanup:notStagedCleanup()});
   }
 
-  return runInStage('cydeworks-restore-stage-',_testHooks,publication,async stageRoot=>{
+  return runInStage('cydeworks-restore-stage-',_testHooks,publication,'validated-redacted-rebuild-only',async stageRoot=>{
     const verification=await verifyWorkspaceBackupIntoStage({backupDir:backupRoot,dbFilename,stageRoot,_testHooks});
 
     // Rebuild a fresh database from validated canonical rows instead of copying archive pages.
@@ -1306,7 +1338,14 @@ export async function restoreWorkspaceBackup({
       verifiedInStaging:true,
       publication,
       manifestSha256:verification.manifestSha256,
-      consistency:verification.consistency,
+      consistency:{
+        ...verification.consistency,
+        rebuiltOutput:{
+          construction:'fresh-sqlite-database-from-validated-rows',
+          sqlitePagesMayRetainDeletedData:false,
+          location:'private-staging-only-not-published',
+        },
+      },
       database:publicDatabaseFacts(restoredDb),
       limits:[...verification.manifest.limits],
     };
