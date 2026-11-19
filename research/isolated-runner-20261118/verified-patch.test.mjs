@@ -107,7 +107,7 @@ test('reproduces exact checked bytes via host-resolved claim without mutating ba
     assert.deepEqual(bound.fileDigests, candDigests.fileDigests);
     assert.equal(bound.treeSha256, candDigests.treeSha256);
     assert.equal(bound.verification.callerAssertedTrusted, true);
-    assert.equal(bound.verification.provenanceEnforcedByCaller, true);
+    assert.equal('provenanceEnforcedByCaller' in bound.verification, false);
     assert.equal('trusted' in bound.verification, false);
     assert.equal(bound.baseUnchanged, true);
     assert.equal(bound.reproducedFromDisposableBase, true);
@@ -272,5 +272,38 @@ test('guards scratchRoot, enforces Windows path safety, and isolates ambient hoo
     });
     assert.equal(existsSync(marker), false);
     assert.deepEqual(bound.fileDigests, candDigests.fileDigests);
+  });
+});
+
+test('never claims unobserved host provenance and rejects untrusted verifier metadata', () => {
+  withScratch(({baseRepoDir, baseRevision, claim, helperScratch}) => {
+    const candDigests = computeSortedFileDigests(CANDIDATE_FILES);
+    const built = buildCandidatePatch({baseRepoDir, baseRevision, candidateFiles: CANDIDATE_FILES, scratchRoot: helperScratch});
+    const syntheticResolveClaim = claimId => ({
+      trusted: true,
+      claimId,
+      scope: claim.scope,
+      scopeHash: claim.scopeHash,
+    });
+
+    for (const badVer of [
+      makeVerification(claim, candDigests, {trusted: undefined}),
+      makeVerification(claim, candDigests, {trusted: false}),
+      makeVerification(claim, candDigests, {trusted: true, untrusted: true}),
+    ]) {
+      assert.throws(() => verifyAndBindPatch({
+        baseRepoDir, baseRevision, claim, resolveClaim: syntheticResolveClaim,
+        verification: badVer, patch: built.patch, scratchRoot: helperScratch,
+      }), /verifier attestation/);
+    }
+
+    const bound = verifyAndBindPatch({
+      baseRepoDir, baseRevision, claim, resolveClaim: syntheticResolveClaim,
+      verification: makeVerification(claim, candDigests, {provenanceEnforcedByCaller: true}),
+      patch: built.patch, scratchRoot: helperScratch,
+    });
+    assert.equal(bound.verification.callerAssertedTrusted, true);
+    assert.equal('provenanceEnforcedByCaller' in bound.verification, false);
+    assert.equal('trusted' in bound.verification, false);
   });
 });
