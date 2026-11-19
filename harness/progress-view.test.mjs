@@ -988,6 +988,39 @@ test('hostile inputs, accessor getters, revoked proxies, arbitrary objects and c
     }
   }
 
+  // Appending diagnostics onto a recognized helper phrase is still rejected
+  const suffixedBackward=presentProgress({
+    phase:'active',
+    status:'Running',
+    clockAnomaly:true,
+    clockAnomalyReason:'Measured sample timestamps moved backward. Runner detail PRIVATE_CLOCK_SUFFIX',
+  });
+  assert.equal(suffixedBackward.clockAnomaly,true);
+  assert.equal(suffixedBackward.clockAnomalyReason,'Clock timestamps are inconsistent or out of range.');
+  assert.equal(suffixedBackward.announcement,'Timing anomaly detected. Running. Clock timestamps are inconsistent or out of range.');
+  assert.doesNotMatch(suffixedBackward.text,/PRIVATE_CLOCK_SUFFIX|Runner detail/);
+
+  // Recognized helper backward-clock and counter-rejection messages are preserved safely
+  const recognizedMeasuredBackward=presentProgress({
+    phase:'active',
+    status:'Running',
+    clockAnomaly:true,
+    clockAnomalyReason:'Measured sample timestamps moved backward.',
+    stepSamplesValid:false,
+    stepRejectionReason:'Measured sample timestamps moved backward.',
+  });
+  assert.equal(recognizedMeasuredBackward.clockAnomalyReason,'Measured sample timestamps moved backward.');
+  assert.equal(rowByKey(recognizedMeasuredBackward,'clockAnomaly').value,'Measured sample timestamps moved backward.');
+  assert.equal(recognizedMeasuredBackward.announcement,'Timing anomaly detected. Running. Measured sample timestamps moved backward.');
+
+  const recognizedUnitRejection=presentProgress({
+    phase:'active',
+    status:'Running',
+    stepSamplesValid:false,
+    stepRejectionReason:'Measured counter unit is not an allowlisted discrete progress unit.',
+  });
+  assert.equal(rowByKey(recognizedUnitRejection,'completed').value,'Unavailable: Measured counter unit is not an allowlisted discrete progress unit.');
+
   // Non-failure metadata containing quoted JSON keys still redacts secret values cleanly
   const quotedJsonLabel=presentProgress({
     phase:'active',
