@@ -4,7 +4,9 @@ Date: November 18, 2026
 Owner worktree: `work/t3-release-backlog`
 Owned artifact: `docs/RELEASE-BACKLOG.md`
 Baseline commit: `7fc7bd8` (`Add defensive check-result parser unit tests`)
-References: [AGENTS.md](../AGENTS.md) · [docs/ROADMAP.md](ROADMAP.md) · [docs/NEXT-WAVE.md](NEXT-WAVE.md) · [12-Package Feature Plan](superpowers/plans/2026-11-18-cydeworks-ai-feature-and-reuse-plan.md)
+References: [AGENTS.md](../AGENTS.md) · [docs/ROADMAP.md](ROADMAP.md) · [docs/NEXT-WAVE.md](NEXT-WAVE.md) · [12-Package Feature Plan](superpowers/plans/2026-11-18-cydeworks-ai-feature-and-reuse-plan.md) · separate plan [docs/STIG-READINESS-PLAN.md](STIG-READINESS-PLAN.md)
+
+Section 8 is a later unreviewed planning cross-reference on branch `work/t3-stig-readiness-plan`. It does not revise sections 1 through 7, does not merge the STIG plan, and does not accept any package as release-ready.
 
 This document defines the dependency-ordered release backlog to finish the CydeWorks AI personal Windows release. It separates verified source and test evidence in the current repository from remaining implementation and qualification gaps, enforces the browser connection safety gates, assigns T3 provider and reasoning effort routing, and isolates branch file scopes so parallel worktrees never collide or revert peer work.
 
@@ -235,3 +237,236 @@ If any regression, unexpected route behavior, recovery hold anomaly, or desktop 
    - Stop the staged desktop or preview process cleanly (waiting for the write fence in `harness/desktop/service.cjs` to drain).
    - Check out the prior verified baseline commit (`7fc7bd8` or the last owner-approved checkpoint tag).
    - If a database migration ran, restore the pre-cutover SQLite backup verified in Section 7.2 into `.state/workspace.sqlite` and verify `GET /api/health` and `GET /api/receipts/analytics` before unlocking with `.state/access.key`.
+
+---
+
+## 8. Unreviewed STIG Cross-Reference and Gate Ledger
+
+Tracking status: unreviewed planning note. This section records dependency order from `docs/STIG-READINESS-PLAN.md` and the completed review transcripts named below. It is not a STIG assessment, authorization to operate, penetration test, compliance score, or a new independent safety review. The STIG plan stays a separate document. It is not merged into sections 1 through 7, and no control is marked met.
+
+The plan's own first line is `Planning status: NEEDS WORK`. Its source pin is commit `aad7a49f0e0f3ca6971b166b1e2e878832ed1744`. Sections 1 through 7 stay pinned to backlog baseline `7fc7bd8993c2080ce6dd460fb4b432325e91b7f1`. Neither pin includes the six reviewed package revisions or their follow-up commits. Those revisions are absent from this branch history.
+
+Builder test counts quoted below are reports carried in the review prompts. The review transcripts say no tests ran. Those counts are not independent proof.
+
+Re-review rule for every changed revision: after a fix is committed, the next evidence is one focused read-only review of that exact revision by Codex `gpt-6.2-sol` with `reasoningEffort` high, with no model or effort fallback and no paid compute. One review per revision. This tracking note does not launch it. A parent review does not cover a child commit.
+
+### 8.1 STIG plan commit checked in this worktree
+
+Checked on branch `work/t3-stig-readiness-plan` before this backlog section was committed:
+
+| Check | Result |
+| --- | --- |
+| Worktree HEAD at the check | `729a40485f4173c9c7ec3599b6b11c677900d80b` |
+| Subject | Add a STIG V6R5 readiness plan for the pinned source. |
+| Parent | `aad7a49f0e0f3ca6971b166b1e2e878832ed1744` |
+| Changed paths | `docs/STIG-READINESS-PLAN.md` added. No other path. |
+| Blob | Working tree `docs/STIG-READINESS-PLAN.md` matched `HEAD:docs/STIG-READINESS-PLAN.md` (`d85fe0b559235625aff0f58c16b773c208a6b42e`). |
+| Plan text read | Yes, for this cross-reference. This note does not re-review the plan. |
+
+The plan says it did not recompute the readiness-summary archive or XCCDF hashes. This backlog note does not recompute them either. The summary figures copied by the plan are 286 checks: 34 CAT I, 230 CAT II, and 22 CAT III. CSV labels used by the plan: 25 source gap, 204 needs evidence, 55 likely not applicable, 2 source suggests met. Those labels are provisional source judgments. No compliance percentage is inferred.
+
+### 8.2 RP dependency order
+
+Design precedes code. Evidence documents can be collected. Code, product-executing fixtures, and regulated controls wait for the owner decisions in each item. This order is copied from the separate plan. Copying it does not approve implementation.
+
+| Item | Depends on | Blocks | Release-backlog cross-reference, not a merge |
+| --- | --- | --- | --- |
+| RP-01 deployment and applicability decision | None | Regulated implementation inside RP-03, RP-04, RP-06, RP-08, and RP-10 | No wave item. Does not publish a compliance percentage. |
+| RP-02 research runner stays disconnected | None | Browser connection of the isolated runner. Does not block personal session or audit design. | Same release constraint as Gates G1 through G5 (`RB-G01-A` through `RB-G01-R`) and the hold on `RB-S02-A`. Not one of the 25 source-gap rows. Does not re-verify inert Stop, replay, or patch-binding evidence. |
+| RP-03 local session lifecycle | RP-01 before a regulated attempt limit. Personal idle and Lock design can be written first. V-222437 also waits for the RP-04 principal and the RP-05 log record. | Regulated lockout until RP-01 classifies the credential and selects that limit | No section 1 through 7 item. Session work must keep V-222580 and V-222581 as already implemented in the pinned source. The plan does not reopen those two rows. |
+| RP-04 credential decision | RP-01 | A verifier or transport change. Supplies the actor name used by RP-05. | Not `RB-P07-A`. No hash replacement and no move of the access file until RP-01 and the owner approve it. |
+| RP-05 security-event capture | RP-04 for the actor name. V-222445 also waits for RP-03 idle behavior. The audit schema may be drafted beside RP-03. | Fail-closed shutdown, or a written availability override, before code keeps serving after an audit write failure | Adjacent words in `RB-P02-A` are a different store. The approval review in section 8.6 does not close RP-05. |
+| RP-06 transport, cookie flags, and hash modules | RP-01 and RP-04 | Changes to `Secure`, the listen address, and hashing | No wave item. Setting `Secure` on the current HTTP cookie is not the fix. The listener stays on loopback unless a later approved design says otherwise. |
+| RP-07 separate control state from user data | RP-04, so the secret moves once | Live migration of an existing workspace | Adjacent to `RB-P11-A` data controls. Directory separation is not the backup module. |
+| RP-08 IPv6 as a deployment profile | RP-01 and RP-06 | Non-loopback binding. Opening `0.0.0.0` or a public address is not a way to close V-222634. | No wave item. V-222635 stays in the RP-11 register and is a different row from V-222634. |
+| RP-09 input-handling and fail-secure evidence | None for a static inventory. Executable tests need owner approval and disposable fixtures. | Nothing in the personal design sequence. Results stay evidence. | No wave item. The plan does not claim a vulnerability was found or ruled out. |
+| RP-10 release and operations evidence | RP-01 for which regulated artifacts are required. Document collection can start. | Signing, backup drills, and cutover | Names the same neighborhood as `RB-P11-A`, `RB-P11-C`, and `RB-P12-R`. Those backlog items do not close the evidence rows. |
+| RP-11 applicability register | RP-01 | Formal reliance on a likely-not-applicable label until an assessor confirms it | No wave item. The 55 likely-not-applicable checks stay provisional. |
+
+Recommended sequence in the plan, which the plan does not grant:
+
+1. RP-01 decision.
+2. RP-02 remains closed for the life of runner qualification.
+3. Personal designs for RP-03, RP-04, RP-05, and RP-06, reviewed before code.
+4. Personal code for idle timeout, legacy Lock or legacy removal, secret-safe audit, and directory separation.
+5. Regulated credential, TLS, FIPS, IPv6, identity, and governance work only where RP-01 includes them.
+6. RP-09 and RP-10 evidence beside design. Executable tests, signing, and cutover stay gated.
+7. RP-11 updated when the architecture adds SAML, WS-Security, PKI authentication, a new cryptographic mandate, or a multi-tier deployment.
+
+### 8.3 Personal app versus conditional regulated owner decisions
+
+Personal-app work is useful while CydeWorks remains one local operator on loopback. It still needs the owner's implementation approval. Conditional work starts only after the owner selects a DoD, DoW, or other regulated deployment and an assessor confirms applicability. The plan keeps both "DoD" and "DoW" because the source summary and CSV use both. Host file mode `0o600` and loopback binding stay useful local protections. They do not close a row whose CSV label is source gap or needs evidence.
+
+| Item | Personal-app owner decision | Conditional regulated owner decision |
+| --- | --- | --- |
+| RP-01 | Name one local operator, one workspace, loopback HTTP, legacy UI by default, experience UI optional, research runner disconnected. | If regulated use is intended, name users, roles, data categories, host and network boundary, inherited controls, and the assessor. Record DoD, DoW, or both. Classify `access.key` as a password, a local key file, or something else. V-222542 and V-222543 stay open until that classification exists. |
+| RP-02 | Keep the `pilot.mjs` disable throw. Decide later whether it is ever removed. Default is keep it. | Same hold. Regulated deployment does not by itself authorize browser connection. |
+| RP-03 | Whether legacy ships. Whether the 15-minute idle rule is adopted. Lock is not Stop. Polling must not move the idle deadline. | Whether the access file is a password and the three-attempt, 15-minute limit is in scope, and how the only local operator recovers without a second always-valid secret in the repository or client. |
+| RP-04 | Whether a personal local key file remains acceptable. Do not log the secret. Do not replace it with a hash until approved. | If an assessor treats it as a password: approved one-way storage, RP-06 protected channel, and the related identity, length, composition, PKI, display, embedded-authentication, and default-password evidence rows. A hash change without transport protection does not close V-222543. |
+| RP-05 | Local principal name. Whether audit failure stops the listener. Retention period. Records omit the access file, cookie, terminal lease, and request body. | External collector only after its coverage is shown. Centralized shipping, review, protection, retention, and backup are evidence needs. A personal principal does not close organizational unique identity (V-222522). |
+| RP-06 | Keep loopback HTTP, or approve local TLS. If HTTP remains, V-222576, V-222598, and V-222599 stay open for an assessment that requires TLS. | Whether FIPS validation is required. Node's default configuration is not that evidence. At-rest and transmitted-information rows follow the same decision. |
+| RP-07 | Approve target directories. A later move of a real workspace needs its own approval. | No separate regulated start. The secret still moves only to the place RP-04 chooses. |
+| RP-08 | Record IPv4 loopback as intentional. V-222634 stays open for an assessment that requires the DoW IPv6 profile. | Whether that profile applies. If it does, design loopback IPv6 with the RP-06 origin checks. `::1` and `127.0.0.1` stay loopback. |
+| RP-09 | Which disposable checks are worth a later isolated test, and who may run them. | Same gate. No network scan is authorized by the plan. |
+| RP-10 | Whether a signed Windows release is in scope, and where backups go. Threat-model note and software list can be written for the personal app. | Whether regulated governance documents are required. Classification markings, banners, and incident response are produced only for the deployment named in RP-01. |
+| RP-11 | Keep the 55 likely-not-applicable IDs provisional. | Assessor confirmation before a formal package relies on a label. Seven CAT I rows in that register become active work only if the product adds the mechanism or tier they name. |
+
+Approval gates that remain one owner action at a time, and that this section does not grant: credential or access-file changes, connected-service changes, paid usage, public push, merge to the default branch, deployment, live-preview cutover, and migration of an existing workspace database.
+
+### 8.4 Twenty-five provisional source gaps
+
+The plan assigns each of the 25 CSV source-gap IDs to one primary work item. Severities below are the CSV check severities, not independently demonstrated exploit severities. CAT I source gaps are V-222432, V-222542, and V-222543. CAT III source gaps are V-222392 and V-222437. The other 20 are CAT II.
+
+| Work item | IDs | Count |
+| --- | --- | ---: |
+| RP-03 session lifecycle | V-222389, V-222391, V-222392, V-222432, V-222437 | 5 |
+| RP-04 credential architecture | V-222542, V-222543 | 2 |
+| RP-05 audit capture | V-222441, V-222442, V-222443, V-222445, V-222449, V-222462, V-222464, V-222465, V-222468, V-222471, V-222477, V-222486 | 12 |
+| RP-06 transport and hashes | V-222571, V-222576, V-222598, V-222599 | 4 |
+| RP-07 control and user data | V-222626 | 1 |
+| RP-08 IPv6 profile | V-222634 | 1 |
+| Total |  | 25 |
+
+Full requirement text and the source lines read at `aad7a49` stay in the STIG plan. They are not restated here and are not accepted as closed.
+
+### 8.5 Evidence packages for the 204 needs-evidence rows
+
+Each ID appears once in the STIG plan. These rows are not restated as source gaps, and they are not copied into a second register here. Package totals below were read from that plan: 57 + 62 + 9 + 19 + 10 + 47 = 204.
+
+| Package | Count | Owned with | CAT I members named by the plan |
+| --- | ---: | --- | --- |
+| Audit and logging | 57 | RP-05 | None named in the package summary |
+| Identity, session, and access evidence | 62 | RP-03 and RP-04 | V-222425, V-222430, V-222522, V-222536, V-222551, V-222554, V-222577, V-222578, V-222642, V-222662 |
+| Cryptography and transmission evidence | 9 | RP-06 | V-222588, V-222589, V-222596 |
+| Input handling and fail-secure evidence | 19 | RP-09 | V-222585, V-222601, V-222602, V-222604, V-222607, V-222608, V-222609, V-222612 |
+| Availability and recovery evidence | 10 | RP-10 | None named in the package summary |
+| Governance, release, and data-management evidence | 47 | RP-01 and RP-10 | V-222643, V-222658, V-222659 |
+
+The full ID lists remain only in `docs/STIG-READINESS-PLAN.md`. Tracking a package does not close V-222652 or any other row.
+
+### 8.6 NEEDS WORK ledger for the six reviewed revisions
+
+Each transcript below was read through `t3_thread_read`. Each review branch tip matches the reviewed commit. The reviewer identity in every transcript is Codex `gpt-6.2-sol` with `reasoningEffort` high. No tests were run in those static reviews. Browser and release approval were outside every verdict. Earlier threads cited inside those transcripts were not read again for this note.
+
+Integration of all six reviewed revisions stays held. Sections 4 and 6 still describe the original unstarted scopes. They are not a current acceptance status for these revisions.
+
+#### Patch binding, `RB-G01-D` helper
+
+- Reviewed commit: `57068451a6e38ea21d27dcf86c5978a4e5ac698e`
+- Parent: `526e33ec1d0d59447c5726317eb221b7d9b4d95f`
+- Subject: Resolve claimId from host-owned store and document verifier trust boundary
+- Branch and worktree: `review/t3-patch-5706845` at `C:\Users\epbal\Documents\Codex\2026-11-10\name-this-chat-bfe-harness-2\work\cydeworks-canonical-source\work\review-patch-5706845`
+- Transcript: [CydeWorks patch focused independent review 5706845](t3-thread://v2/128ef247-4f3b-4453-9010-34f041b0c658/mcp:35cc5c4e-b80d-4409-b218-e3a60f6e4bcc)
+- Completed: 2026-11-19T05:05:19.578Z
+- Verdict: NEEDS WORK
+- High blocker: host provenance remains an integration blocker. The helper compares a `claimId` lookup with the supplied scope, digest, and case count, but the only resolver in that checkout is a test fixture over a synthetic journal. Verifier evidence still enters as a caller-supplied object. Integration needs a host-controlled claim store and a verifier channel outside candidate control.
+- Medium blocker: `provenanceEnforcedByCaller: true` is unconditional and overstates verifier provenance.
+- Transcript says closed by static inspection: the new regression rejects a self-consistent substituted claim with matching forged verifier evidence when `approvedCases` is omitted. Earlier Git replacement, default scratch guard, and exact staged-file findings stay closed in that inspection. Closure still depends on an independently protected resolver, which this commit does not establish.
+- Builder count, reported only: 7/7 focused tests.
+
+#### Inference broker settlement
+
+- Reviewed commit: `dc46ab2241ed8308393f5eb2eb7fe5c436f06880`
+- Parent: `4ed0dd156e87ecd516dfa1c2816a6934a085dc89`
+- Subject: Address Codex review findings on broker settlement evidence and memory bounds
+- Branch and worktree: `review/t3-broker-dc46ab2` at `C:\Users\epbal\Documents\Codex\2026-11-10\name-this-chat-bfe-harness-2\work\cydeworks-canonical-source\work\review-broker-dc46ab2`
+- Transcript: [CydeWorks broker focused independent review dc46ab2](t3-thread://v2/128ef247-4f3b-4453-9010-34f041b0c658/mcp:7cbd8318-9454-4a83-9b86-b9e4baa32240)
+- Completed: 2026-11-19T05:05:35.300Z
+- Verdict: NEEDS WORK. Hold broker integration.
+- High blocker: per-choice settlement is only partial. SSE can combine terminal reasons across different completion IDs and settle a two-choice request.
+- Medium blocker: the 4 MB observation budget does not charge retained SSE event names. The transcript describes nearly 16 MiB retained across 64 paused streams while `observationBytes` stays at zero.
+- Low blocker: overflow dispatches are counted twice while active (`inFlight` and `unknown` together).
+- Transcript says closed by static inspection: CR, LF, and split CRLF handling, including late errors after `[DONE]`; `observation-limit-exceeded` and `response-truncated` labels; zero dispatch remains distinct; socket closure leaves model cancellation unverified.
+- Tests: the transcript says the updated tests were UNRUN. An earlier builder 20/20 count is an attributed report, not proof for this revision.
+
+#### Approval audit, `RB-P02-A`
+
+- Reviewed commit: `f1efdfaa6e43ef8e36f8e86503a37519a2c42eb9`
+- Parent: `f7411512fbdc73d95e0137ec816290960a165ddd`
+- Subject: Harden RB-P02-A approval scope, root containment, crash hold, and audit triggers
+- Branch and worktree: `review/t3-approval-f1efdfa` at `C:\Users\epbal\Documents\Codex\2026-11-10\name-this-chat-bfe-harness-2\work\cydeworks-canonical-source\work\review-approval-f1efdfa`
+- Transcript: [CydeWorks approval focused independent review f1efdfa](t3-thread://v2/128ef247-4f3b-4453-9010-34f041b0c658/mcp:3e656d82-cba1-427a-bca5-e1625c72c815)
+- Completed: 2026-11-19T05:06:12.035Z
+- Verdict: NEEDS WORK. Hold `RB-P02-A` out of server wiring (`RB-P02-B`).
+- High blocker: crash-hold release can proceed without proof that the original worker stopped. Lease acquisition can replace an active owner, and release trusts caller-supplied exit flags or a syntactically valid receipt digest.
+- High blocker: dispatch scope is complete in shape only. `currentScope` is accepted from the caller. The two-connection test is sequential and uses local counters.
+- High blocker: Lock leaves an issuance race. `revokeSession` revokes grants already present, so issuance can still accept the same session ID after Lock.
+- High blocker: root checks can accept a different directory at the same path. The grant binds path strings and a stored revision.
+- Medium blocker: SQLite integrity is partial. Claim phase and recovery state remain writable outside allowed transitions. `CREATE TABLE IF NOT EXISTS` leaves an `f741151` database without the new columns. Replacement writes were uncovered.
+- Builder counts, reported only: 18/18 focused and 295/296 full-suite, with the remaining failure attributed to the inherited environment. Independent runtime evidence was pending in the transcript.
+
+#### Project context, `RB-P08-A`
+
+- Reviewed commit: `79d0fff0693c6f06bb8f6b367e4cba2c81af9d60`
+- Parent: `aad7a49f0e0f3ca6971b166b1e2e878832ed1744` (sibling of the STIG plan commit, not an ancestor of this branch)
+- Subject: Add RB-P08-A offline project context and skill library
+- Branch and worktree: `review/t3-context-79d0fff` at `C:\Users\epbal\Documents\Codex\2026-11-10\name-this-chat-bfe-harness-2\work\cydeworks-canonical-source\work\review-context-79d0fff`
+- Transcript: [CydeWorks context focused independent review 79d0fff](t3-thread://v2/128ef247-4f3b-4453-9010-34f041b0c658/mcp:d66f7581-78ee-4d49-a65b-e5e43214b938)
+- Completed: 2026-11-19T05:06:00.424Z
+- Verdict: NEEDS WORK. Hold `RB-P08-A` integration.
+- P1 blocker: version reuse can approve replacement content under an older version label because `expectedDigest` is optional, and a template pin follows that label.
+- P2 blocker: four permitted 64 KiB entries can exceed the shared hasher's 256 KiB input after framing, so a valid selection can fail to preview.
+- P2 blocker: `sourceHash` is a caller claim outside the approval digest.
+- P2 blocker: template eligibility and preview sample the clock separately, so one draft can mark an entry eligible and then exclude it as expired.
+- P2 blocker: template and selection validation can invoke caller-supplied JavaScript on arrays.
+- Transcript limits: explicit selection, project-scoped lookup, immediate revocation, ordinary version-change invalidation, deterministic ordering, and input-only templates were present for the fixtures inspected. No prior `RB-P08-A` finding record was in that checkout. A trailing blank line was flagged at `harness/project-context.test.mjs` line 843.
+- Builder counts, reported only: 11/11 focused and 298/299 full-suite, with the remaining failure attributed to the inherited environment.
+
+#### Workspace backup, `RB-P11-A`
+
+- Reviewed commit: `0f24c02ac1f4af66cfe9474bce98f92392635a6e`
+- Parent: `c907420ec4cdc4c8ab7d287870ab3e7df8ae81be` (subject: Add offline workspace SQLite backup and restore verifier (RB-P11-A); parent `ee6b4a161453d104273dba76a73e211887f6fc2e`)
+- Range named by the review prompt: `ee6b4a1..0f24c02`, which contains both commits above. This note checked that range with `git log`. It did not re-review the patches.
+- Subject of the reviewed tip: Harden workspace backup destination rollback and document consistency limits
+- Branch and worktree: `review/t3-backup-0f24c02` at `C:\Users\epbal\Documents\Codex\2026-11-10\name-this-chat-bfe-harness-2\work\cydeworks-canonical-source\work\review-backup-0f24c02`
+- Transcript: [CydeWorks backup independent review](t3-thread://v2/128ef247-4f3b-4453-9010-34f041b0c658/mcp:4661229a-960a-4086-8a90-e7eeba7f510a)
+- Completed: 2026-11-19T04:54:39.940Z
+- Verdict: NEEDS WORK. `RB-P11-A` does not meet acceptance.
+- High blocker: rollback can delete another writer's file. Exclusive create protects the first open, then unlink uses the recorded pathname.
+- High blocker: source and restore reads can escape the checked tree or publish different bytes from the bytes that were hashed.
+- High blocker: credential exclusion is filename-based. Ordinary artifacts and the full SQLite snapshot, including deleted pages, can retain secrets. The manifest discloses database retention. Disclosure is not the acceptance requirement to select eligible fields.
+- Medium blocker: partial failure can leave output with an ambiguous status because rollback suppresses deletion errors and cleanup can mask the original error.
+- Medium blocker: a self-consistent SQLite database with no `tasks` table can pass. Cross-store consistency stays unknown. Standalone inventory is not a single read transaction and needs its own consistency status.
+- Builder count, reported only: 9/9, matching five backup tests, two export tests, and two removal tests in source. The transcript had no run transcript tied to this HEAD.
+
+#### Disconnected synthetic verifier
+
+- Reviewed commit: `a2394a15c86bd3458671af6a64d1078eb9c26e0f`
+- Parent: `9539ace75161338b4304e9a9f86afbf1bc541448`
+- Subject: Add disconnected allowlisted AST verifier for fixed synthetic fixture
+- Branch and worktree: `review/t3-verifier-a2394a1` at `C:\Users\epbal\Documents\Codex\2026-11-10\name-this-chat-bfe-harness-2\work\cydeworks-canonical-source\work\review-verifier-a2394a1`
+- Transcript: [CydeWorks verifier independent review](t3-thread://v2/128ef247-4f3b-4453-9010-34f041b0c658/mcp:b5f46640-0884-427d-90b9-99872507b163)
+- Completed: 2026-11-19T04:54:25.773Z
+- Verdict: NEEDS WORK. General code execution and browser integration stay unapproved.
+- High blocker: a passing attestation can misrepresent the checked Python files because decoding, local binding, and exception-target cleanup differ from Python.
+- High blocker: attestation shape does not establish provenance. The result copies caller claim ID and base revision. `trusted: true` can validate without `caseResults`. The consumer at `aad7a49` also accepts the trust flag and makes `results` optional.
+- High blocker: the directory reader checks a path, then opens by pathname, so a concurrent replacement can invalidate the check. There is no deadline on a blocking open or read.
+- Medium blocker: the interoperability test targets the older helper contract and is incompatible with `aad7a49`, where `validateBoundScope` requires nested `claim.scope`.
+- Medium blocker: module initialization runs before the per-case error boundary, and the CLI does not catch those exceptions.
+- Transcript limits: no direct candidate execution was found in the AST evaluator. The case vector matches `pilot.mjs` by inspection. Twelve fixed observations do not establish general fixture behavior. Incomplete evidence, wall-clock isolation, and end-to-end patch binding stay unqualified.
+- Builder counts, reported only: 14/14 verifier, 6/6 parser, and 3/3 pilot. The interop test can skip when Node or Git is unavailable, so the reported count does not establish compatibility with `aad7a49`.
+
+### 8.7 Follow-up commits whose re-review evidence is missing
+
+Each reviewed commit has exactly one child on a separate work branch. `git merge-base --is-ancestor` showed each child is a descendant of its reviewed parent and that none of these twelve commits is an ancestor of `729a40485f4173c9c7ec3599b6b11c677900d80b`. No local branch named `review/*` points at a child. This note read each child's commit id, parent, subject, author date, and `git diff-tree --name-status` output. It did not read the patch bodies, did not run tests, and did not read a completed re-review thread for any child. Commit subjects are labels, not evidence that a blocker is closed.
+
+Author dates are UTC-7. Each child is later than the review completion time in section 8.6.
+
+| Reviewed parent | Follow-up commit, not reviewed | Branch tip | Author date | Paths in the commit | Subject label, not a finding closure |
+| --- | --- | --- | --- | --- | --- |
+| `57068451a6e38ea21d27dcf86c5978a4e5ac698e` | `162c2f8aacf34397ba1ec725416c1a1dd270161e` | `work/t3-verified-patch-binding` | 2026-11-18T22:11:40-07:00 | `research/isolated-runner-20261118/verified-patch.mjs`, `research/isolated-runner-20261118/verified-patch.test.mjs` | Remove unobserved provenanceEnforcedByCaller claim and reject untrusted verifier flag |
+| `dc46ab2241ed8308393f5eb2eb7fe5c436f06880` | `5366dde492b7f8428801059ea5ad13575858eac2` | `work/t3-broker-settlement-evidence` | 2026-11-18T22:12:40-07:00 | `harness/inference-broker.mjs`, `harness/inference-broker.test.mjs` | Address re-review findings on SSE ID consistency, event memory bounds, and overflow accounting |
+| `f1efdfaa6e43ef8e36f8e86503a37519a2c42eb9` | `26aec86f68cf7ee365ac7c6be23ef2c3ed3744fe` | `work/t3-pkg02-approval-audit` | 2026-11-18T22:19:19-07:00 | `harness/approval-audit.mjs`, `harness/approval-audit.test.mjs`, `harness/workspace-projects.mjs` | Address RB-P02-A approval hardening review findings |
+| `79d0fff0693c6f06bb8f6b367e4cba2c81af9d60` | `2e7f7f213a99cdd6876e2b87ed8da8e10fd474af` | `work/t3-pkg08-project-context` | 2026-11-18T22:14:00-07:00 | `harness/project-context.mjs`, `harness/project-context.test.mjs` | Harden project context revisions, digests, preview budget, and dense arrays |
+| `0f24c02ac1f4af66cfe9474bce98f92392635a6e` | `beffebd7e3bd3080392aec97258e3d2076f8a774` | `work/t3-pkg11-workspace-backup` | 2026-11-18T22:04:47-07:00 | `harness/workspace-backup.mjs`, `harness/workspace-backup.test.mjs` | Address Codex backup review: fail closed on unsafe publish/raw paths, bind handle identities, and enforce workspace schema |
+| `a2394a15c86bd3458671af6a64d1078eb9c26e0f` | `29bb54a05134c357c81817936a0ae91662238995` | `work/t3-trusted-fixture-verifier` | 2026-11-18T22:04:44-07:00 | `research/isolated-runner-20261118/protected-fixture-verifier.py`, `research/isolated-runner-20261118/test_protected_fixture_verifier.py` | Harden protected synthetic fixture verifier provenance and Python parity |
+
+The patch follow-up subject names the unconditional provenance field and an untrusted verifier flag. That subject does not mention the High host-owned store and out-of-band verifier channel. Even if it did, this note would not treat the subject as closure. Each of the six children still needs its own single Codex `gpt-6.2-sol` high re-review after the fix commit. Those reviews were not launched here.
+
+### 8.8 Limits of this ledger
+
+- Sections 1 through 7 were left in place, including their `7fc7bd8` baseline and their original "can run now" wording.
+- No target code, test, live runtime, credential, network call, install, setting, MCP server, browser session, push, or merge was used to produce this section.
+- Peer worktrees were not checked out, edited, or merged.
+- `docs/STIG-READINESS-PLAN.md` was not edited.
+- This section does not authorize RP implementation, Wave 2 server wiring, browser staging, or removal of the pilot disable throw.
