@@ -7,15 +7,15 @@ import {diagnosticMessages} from './route-diagnostics.js';
 import {bindProposalEditor} from './proposal-editor.js';
 import {terminalRequest,ownsTerminal} from './terminal-request.js';
 import {bindDraftCopyDialog} from './draft-copy-dialog.js';
-import {bindWorkspaceLock,createSessionEpoch,workspaceLockCopy} from './workspace-lock.js';
+import {bindWorkspaceLock,createLegacySessionController,workspaceLockCopy} from './workspace-lock.js';
 const $ = id => document.getElementById(id);
 const form = $('create');
 const field = name => form.elements.namedItem(name);
 let task, models=[], selection=0, busy=false, editing, lease, detached=false, listRevision=0, listTimer;
 let connection='connected', needsReconcile=false, explicitLock=null;
 let actionRevision=0;
-const sessionGate=createSessionEpoch();
-let lockEpoch=0;
+const sessionUi=createLegacySessionController();
+const sessionGate=sessionUi.gate;
 const resumeKey='bfe-last-task';
 const remember=id=>{try { if (id) sessionStorage.setItem(resumeKey,id); else sessionStorage.removeItem(resumeKey); } catch { /* Storage may be disabled. */ }};
 const remembered=()=>{try { return sessionStorage.getItem(resumeKey); } catch { return null; }};
@@ -43,13 +43,13 @@ async function api(path,body) {
 }
 async function act(fn) {
   if (busy||sessionGate.locked()) return;
-  const epoch=sessionGate.epoch();
+  const token=sessionUi.capture();
   busy=true;
   actionRevision++;
   $('new-task').disabled=true;
   note();
-  try { await fn(); } catch (error) {
-    if(!sessionGate.current(epoch))return;
+  try { await fn(token); } catch (error) {
+    if(!sessionUi.current(token)||error?.stale)return;
     note(error.message);
     if (task && error.status===401) {
       lease=undefined;
@@ -65,7 +65,7 @@ async function act(fn) {
     }
   } finally {
     busy=false;
-    if(sessionGate.current(epoch)&&connection==='connected'&&!needsReconcile)$('new-task').disabled=false;
+    if(sessionUi.current(token)&&connection==='connected'&&!needsReconcile)$('new-task').disabled=false;
   }
 }
 const path = () => '/api/tasks/'+task.id;
@@ -74,11 +74,18 @@ const active = status => status==='running';
 const labels = {draft:'Needs approval', review:'Needs review', running:'Running', accepted:'Accepted', rejected:'Rejected',
   failed:'Needs attention', cancelled:'Request cancelled', interrupted:'Needs recovery'};
 
-function concealLocalSession() {
-  lockEpoch=sessionGate.conceal();
-  lease=undefined;
-  observer.stop();
-  clearTimeout(listTimer);
+function applyConcealedView() {
+  const view=sessionUi.view;
+  $('workspace').hidden=view.workspaceHidden;
+  $('workspace').inert=view.workspaceInert;
+  $('unlock').hidden=view.unlockHidden;
+  $('access-file').disabled=view.unlockDisabled;
+  for (const dialog of document.querySelectorAll('dialog')) {
+    dialog.inert=true;
+    if (dialog.open) dialog.close();
+  }
+  const exportSave=$('export-save');
+  if (exportSave) exportSave.disabled=true;
   $('new-task').disabled=true;
   for (const id of ['run-button','terminal-take','terminal-release','terminal-status','terminal-stop','terminal-detach','terminal-attach','edit','edit-proposal','reject','copy-task','download','download-patch','refresh-routes','export','remove-task']) {
     const node=$(id);
@@ -86,7 +93,29 @@ function concealLocalSession() {
   }
   cancel.disabled=true;
   $('accept').disabled=true;
-  return lockEpoch;
+}
+function concealLocalSession() {
+  const dialogs=[...document.querySelectorAll('dialog')].map(node=>({open:node.open,inert:false,cached:null,node}));
+  sessionUi.useDialogs(dialogs);
+  const token=sessionUi.beginLock();
+  for (const dialog of dialogs) {
+    dialog.node.inert=true;
+    if (dialog.node.open) dialog.node.close();
+  }
+  lease=undefined;
+  observer.stop();
+  clearTimeout(listTimer);
+  applyConcealedView();
+  return token.epoch;
+}
+function applyRecoveredUnlock() {
+  applyConcealedView();
+  $('lock-workspace').hidden=true;
+  $('connection').hidden=true;
+}
+function releaseConcealedView() {
+  $('workspace').inert=false;
+  for (const dialog of document.querySelectorAll('dialog')) dialog.inert=false;
 }
 function setConnection(state) {
   if (sessionGate.locked() && state.phase!=='locked') return;
@@ -135,17 +164,20 @@ bindWorkspaceLock({
   openButton:$('lock-workspace'),dialog:$('lock-dialog'),confirmButton:$('lock-confirm'),cancelButton:$('lock-cancel'),
   status:$('access-status'),send:body=>api('/api/session/lock',body),focusTarget:$('access-file'),
   onLocalLock() {
-    concealLocalSession();
+    const epoch=concealLocalSession();
     explicitLock='waiting';
     setConnection({phase:'locked'});
+    return epoch;
   },
-  onOutcome(outcome) {
+  onOutcome(outcome, lockEpoch) {
     if(!sessionGate.outcomeCurrent(lockEpoch)){
       if(!sessionGate.locked())$('access-status').textContent='';
-      return;
+      return false;
     }
+    sessionUi.finishLock({epoch:lockEpoch}, outcome);
     explicitLock=outcome;
     setConnection({phase:'locked'});
+    return true;
   },
 });
 $('reconnect').onclick=()=>{ if (task&&!sessionGate.locked()) observer.start(task.id); };
@@ -424,34 +456,40 @@ function releaseView() {
 $('terminal-take').onclick=()=>act(async()=>{
   const takeover=task.live?.owner==='Operator';
   if (takeover && !window.confirm('Move terminal control from the other view to this view?')) return;
-  lease=await control('take',takeover);
+  const applied=await sessionUi.takeControl(()=>control('take',takeover));
+  if(!applied)return;
+  lease=sessionUi.view.lease;
   task.live.control={attemptId:lease.attemptId,generation:lease.generation,owner:'Operator',closed:false};
   task.live.owner='Operator';
   render();
 });
-$('terminal-release').onclick=()=>act(async()=>{
-  await control('release');
+$('terminal-release').onclick=()=>act(async token=>{
+  await sessionUi.settle(token, ()=>control('release'));
   lease=undefined;
-  task=await api(path());
+  task=await sessionUi.settle(token, ()=>api(path()));
   render();
 });
-$('terminal-status').onclick=()=>act(async()=>{await control('status');task=await api(path());render();});
-$('terminal-stop').onclick=()=>act(async()=>{
+$('terminal-status').onclick=()=>act(async token=>{
+  await sessionUi.settle(token, ()=>control('status'));
+  task=await sessionUi.settle(token, ()=>api(path()));
+  render();
+});
+$('terminal-stop').onclick=()=>act(async token=>{
   if (!window.confirm('Stop the managed OpenCode process?')) return;
-  await control('stop',true);
+  await sessionUi.settle(token, ()=>control('stop',true));
   lease=undefined;
-  task=await api(path());
+  task=await sessionUi.settle(token, ()=>api(path()));
   render();
 });
-$('terminal-detach').onclick=()=>act(async()=>{
+$('terminal-detach').onclick=()=>act(async token=>{
   const held=lease;
   lease=undefined;
   detached=true;
   render();
   $('terminal-attach').focus({preventScroll:true});
   // Detach is local observation state even if releasing the old lease fails.
-  if(held)await api(path()+'/terminal',terminalRequest(task,held,'detach'));
-  task=await api(path());
+  if(held)await sessionUi.settle(token, ()=>api(path()+'/terminal',terminalRequest(task,held,'detach')));
+  task=await sessionUi.settle(token, ()=>api(path()));
   render();
 });
 $('terminal-attach').onclick=()=>{
@@ -459,6 +497,7 @@ $('terminal-attach').onclick=()=>{
   detached=false;render();$('terminal-detach').focus({preventScroll:true});
 };
 function render() {
+  if(sessionGate.locked())return;
   const attempt=task.attempts.at(-1);
   $('task-title').textContent=task.title;
   $('status').textContent=labels[task.status];
@@ -506,6 +545,7 @@ function render() {
   $('accept').disabled=actionsBlocked||!attempt?.checks||attempt.checks.some(check=>!check.pass);
 }
 function download(name,content,type='text/plain') {
+  if(sessionGate.locked())return;
   const url=URL.createObjectURL(new Blob([content],{type}));
   const anchor=element('a');
   anchor.href=url;
@@ -538,28 +578,33 @@ $('edit').onclick=()=>{
   field('source').focus();
 };
 $('file').onchange=()=>act(async()=>{
-  const file=$('file').files[0];
-  if (!file) return;
-  if (file.size>20000) throw Error('This preview accepts a small text file, up to 5,000 characters.');
-  const source=await file.text();
-  if (source.length>5000 || source.includes('\0')) throw Error('Choose a text file of at most 5,000 characters.');
-  field('source').value=source;
-  field('filename').value=file.name;
+  const applied=await sessionUi.readSource(async()=>{
+    const file=$('file').files[0];
+    if (!file) return null;
+    if (file.size>20000) throw Error('This preview accepts a small text file, up to 5,000 characters.');
+    const source=await file.text();
+    if (source.length>5000 || source.includes('\0')) throw Error('Choose a text file of at most 5,000 characters.');
+    return {source,filename:file.name};
+  });
+  if(!applied)return;
+  field('source').value=sessionUi.view.fields.source;
+  field('filename').value=sessionUi.view.fields.filename;
 });
 form.onsubmit=event=>{
   event.preventDefault();
-  void act(async()=>{
+  void act(async token=>{
     const fields=Object.fromEntries(new FormData(form));
-    const created=editing
-      ? await api('/api/tasks/'+editing.id+'/scope',{...fields,version:editing.version})
-      : await api('/api/tasks',fields);
+    const created=await sessionUi.settle(token, ()=>editing
+      ? api('/api/tasks/'+editing.id+'/scope',{...fields,version:editing.version})
+      : api('/api/tasks',fields));
     await openTask(created.id);
   });
 };
 $('model').onchange=()=>{$('approve').checked=false;showRoute();};
-$('refresh-routes').onclick=()=>act(async()=>{
+$('refresh-routes').onclick=()=>act(async token=>{
   const preferred=$('model').value;
-  populateRoutes(await api('/api/models'),preferred);
+  const inventory=await sessionUi.settle(token, ()=>api('/api/models'));
+  populateRoutes(inventory,preferred);
   note('Routes refreshed. Review the selected route and approve the scope again.');
 });
 $('run').onsubmit=event=>{
@@ -567,8 +612,10 @@ $('run').onsubmit=event=>{
   void act(async()=>{
     const route=models.find(model=>routeKey(model)===$('model').value);
     if (!route?.readiness?.eligible) throw Error('Select an eligible route or refresh the route list.');
-    task=await api(path()+'/run',{version:task.version,sourceHash:task.sourceHash,model:route.id,engine:route.engine,
-      backend:routeBackend(route),modelDigest:route.digest??null,modelFingerprint:route.fingerprint??null,approve:$('approve').checked});
+    const approved=await sessionUi.runApproved(()=>api(path()+'/run',{version:task.version,sourceHash:task.sourceHash,model:route.id,engine:route.engine,
+      backend:routeBackend(route),modelDigest:route.digest??null,modelFingerprint:route.fingerprint??null,approve:$('approve').checked}));
+    if(!approved)return;
+    task=approved;
     detached=false;
     $('approve').checked=false;
     render();
@@ -576,8 +623,8 @@ $('run').onsubmit=event=>{
     await refreshList();
   });
 };
-for (const [id,decision] of [['accept','accepted'],['reject','rejected']]) $(id).onclick=()=>act(async()=>{
-  task=await api(path()+'/review',{version:task.version,decision,artifactHash:task.attempts.at(-1).artifact.sha256});
+for (const [id,decision] of [['accept','accepted'],['reject','rejected']]) $(id).onclick=()=>act(async token=>{
+  task=await sessionUi.settle(token, ()=>api(path()+'/review',{version:task.version,decision,artifactHash:task.attempts.at(-1).artifact.sha256}));
   render();
   await refreshList();
 });
@@ -585,7 +632,8 @@ bindProposalEditor({openButton:$('edit-proposal'),dialog:$('proposal-dialog'),fo
   content:$('proposal-content'),status:$('proposal-status'),saveButton:$('proposal-save'),cancelButton:$('proposal-cancel'),
   normalizeChoice:$('proposal-normalize'),normalizeGroup:$('proposal-normalize-group'),
   current:()=>task?{id:task.id,version:task.version,status:task.status,artifact:task.attempts.at(-1)?.artifact}:null,
-  submit:(id,body)=>api('/api/tasks/'+id+'/revise',body),onSaved:(id,result)=>{
+  submit:(id,body)=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/tasks/'+id+'/revise',body)),onSaved:(id,result)=>{
+    if(sessionGate.locked()||!task)return;
     if(task?.id===id && result.version>=task.version) {task=result;render();note('Edited proposal saved for review.');}
     void refreshList().catch(()=>note('Edited proposal saved, but the task list could not be refreshed.'));
   }});
@@ -599,19 +647,24 @@ $('download-patch').onclick=()=>{
 };
 bindDraftCopyDialog({openButton:$('copy-task'),dialog:$('copy-dialog'),target:$('copy-target'),status:$('copy-status'),
   copyButton:$('copy-submit'),checkButton:$('copy-check'),retryButton:$('copy-retry'),closeButton:$('copy-close'),current:()=>task,
-  submit:(id,body)=>api('/api/tasks/'+id+'/copy-draft',body),
-  lookup:requestId=>api('/api/draft-copies/'+requestId),onCopied:id=>{
+  submit:(id,body)=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/tasks/'+id+'/copy-draft',body)),
+  lookup:requestId=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/draft-copies/'+requestId)),onCopied:id=>{
+    if(sessionGate.locked())return;
     void act(async()=>{await openTask(id,{chooseRoute:true});note('Opened the saved copy. Review its scope and select a route before approving a run.');});
   }});
 bindExportDialog({openButton:$('export'),dialog:$('export-dialog'),mode:$('export-mode'),
   description:$('export-description'),status:$('export-status'),preview:$('export-preview'),
   saveButton:$('export-save'),closeButton:$('export-close'),currentTaskId:()=>task?.id,
-  load:(id,mode)=>api('/api/tasks/'+id+'/export?mode='+encodeURIComponent(mode)),
-  download:content=>download('harness-task-metadata.json',content,'application/json')});
+  load:(id,mode)=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/tasks/'+id+'/export?mode='+encodeURIComponent(mode))),
+  download:content=>{
+    const dialog=$('export-dialog');
+    if(!sessionUi.allowDownload({open:dialog.open&&!sessionGate.locked(),inert:dialog.inert||sessionGate.locked(),cached:sessionGate.locked()?null:content}))return;
+    download('harness-task-metadata.json',content,'application/json');
+  }});
 bindRemovalDialog({openButton:$('remove-task'),dialog:$('removal-dialog'),target:$('removal-target'),preview:$('removal-preview'),
   status:$('removal-status'),confirmation:$('removal-confirmation'),removeButton:$('removal-submit'),closeButton:$('removal-close'),
-  currentTaskId:()=>task?.id,load:id=>api('/api/tasks/'+id+'/removal-preview'),
-  remove:(id,body)=>api('/api/tasks/'+id+'/remove',body),onRemoved:id=>{
+  currentTaskId:()=>task?.id,load:id=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/tasks/'+id+'/removal-preview')),
+  remove:(id,body)=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/tasks/'+id+'/remove',body)),onRemoved:id=>{
     if(sessionGate.locked())return;
     if(task?.id===id) {
       observer.stop();lease=undefined;task=undefined;editing=undefined;remember(null);selection++;
@@ -630,26 +683,45 @@ async function enter() {
   $('access-status').textContent='';
   $('lock-workspace').hidden=true;
   const epoch=sessionGate.unlock();
+  const entered={epoch};
+  let accessHidden=false;
   try {
     await refreshList();
     if(!sessionGate.current(epoch))return;
     connection='connected';
     $('connection').hidden=true;
     $('unlock').hidden=true;
+    accessHidden=true;
+    sessionUi.noteAccessHidden();
     $('workspace').hidden=false;
+    releaseConcealedView();
     $('lock-workspace').hidden=false;
     watchList();
     const id=task?.id??remembered();
     if (id) {
       try { await openTask(id); }
       catch(error) {
-        if (error.status===404) remember(null);
-        else if(!sessionGate.current(epoch))return;
-        else throw error;
+        if(!sessionGate.current(epoch))return;
+        if (error.status===404) { remember(null); return; }
+        throw error;
       }
     }
   } catch(error) {
     if(!sessionGate.current(epoch))return;
+    if(accessHidden){
+      const dialogs=[...document.querySelectorAll('dialog')].map(node=>({open:node.open,inert:false,cached:null,node}));
+      sessionUi.useDialogs(dialogs);
+      sessionUi.failRestore(entered);
+      lease=undefined;
+      observer.stop();
+      clearTimeout(listTimer);
+      for (const dialog of dialogs) {
+        dialog.node.inert=true;
+        if (dialog.node.open) dialog.node.close();
+      }
+      applyRecoveredUnlock();
+      throw error;
+    }
     concealLocalSession();
     $('lock-workspace').hidden=true;
     throw error;

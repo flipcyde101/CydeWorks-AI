@@ -5,7 +5,7 @@ import {writeFile,readFile,access} from 'node:fs/promises';
 import {join} from 'node:path';
 import {terminalWorkspace} from './test-support/terminal-workspace.mjs';
 import {createTerminalControl} from './terminal-control.mjs';
-import {bindWorkspaceLock,createSessionEpoch,workspaceLockCopy} from './web/workspace-lock.js';
+import {bindWorkspaceLock,createLegacySessionController,createSessionEpoch,workspaceLockCopy} from './web/workspace-lock.js';
 import {classifyLockOutcome} from './web-experience/adapters/contract.js';
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -169,6 +169,7 @@ const sessionIdleMs=15*60*1000;
 const sessionClockNeedle=`const sessionMonotonic = () => performance.now();
 const sessionWall = () => Date.now();`;
 const issuedCookie=/^bfe_session=[a-f0-9]{64}; HttpOnly; SameSite=Strict; Path=\/api$/;
+const survivorCookie=/^bfe_session=[a-f0-9]{64}; HttpOnly; SameSite=Strict; Path=\/api\/$/;
 const expiredCookie='bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api';
 
 function clockPatch(code) {
@@ -195,13 +196,40 @@ function clockPatch(code) {
     };`);
 }
 
+function cookiePath(header) {
+  const match=/;\s*Path=([^;,\s]+)/i.exec(header);
+  return match?match[1]:'/';
+}
+function cookieKey(header) {
+  const [pair]=String(header).split(';');
+  const name=pair.slice(0,pair.indexOf('='));
+  return name+'\n'+cookiePath(header);
+}
 function applyCookie(jar, header) {
   if(!header)return;
   const [pair]=String(header).split(';');
-  const name=pair.slice(0,pair.indexOf('='));
   const value=pair.slice(pair.indexOf('=')+1);
-  if(/Max-Age=0/i.test(header))delete jar[name];
-  else jar[name]=value;
+  const key=cookieKey(header);
+  if(/Max-Age=0/i.test(header))delete jar[key];
+  else jar[key]=value;
+}
+function setCookies(response) {
+  assert.equal(typeof response.headers.getSetCookie,'function');
+  const cookies=response.headers.getSetCookie();
+  assert.ok(cookies.length);
+  return cookies;
+}
+function primaryIssued(response) {
+  const cookies=setCookies(response);
+  const primary=cookies.find(value=>issuedCookie.test(value));
+  const survivor=cookies.find(value=>survivorCookie.test(value));
+  assert.ok(primary);
+  assert.ok(survivor);
+  assert.equal(primary.split(';')[0],survivor.split(';')[0]);
+  return primary;
+}
+function cookieValue(header) {
+  return header.split(';')[0].slice('bfe_session='.length);
 }
 
 // The copied host reads session-clock.txt. Production uses performance.now() and Date.now().
@@ -237,8 +265,7 @@ test('polls and heartbeats do not move the 15-minute deadline',{timeout:15000},a
   const {origin,request,path,at}=await withSessionClock(t,{startImmediately:true});
   const issued=await client(origin)('/api/session',{key:'a'.repeat(64)});
   assert.equal(issued.status,200);
-  const original=issued.headers.get('set-cookie');
-  assert.match(original,issuedCookie);
+  const original=primaryIssued(issued);
   const before=await (await request(path)).json();
   const taken=await request(path+'/terminal',{command:'take',...before.live.control});
   assert.equal(taken.status,200);
@@ -264,8 +291,7 @@ test('polls and heartbeats do not move the 15-minute deadline',{timeout:15000},a
   assert.equal((await request('/api/session/lock',{})).status,401);
   const fresh=await client(origin)('/api/session',{key:'a'.repeat(64)});
   assert.equal(fresh.status,200);
-  const next=fresh.headers.get('set-cookie');
-  assert.match(next,issuedCookie);
+  const next=primaryIssued(fresh);
   assert.notEqual(next.split(';')[0],original.split(';')[0]);
   assert.equal((await request('/api/tasks')).status,401);
   assert.equal((await client(origin,next.split(';')[0])('/api/tasks')).status,200);
@@ -288,13 +314,11 @@ test('an operator POST moves the deadline and the boundary is exact',{timeout:15
 test('unlock at the deadline replaces the secret before issuing a cookie',{timeout:15000},async t=>{
   const {origin,request,at}=await withSessionClock(t);
   const first=await client(origin)('/api/session',{key:'a'.repeat(64)});
-  const original=first.headers.get('set-cookie');
-  assert.match(original,issuedCookie);
+  const original=primaryIssued(first);
   await at(sessionIdleMs);
   const fresh=await client(origin)('/api/session',{key:'a'.repeat(64)});
   assert.equal(fresh.status,200);
-  const next=fresh.headers.get('set-cookie');
-  assert.match(next,issuedCookie);
+  const next=primaryIssued(fresh);
   assert.notEqual(next.split(';')[0],original.split(';')[0]);
   assert.equal((await request('/api/tasks')).status,401);
   assert.equal((await client(origin,next.split(';')[0])('/api/tasks')).status,200);
@@ -490,6 +514,14 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(app,/if\(stamp!==listRevision\|\|!sessionGate\.current\(epoch\)\)return;/);
   assert.match(app,/if\(!sessionGate\.outcomeCurrent\(lockEpoch\)\)/);
   assert.match(app,/if \(busy\|\|sessionGate\.locked\(\)\) return;/);
+  assert.match(app,/sessionUi\.readSource\(/);
+  assert.match(app,/sessionUi\.takeControl\(/);
+  assert.match(app,/sessionUi\.runApproved\(/);
+  assert.match(app,/sessionUi\.allowDownload\(/);
+  assert.match(app,/sessionUi\.settle\(/);
+  assert.match(enter,/sessionUi\.failRestore\(entered\)/);
+  assert.match(enter,/observer\.stop\(\)/);
+  assert.match(enter,/clearTimeout\(listTimer\)/);
   assert.match(experience,/classifyLockOutcome\(result\)/);
   assert.match(experience,/state\.sessionEpoch !== epoch \|\| state\.session\.unlocked/);
 });
@@ -504,8 +536,7 @@ test('a backward session clock ends the workspace session',{timeout:15000},async
   assert.equal(wall.headers.get('set-cookie'),expiredCookie);
   const unlocked=await client(origin)('/api/session',{key:'a'.repeat(64)});
   assert.equal(unlocked.status,200);
-  const cookie=unlocked.headers.get('set-cookie');
-  assert.match(cookie,issuedCookie);
+  const cookie=primaryIssued(unlocked);
   const next=client(origin,cookie.split(';')[0]);
   assert.equal((await next('/api/tasks')).status,200);
   await at(2000,500);
@@ -568,8 +599,7 @@ export const fixture={models:async()=>[]};
   await at(sessionIdleMs);
   const unlocked=await client(origin)('/api/session',{key:'a'.repeat(64)});
   assert.equal(unlocked.status,200);
-  const issued=unlocked.headers.get('set-cookie');
-  assert.match(issued,issuedCookie);
+  const issued=primaryIssued(unlocked);
   await writeFile(join(folder,'probe.release'),'ready');
   const late=await pending;
   assert.equal(late.status,401);
@@ -577,9 +607,210 @@ export const fixture={models:async()=>[]};
   assert.ok(lateCookie==null||!String(lateCookie).includes('Max-Age=0'));
   assert.equal(Object.hasOwn(await late.json(),'models'),false);
   const jar={};
-  applyCookie(jar,issued);
+  for(const header of setCookies(unlocked)) applyCookie(jar,header);
   applyCookie(jar,lateCookie);
-  assert.equal(jar.bfe_session,issued.split(';')[0].slice('bfe_session='.length));
-  assert.equal((await client(origin,'bfe_session='+jar.bfe_session)('/api/tasks')).status,200);
+  const secret=cookieValue(issued);
+  assert.equal(jar['bfe_session\n/api'],secret);
+  assert.equal(jar['bfe_session\n/api/'],secret);
+  assert.equal((await client(origin,'bfe_session='+jar['bfe_session\n/api/'])('/api/tasks')).status,200);
   assert.equal((await request('/api/tasks')).status,401);
+});
+
+test('an already issued cookie deletion leaves the newer path survivor',{timeout:15000},async t=>{
+  const {origin,at}=await withSessionClock(t);
+  const first=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  const oldHeader=primaryIssued(first);
+  const oldSecret=cookieValue(oldHeader);
+  await at(sessionIdleMs);
+  const expired=await client(origin,'bfe_session='+oldSecret)('/api/tasks');
+  assert.equal(expired.status,401);
+  assert.equal(expired.headers.get('set-cookie'),expiredCookie);
+  const deletion=expired.headers.get('set-cookie');
+  const fresh=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  const next=primaryIssued(fresh);
+  const secret=cookieValue(next);
+  assert.notEqual(secret,oldSecret);
+  const jar={};
+  for(const header of setCookies(fresh)) applyCookie(jar,header);
+  applyCookie(jar,deletion);
+  assert.equal(jar['bfe_session\n/api'],undefined);
+  assert.equal(jar['bfe_session\n/api/'],secret);
+  assert.equal((await client(origin,'bfe_session='+jar['bfe_session\n/api/'])('/api/tasks')).status,200);
+  assert.equal((await client(origin,'bfe_session='+oldSecret)('/api/tasks')).status,401);
+  const onlyOld={};
+  applyCookie(onlyOld,oldHeader);
+  applyCookie(onlyOld,deletion);
+  assert.equal(onlyOld['bfe_session\n/api'],undefined);
+});
+
+function deferred() {
+  let release;
+  const promise=new Promise(resolve=>{release=resolve;});
+  return {promise,release};
+}
+
+test('a current file read, take, and run update the legacy session view',async()=>{
+  const ui=createLegacySessionController();
+  ui.gate.unlock();
+  assert.equal(await ui.readSource(async()=>({source:'shown',filename:'note.txt'})),true);
+  assert.equal(ui.view.fields.source,'shown');
+  assert.equal(ui.view.fields.filename,'note.txt');
+  assert.equal(await ui.takeControl(async()=>({attemptId:'attempt',generation:2})),true);
+  assert.deepEqual(ui.view.lease,{attemptId:'attempt',generation:2});
+  assert.equal(ui.view.polling,false);
+  const task=await ui.runApproved(async()=>({id:'task'}));
+  assert.deepEqual(task,{id:'task'});
+  assert.equal(ui.view.polling,true);
+  assert.equal(ui.view.runs,1);
+  assert.equal(ui.view.uiWrites,3);
+});
+
+test('delayed file, take, and run successes do not write or poll after Lock',async()=>{
+  const ui=createLegacySessionController();
+  ui.gate.unlock();
+  ui.view.fields.source='already shown';
+  ui.view.fields.filename='kept.txt';
+  const file=deferred();
+  const take=deferred();
+  const run=deferred();
+  const fileResult=ui.readSource(()=>file.promise);
+  const takeResult=ui.takeControl(()=>take.promise);
+  const runResult=ui.runApproved(()=>run.promise);
+  const lock=ui.beginLock();
+  file.release({source:'late source',filename:'late.txt'});
+  take.release({attemptId:'late',generation:9});
+  run.release({id:'late-task'});
+  assert.equal(await fileResult,false);
+  assert.equal(await takeResult,false);
+  assert.equal(await runResult,false);
+  assert.equal(ui.view.fields.source,'already shown');
+  assert.equal(ui.view.fields.filename,'kept.txt');
+  assert.equal(ui.view.lease,null);
+  assert.equal(ui.view.polling,false);
+  assert.equal(ui.view.runs,0);
+  assert.equal(ui.view.uiWrites,0);
+  assert.equal(ui.view.workspaceHidden,true);
+  assert.equal(ui.view.workspaceInert,true);
+  assert.equal(ui.gate.outcomeCurrent(lock.epoch),true);
+});
+
+test('each Lock keeps its own epoch and only the latest outcome can publish',async()=>{
+  const ui=createLegacySessionController();
+  ui.gate.unlock();
+  const first=ui.beginLock();
+  const second=ui.beginLock();
+  assert.notEqual(first.epoch,second.epoch);
+  assert.equal(ui.finishLock(first,'confirmed'),false);
+  assert.equal(ui.view.notice,null);
+  assert.equal(ui.gate.outcomeCurrent(first.epoch),false);
+  assert.equal(ui.finishLock(second,'confirmed'),true);
+  assert.equal(ui.view.notice,'confirmed');
+  assert.equal(ui.gate.outcomeCurrent(second.epoch),true);
+  assert.equal(first.epoch+1,second.epoch);
+});
+
+test('an older Lock response cannot replace a later Lock status',async()=>{
+  const ui=createLegacySessionController();
+  const status={textContent:'initial'};
+  const dialog={open:false,showModal(){this.open=true;},close(){this.open=false;}};
+  const openButton={onclick:null,focus(){this.focused=true;}};
+  const confirmButton={onclick:null,disabled:false};
+  const cancelButton={onclick:null};
+  const held=deferred();
+  let firstEpoch;
+  bindWorkspaceLock({
+    openButton,dialog,confirmButton,cancelButton,status,
+    async send(){
+      held.later=ui.beginLock();
+      status.textContent='second-waiting';
+      return held.promise;
+    },
+    onLocalLock(){
+      firstEpoch=ui.beginLock().epoch;
+      return firstEpoch;
+    },
+    onOutcome(outcome, epoch){
+      return ui.finishLock({epoch},outcome)?true:false;
+    },
+  });
+  const done=confirmButton.onclick();
+  assert.equal(status.textContent,'second-waiting');
+  assert.notEqual(held.later.epoch,firstEpoch);
+  held.release({locked:true});
+  await done;
+  assert.equal(status.textContent,'second-waiting');
+  assert.equal(ui.view.notice,null);
+  assert.equal(ui.finishLock({epoch:firstEpoch},'confirmed'),false);
+  assert.equal(ui.finishLock(held.later,'confirmed'),true);
+  assert.equal(ui.view.notice,'confirmed');
+  assert.equal(status.textContent,'second-waiting');
+});
+
+test('Lock closes dialogs and refuses a cached export download',async()=>{
+  const ui=createLegacySessionController();
+  ui.gate.unlock();
+  ui.view.fields.source='already shown';
+  const dialog={open:false,inert:false,cached:null};
+  ui.openDialog(dialog);
+  dialog.cached='export-body';
+  assert.equal(ui.allowDownload(dialog),true);
+  assert.deepEqual(ui.view.downloads,['export-body']);
+  ui.beginLock();
+  assert.equal(dialog.open,false);
+  assert.equal(dialog.inert,true);
+  assert.equal(dialog.cached,null);
+  assert.equal(ui.view.workspaceHidden,true);
+  assert.equal(ui.view.workspaceInert,true);
+  assert.equal(ui.view.fields.source,'already shown');
+  assert.equal(ui.allowDownload({open:true,inert:false,cached:'export-body'}),false);
+  assert.deepEqual(ui.view.downloads,['export-body']);
+});
+
+test('a failed restore after the access panel is hidden recovers unlock and drops the late read',async()=>{
+  const ui=createLegacySessionController();
+  const entered={epoch:ui.gate.unlock()};
+  ui.noteAccessHidden();
+  assert.equal(ui.view.unlockHidden,true);
+  assert.equal(ui.view.workspaceHidden,false);
+  const late=deferred();
+  const pending=ui.readSource(()=>late.promise);
+  assert.equal(ui.failRestore(entered),'recovered');
+  assert.equal(ui.view.unlockHidden,false);
+  assert.equal(ui.view.unlockDisabled,false);
+  assert.equal(ui.view.workspaceHidden,true);
+  assert.equal(ui.view.workspaceInert,true);
+  assert.equal(ui.view.polling,false);
+  late.release({source:'late',filename:'late.txt'});
+  assert.equal(await pending,false);
+  assert.equal(ui.view.fields.source,'');
+  assert.equal(ui.view.uiWrites,0);
+  const opened=ui.gate.unlock();
+  assert.equal(ui.gate.current(opened),true);
+  ui.noteAccessHidden();
+  assert.equal(ui.view.workspaceHidden,false);
+  assert.equal(ui.view.workspaceInert,false);
+});
+
+test('a failed restore for an older epoch does not replace a newer Lock',async()=>{
+  const ui=createLegacySessionController();
+  const entered={epoch:ui.gate.unlock()};
+  ui.noteAccessHidden();
+  const lock=ui.beginLock();
+  assert.equal(ui.failRestore(entered),'stale');
+  assert.equal(ui.gate.outcomeCurrent(lock.epoch),true);
+  assert.equal(ui.view.notice,null);
+  assert.equal(ui.view.workspaceHidden,true);
+  assert.equal(ui.view.workspaceInert,true);
+});
+
+test('a settled result that arrives after Lock is stale',async()=>{
+  const ui=createLegacySessionController();
+  ui.gate.unlock();
+  const token=ui.capture();
+  const late=deferred();
+  const pending=ui.settle(token,()=>late.promise);
+  ui.beginLock();
+  late.release({id:'task'});
+  await assert.rejects(pending,error=>error.stale===true);
+  assert.equal(ui.view.uiWrites,0);
 });

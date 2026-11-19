@@ -68,6 +68,20 @@ function equal(candidate, expected) {
   return typeof candidate==='string' && /^[a-f0-9]{64}$/.test(candidate) &&
     timingSafeEqual(Buffer.from(candidate),Buffer.from(expected));
 }
+function presentedSessionValues(header) {
+  const values=[];
+  for(const part of String(header??'').split(';')) {
+    const item=part.trim();
+    if(item.startsWith('bfe_session=')) values.push(item.slice('bfe_session='.length));
+  }
+  return values;
+}
+function sessionCookieHeaders() {
+  // Path=/api and Path=/api/ are different cookies. Max-Age=0 for Path=/api cannot
+  // remove a newer Path=/api/ cookie that unlock has already issued.
+  const prefix='bfe_session='+session+'; HttpOnly; SameSite=Strict; Path=';
+  return [prefix+'/api', prefix+'/api/'];
+}
 const db = new DatabaseSync(database);
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
   CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, updated TEXT NOT NULL, data TEXT NOT NULL);
@@ -295,20 +309,19 @@ const server=http.createServer(async (req,res) => {
       if(sessionAtArrival!==session)fail(409,'The workspace was locked while unlocking. Choose the access file again.');
       if(sessionIdle())endWorkspaceSession();
       noteSessionActivity();
-      res.setHeader('Set-Cookie','bfe_session='+session+'; HttpOnly; SameSite=Strict; Path=/api');
+      res.setHeader('Set-Cookie',sessionCookieHeaders());
       return send(200,{authorized:true});
     }
-    const cookie=req.headers.cookie?.split(';').map(value=>value.trim()).find(value=>value.startsWith('bfe_session='));
+    const presentedSessions=presentedSessionValues(req.headers.cookie);
     const expireSessionCookie=()=>res.setHeader('Set-Cookie','bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api');
     const requireSession=()=>{
       if(sessionIdle()) {
-        const presented=cookie?.slice('bfe_session='.length);
-        const matched=equal(presented,session);
+        const matched=presentedSessions.some(value=>equal(value,session));
         endWorkspaceSession();
         if(matched)expireSessionCookie();
         fail(401,'Unlock this workspace with its local access.key file.');
       }
-      if (!equal(cookie?.slice('bfe_session='.length),session)) fail(401,'Unlock this workspace with its local access.key file.');
+      if(!presentedSessions.some(value=>equal(value,session))) fail(401,'Unlock this workspace with its local access.key file.');
     };
     requireSession();
     const authenticatedBody=async()=>{
