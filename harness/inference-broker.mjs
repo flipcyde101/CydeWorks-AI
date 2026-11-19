@@ -2,8 +2,12 @@ import {Agent,createServer,request} from 'node:http';
 import {randomBytes,timingSafeEqual} from 'node:crypto';
 
 const MAX_BODY_BYTES=2000000;
+const MAX_OBSERVATION_BYTES=4000000;
 const MAX_SSE_LINE_BYTES=262144;
+const MAX_SSE_EVENT_BYTES=262144;
 const MAX_SSE_EVENT_LINES=256;
+const MAX_EXPECTED_CHOICES=32;
+const MAX_ACTIVE_ENTRIES=64;
 const MAX_RECORDS=64;
 const MAX_FINISH_REASONS=8;
 const TERMINAL_FINISH_REASONS=new Set(['stop','length','tool_calls']);
@@ -19,11 +23,19 @@ function mediaTypeOf(header) {
   return header.split(';',1)[0].trim().toLowerCase();
 }
 
+function parseExpectedChoices(parsed) {
+  if(parsed.n===undefined||parsed.n===null)return 1;
+  if(Number.isSafeInteger(parsed.n)&&parsed.n>=1&&parsed.n<=MAX_EXPECTED_CHOICES)return parsed.n;
+  return null;
+}
+
 function normalizeFinishReason(value) {
   return typeof value==='string'&&TERMINAL_FINISH_REASONS.has(value)?value:null;
 }
 
-function evaluateJsonCompletion(buffer) {
+function evaluateJsonCompletion(buffer,expectedChoices) {
+  if(expectedChoices===null)
+    return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(buffer);}
   catch {return {settled:false,evidence:'ambiguous-response',finishReasons:[]};}
@@ -34,68 +46,139 @@ function evaluateJsonCompletion(buffer) {
     return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
   if(parsed.error!==undefined&&parsed.error!==null)
     return {settled:false,evidence:'upstream-error',finishReasons:[]};
+  if(parsed.id!==undefined&&(typeof parsed.id!=='string'||!parsed.id))
+    return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
   if(parsed.object!==undefined&&parsed.object!=='chat.completion')
     return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
   if(parsed.model!==undefined&&(typeof parsed.model!=='string'||!parsed.model))
     return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
-  if(!Array.isArray(parsed.choices)||parsed.choices.length===0)
+  if(!Array.isArray(parsed.choices)||parsed.choices.length!==expectedChoices)
     return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
-  const reasons=[];
+  const seen=new Set();
+  const reasonsByIndex=new Array(expectedChoices).fill(null);
   for(const choice of parsed.choices) {
     if(!choice||typeof choice!=='object'||Array.isArray(choice))
       return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
+    if(choice.error!==undefined&&choice.error!==null)
+      return {settled:false,evidence:'upstream-error',finishReasons:[]};
+    if(choice.message!==undefined&&(!choice.message||typeof choice.message!=='object'||Array.isArray(choice.message)))
+      return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
+    let index;
+    if(choice.index===undefined) {
+      if(expectedChoices!==1)return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
+      index=0;
+    } else if(Number.isSafeInteger(choice.index)&&choice.index>=0&&choice.index<expectedChoices) {
+      index=choice.index;
+    } else {
+      return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
+    }
+    if(seen.has(index))
+      return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
+    seen.add(index);
     const reason=normalizeFinishReason(choice.finish_reason);
     if(!reason)return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
-    if(!reasons.includes(reason)&&reasons.length<MAX_FINISH_REASONS)reasons.push(reason);
+    reasonsByIndex[index]=reason;
   }
-  return {settled:true,evidence:'json-finish-reason',finishReasons:reasons};
+  if(seen.size!==expectedChoices)
+    return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
+  const finishReasons=[];
+  for(const reason of reasonsByIndex) {
+    if(!finishReasons.includes(reason)&&finishReasons.length<MAX_FINISH_REASONS)finishReasons.push(reason);
+  }
+  return {settled:true,evidence:'json-finish-reason',finishReasons};
 }
 
-function createSseTracker() {
+function createSseTracker(expectedChoices,tryReserveObservation,releaseObservation) {
   const decoder=new TextDecoder('utf-8',{fatal:true});
   let lineBuffer='';
+  let ignoreNextLf=false;
   let eventType='';
   let eventDataLines=[];
+  let eventDataBytes=0;
   let sawDone=false;
-  let sawTerminalFinishReason=false;
   let sawError=false;
-  let sawMalformed=false;
-  let truncated=false;
-  const finishReasons=[];
+  let sawMalformed=expectedChoices===null;
+  let sawDuplicateOrContradictory=false;
+  let observationLimitExceeded=false;
+  const choiceFinishReasons=expectedChoices?new Array(expectedChoices).fill(null):[];
+
+  const clearBuffers=()=>{
+    lineBuffer='';
+    eventDataLines=[];
+    eventDataBytes=0;
+    releaseObservation();
+  };
+
+  const failObservationLimit=()=>{
+    observationLimitExceeded=true;
+    clearBuffers();
+  };
 
   const dispatchEvent=()=>{
-    if(eventDataLines.length===0){eventType='';return;}
-    const payload=eventDataLines.join('\n');
-    eventDataLines=[];
     const currentType=eventType;
     eventType='';
-    if(currentType==='error'){sawError=true;return;}
-    if(sawDone){sawMalformed=true;return;}
+    if(currentType==='error') {
+      eventDataLines=[];
+      eventDataBytes=0;
+      sawError=true;
+      return;
+    }
+    if(eventDataLines.length===0)return;
+    const payload=eventDataLines.join('\n');
+    eventDataLines=[];
+    eventDataBytes=0;
+    if(sawDone) {
+      try {
+        const afterDone=JSON.parse(payload);
+        if(afterDone&&typeof afterDone==='object'&&!Array.isArray(afterDone)&&afterDone.error!==undefined&&afterDone.error!==null) {
+          sawError=true;
+          return;
+        }
+      } catch {}
+      sawMalformed=true;
+      return;
+    }
     if(payload==='[DONE]'){sawDone=true;return;}
     let parsed;
     try {parsed=JSON.parse(payload);}
     catch {sawMalformed=true;return;}
     if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)){sawMalformed=true;return;}
     if(parsed.error!==undefined&&parsed.error!==null){sawError=true;return;}
+    if(parsed.id!==undefined&&(typeof parsed.id!=='string'||!parsed.id)){sawMalformed=true;return;}
     if(parsed.object!==undefined&&parsed.object!=='chat.completion.chunk'&&parsed.object!=='chat.completion') {
       sawMalformed=true;return;
     }
-    if(Array.isArray(parsed.choices)) {
-      for(const choice of parsed.choices) {
-        if(!choice||typeof choice!=='object'||Array.isArray(choice)){sawMalformed=true;return;}
-        if(choice.finish_reason!==undefined&&choice.finish_reason!==null) {
-          const reason=normalizeFinishReason(choice.finish_reason);
-          if(!reason){sawMalformed=true;return;}
-          sawTerminalFinishReason=true;
-          if(!finishReasons.includes(reason)&&finishReasons.length<MAX_FINISH_REASONS)finishReasons.push(reason);
-        }
+    if(parsed.model!==undefined&&(typeof parsed.model!=='string'||!parsed.model)){sawMalformed=true;return;}
+    if(parsed.choices===undefined){if(parsed.usage===undefined)sawMalformed=true;return;}
+    if(!Array.isArray(parsed.choices)){sawMalformed=true;return;}
+    const seenInChunk=new Set();
+    for(const choice of parsed.choices) {
+      if(!choice||typeof choice!=='object'||Array.isArray(choice)){sawMalformed=true;return;}
+      if(choice.error!==undefined&&choice.error!==null){sawError=true;return;}
+      let index;
+      if(choice.index===undefined) {
+        if(expectedChoices!==1||parsed.choices.length!==1){sawMalformed=true;return;}
+        index=0;
+      } else if(expectedChoices!==null&&Number.isSafeInteger(choice.index)&&choice.index>=0&&choice.index<expectedChoices) {
+        index=choice.index;
+      } else {
+        sawMalformed=true;return;
+      }
+      if(seenInChunk.has(index)){sawDuplicateOrContradictory=true;return;}
+      seenInChunk.add(index);
+      if(choice.finish_reason!==undefined&&choice.finish_reason!==null) {
+        const reason=normalizeFinishReason(choice.finish_reason);
+        if(!reason){sawMalformed=true;return;}
+        if(choiceFinishReasons[index]!==null){sawDuplicateOrContradictory=true;return;}
+        choiceFinishReasons[index]=reason;
+      } else if(choiceFinishReasons[index]!==null) {
+        sawDuplicateOrContradictory=true;return;
       }
     }
   };
 
-  const processLine=rawLine=>{
-    const line=rawLine.endsWith('\r')?rawLine.slice(0,-1):rawLine;
-    if(Buffer.byteLength(line)>MAX_SSE_LINE_BYTES){truncated=true;return;}
+  const processLine=line=>{
+    if(Buffer.byteLength(line)>MAX_SSE_LINE_BYTES){failObservationLimit();return;}
     if(line===''){dispatchEvent();return;}
     if(line.startsWith(':'))return;
     const colon=line.indexOf(':');
@@ -104,42 +187,89 @@ function createSseTracker() {
     if(value.startsWith(' '))value=value.slice(1);
     if(field==='event')eventType=value;
     else if(field==='data') {
-      if(eventDataLines.length>=MAX_SSE_EVENT_LINES){truncated=true;return;}
+      const valueBytes=Buffer.byteLength(value);
+      if(eventDataLines.length>=MAX_SSE_EVENT_LINES||eventDataBytes+valueBytes>MAX_SSE_EVENT_BYTES) {
+        failObservationLimit();
+        return;
+      }
       eventDataLines.push(value);
+      eventDataBytes+=valueBytes;
     }
   };
 
   return {
+    get observationLimitExceeded(){return observationLimitExceeded;},
     push(chunk) {
-      if(truncated)return;
+      if(observationLimitExceeded)return false;
       let text;
       try {text=decoder.decode(chunk,{stream:true});}
-      catch {sawMalformed=true;return;}
-      lineBuffer+=text;
-      let start=0;
-      for(let idx=lineBuffer.indexOf('\n',start);idx!==-1;idx=lineBuffer.indexOf('\n',start)) {
-        processLine(lineBuffer.slice(start,idx));
-        start=idx+1;
-        if(truncated){lineBuffer='';return;}
+      catch {sawMalformed=true;return true;}
+      let pos=0;
+      if(ignoreNextLf&&text.length>0) {
+        ignoreNextLf=false;
+        if(text[0]==='\n')pos=1;
       }
-      lineBuffer=lineBuffer.slice(start);
-      if(Buffer.byteLength(lineBuffer)>MAX_SSE_LINE_BYTES){truncated=true;lineBuffer='';}
+      while(pos<text.length) {
+        const cr=text.indexOf('\r',pos);
+        const lf=text.indexOf('\n',pos);
+        let next=-1;
+        if(cr!==-1&&lf!==-1)next=cr<lf?cr:lf;
+        else next=cr!==-1?cr:lf;
+        if(next===-1) {
+          const tail=text.slice(pos);
+          const nextBytes=Buffer.byteLength(lineBuffer)+Buffer.byteLength(tail);
+          if(nextBytes>MAX_SSE_LINE_BYTES||!tryReserveObservation(nextBytes+eventDataBytes)) {
+            failObservationLimit();
+            return false;
+          }
+          lineBuffer+=tail;
+          return true;
+        }
+        const segment=text.slice(pos,next);
+        if(Buffer.byteLength(lineBuffer)+Buffer.byteLength(segment)>MAX_SSE_LINE_BYTES) {
+          failObservationLimit();
+          return false;
+        }
+        const fullLine=lineBuffer+segment;
+        lineBuffer='';
+        processLine(fullLine);
+        if(observationLimitExceeded)return false;
+        if(!tryReserveObservation(eventDataBytes)){failObservationLimit();return false;}
+        if(text[next]==='\r') {
+          if(next+1<text.length&&text[next+1]==='\n')pos=next+2;
+          else if(next+1===text.length){ignoreNextLf=true;pos=next+1;}
+          else pos=next+1;
+        } else {
+          pos=next+1;
+        }
+      }
+      if(!tryReserveObservation(Buffer.byteLength(lineBuffer)+eventDataBytes)){failObservationLimit();return false;}
+      return true;
     },
     finish(complete) {
-      try {
-        const tail=decoder.decode();
-        if(tail)lineBuffer+=tail;
-      } catch {sawMalformed=true;}
+      if(!observationLimitExceeded) {
+        try {
+          const tail=decoder.decode();
+          if(tail)lineBuffer+=tail;
+        } catch {sawMalformed=true;}
+      }
+      if(eventType==='error')sawError=true;
       const hadDangling=lineBuffer.length>0||eventDataLines.length>0;
-      lineBuffer='';
-      eventDataLines=[];
-      const settled=complete&&!truncated&&!sawError&&!sawMalformed&&!hadDangling&&sawTerminalFinishReason&&sawDone;
+      clearBuffers();
+      const allChoicesFinished=expectedChoices!==null&&choiceFinishReasons.every(reason=>reason!==null);
+      const settled=complete&&!observationLimitExceeded&&!sawError&&!sawMalformed&&
+        !sawDuplicateOrContradictory&&!hadDangling&&allChoicesFinished&&sawDone;
       const evidence=settled?'sse-finish-reason-and-done'
-        :truncated?'response-truncated'
         :!complete?'upstream-incomplete-stream'
         :sawError?'upstream-error'
+        :observationLimitExceeded?'observation-limit-exceeded'
         :'ambiguous-response';
-      return {settled,evidence,finishReasons:[...finishReasons],sawDone};
+      const finishReasons=[];
+      for(const reason of choiceFinishReasons) {
+        if(reason&&!finishReasons.includes(reason)&&finishReasons.length<MAX_FINISH_REASONS)
+          finishReasons.push(reason);
+      }
+      return {settled,evidence,finishReasons,sawDone};
     },
   };
 }
@@ -160,6 +290,8 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
   let completedCount=0;
   let unknownCount=0;
   let rejectedBeforeDispatch=0;
+  let activeObservationBytes=0;
+  let overflowInFlight=0;
   let recordsTruncated=false;
   let lastUnknownEvidence=null;
   let isClosed=false;
@@ -177,6 +309,7 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
     if(extra.responseComplete!==undefined)entry.responseComplete=extra.responseComplete;
     if(extra.responseBytes!==undefined)entry.responseBytes=extra.responseBytes;
     activeEntries.delete(entry);
+    delete entry.releaseObservation;
     if(nextState==='settled')completedCount++;
     else {
       unknownCount++;
@@ -215,7 +348,51 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
       if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)||parsed.model!==model) {
         rejectedBeforeDispatch++;outgoing.writeHead(403);outgoing.end();return;
       }
+      const expectedChoices=parseExpectedChoices(parsed);
       dispatched++;
+
+      if(activeEntries.size>=MAX_ACTIVE_ENTRIES) {
+        unknownCount++;
+        lastUnknownEvidence='observation-limit-exceeded';
+        recordsTruncated=true;
+        overflowInFlight++;
+        let overflowReleased=false;
+        const releaseOverflow=()=>{
+          if(!overflowReleased){overflowReleased=true;if(!isClosed)overflowInFlight=Math.max(0,overflowInFlight-1);}
+        };
+        const upstream=request({hostname:'127.0.0.1',port:Number(target.port||'80'),path:'/v1/chat/completions',
+          method:'POST',agent,headers:{'Content-Type':'application/json','Accept':incoming.headers.accept??'application/json'}},response=>{
+          if(response.statusCode>=300&&response.statusCode<400) {
+            releaseOverflow();
+            response.destroy();outgoing.writeHead(502);outgoing.end();return;
+          }
+          const headers={};
+          if(response.headers['content-type'])headers['Content-Type']=response.headers['content-type'];
+          outgoing.writeHead(response.statusCode,headers);
+          let responseBytes=0;
+          response.on('data',chunk=>{
+            responseBytes+=chunk.length;
+            if(responseBytes>MAX_BODY_BYTES){releaseOverflow();response.destroy();outgoing.destroy();}
+          });
+          response.once('end',releaseOverflow);
+          response.once('aborted',releaseOverflow);
+          response.once('close',releaseOverflow);
+          response.on('error',()=>{releaseOverflow();outgoing.destroy();});
+          response.pipe(outgoing);
+        });
+        const failed=()=>{
+          releaseOverflow();
+          if(!outgoing.headersSent){outgoing.writeHead(502);outgoing.end();}else outgoing.destroy();
+        };
+        upstream.once('error',failed);
+        upstream.once('upgrade',(_response,socket)=>{socket.destroy();failed();});
+        outgoing.once('close',()=>{
+          if(!outgoing.writableFinished){releaseOverflow();upstream.destroy();}
+        });
+        upstream.end(body);
+        return;
+      }
+
       const entry={
         sequence:dispatched,
         state:'in-flight',
@@ -231,10 +408,33 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
       else recordsTruncated=true;
       activeEntries.add(entry);
 
+      let reservedBytes=0;
+      const releaseObservation=()=>{
+        if(reservedBytes>0) {
+          activeObservationBytes=Math.max(0,activeObservationBytes-reservedBytes);
+          reservedBytes=0;
+        }
+      };
+      const tryReserveObservation=nextTotal=>{
+        if(nextTotal<=reservedBytes) {
+          const freed=reservedBytes-nextTotal;
+          reservedBytes=nextTotal;
+          activeObservationBytes=Math.max(0,activeObservationBytes-freed);
+          return true;
+        }
+        const needed=nextTotal-reservedBytes;
+        if(activeObservationBytes+needed>MAX_OBSERVATION_BYTES)return false;
+        activeObservationBytes+=needed;
+        reservedBytes=nextTotal;
+        return true;
+      };
+      entry.releaseObservation=releaseObservation;
+
       const upstream=request({hostname:'127.0.0.1',port:Number(target.port||'80'),path:'/v1/chat/completions',
         method:'POST',agent,headers:{'Content-Type':'application/json','Accept':incoming.headers.accept??'application/json'}},response=>{
-        entry.statusCode=response.statusCode??null;
+        if(entry.state==='in-flight')entry.statusCode=response.statusCode??null;
         if(response.statusCode>=300&&response.statusCode<400) {
+          releaseObservation();
           settleEntry(entry,'unknown','upstream-redirect-blocked',{statusCode:response.statusCode});
           response.destroy();outgoing.writeHead(502);outgoing.end();return;
         }
@@ -244,45 +444,67 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
         const okStatus=response.statusCode===200;
         const format=mediaType==='text/event-stream'?'sse'
           :(mediaType==='application/json'||mediaType==='')?'json':'other';
-        entry.format=format;
-        const sseTracker=okStatus&&format==='sse'?createSseTracker():null;
-        const jsonChunks=okStatus&&format==='json'?[]:null;
+        if(entry.state==='in-flight')entry.format=format;
+        const sseTracker=okStatus&&format==='sse'?createSseTracker(expectedChoices,tryReserveObservation,releaseObservation):null;
+        const jsonChunks=okStatus&&format==='json'&&expectedChoices!==null?[]:null;
         let responseBytes=0;
         let truncated=false;
+        let observationLimitExceeded=false;
 
         outgoing.writeHead(response.statusCode,headers);
         response.on('data',chunk=>{
           responseBytes+=chunk.length;
-          entry.responseBytes=responseBytes;
+          if(entry.state==='in-flight')entry.responseBytes=responseBytes;
           if(responseBytes>MAX_BODY_BYTES) {
             truncated=true;
             if(jsonChunks)jsonChunks.length=0;
+            releaseObservation();
             settleEntry(entry,'unknown','response-truncated',{responseBytes});
             response.destroy();outgoing.destroy();
             return;
           }
-          if(sseTracker)sseTracker.push(chunk);
-          else if(jsonChunks)jsonChunks.push(chunk);
+          if(entry.state!=='in-flight'||observationLimitExceeded)return;
+          if(sseTracker) {
+            if(!sseTracker.push(chunk))observationLimitExceeded=true;
+          } else if(jsonChunks) {
+            if(!tryReserveObservation(responseBytes)) {
+              observationLimitExceeded=true;
+              jsonChunks.length=0;
+              releaseObservation();
+              return;
+            }
+            jsonChunks.push(chunk);
+          }
         });
         response.once('end',()=>{
-          entry.responseComplete=response.complete===true;
+          if(entry.state!=='in-flight'){releaseObservation();if(jsonChunks)jsonChunks.length=0;return;}
           if(truncated) {
             if(jsonChunks)jsonChunks.length=0;
-            settleEntry(entry,'unknown','response-truncated',{responseBytes,responseComplete:entry.responseComplete});
+            releaseObservation();
+            settleEntry(entry,'unknown','response-truncated',{responseBytes,responseComplete:response.complete===true});
             return;
           }
           if(!response.complete) {
             if(jsonChunks)jsonChunks.length=0;
+            releaseObservation();
             settleEntry(entry,'unknown','upstream-incomplete-stream',{responseBytes,responseComplete:false});
             return;
           }
           if(!okStatus) {
             if(jsonChunks)jsonChunks.length=0;
+            releaseObservation();
             settleEntry(entry,'unknown','upstream-http-error',{responseBytes,responseComplete:true});
+            return;
+          }
+          if(observationLimitExceeded||sseTracker?.observationLimitExceeded) {
+            if(jsonChunks)jsonChunks.length=0;
+            releaseObservation();
+            settleEntry(entry,'unknown','observation-limit-exceeded',{responseBytes,responseComplete:true});
             return;
           }
           if(format==='sse'&&sseTracker) {
             const outcome=sseTracker.finish(true);
+            releaseObservation();
             settleEntry(entry,outcome.settled?'settled':'unknown',outcome.evidence,{
               finishReasons:outcome.finishReasons,
               sawDone:outcome.sawDone,
@@ -294,7 +516,8 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
           if(format==='json'&&jsonChunks) {
             const combined=Buffer.concat(jsonChunks,responseBytes);
             jsonChunks.length=0;
-            const outcome=evaluateJsonCompletion(combined);
+            releaseObservation();
+            const outcome=evaluateJsonCompletion(combined,expectedChoices);
             settleEntry(entry,outcome.settled?'settled':'unknown',outcome.evidence,{
               finishReasons:outcome.finishReasons,
               responseComplete:true,
@@ -302,24 +525,29 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
             });
             return;
           }
+          releaseObservation();
           settleEntry(entry,'unknown','ambiguous-response',{responseComplete:true,responseBytes});
         });
         response.once('aborted',()=>{
           if(jsonChunks)jsonChunks.length=0;
+          releaseObservation();
           settleEntry(entry,'unknown','upstream-incomplete-stream',{responseBytes,responseComplete:false});
         });
         response.once('close',()=>{
           if(jsonChunks)jsonChunks.length=0;
+          releaseObservation();
           settleEntry(entry,'unknown','upstream-incomplete-stream',{responseBytes,responseComplete:response.complete===true});
         });
         response.on('error',()=>{
           if(jsonChunks)jsonChunks.length=0;
+          releaseObservation();
           settleEntry(entry,'unknown','upstream-error',{responseBytes});
           outgoing.destroy();
         });
         response.pipe(outgoing);
       });
       const failed=()=>{
+        releaseObservation();
         settleEntry(entry,'unknown','upstream-error');
         if(!outgoing.headersSent){outgoing.writeHead(502);outgoing.end();}else outgoing.destroy();
       };
@@ -327,6 +555,7 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
       upstream.once('upgrade',(_response,socket)=>{socket.destroy();failed();});
       outgoing.once('close',()=>{
         if(!outgoing.writableFinished) {
+          releaseObservation();
           settleEntry(entry,'unknown','client-aborted');
           upstream.destroy();
         }
@@ -350,7 +579,11 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
   const close=()=>{
     if(closed)return closed;
     isClosed=true;
-    for(const entry of [...activeEntries])settleEntry(entry,'unknown','broker-closed');
+    for(const entry of [...activeEntries]) {
+      entry.releaseObservation?.();
+      settleEntry(entry,'unknown','broker-closed');
+    }
+    overflowInFlight=0;
     signal?.removeEventListener('abort',abort);
     agent.destroy();
     server.closeAllConnections();
@@ -361,7 +594,7 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
   signal?.addEventListener('abort',abort,{once:true});
   if(signal?.aborted){await close();signal.throwIfAborted();}
   const settlement=()=>{
-    const activeCount=activeEntries.size;
+    const activeCount=activeEntries.size+overflowInFlight;
     let state;
     let evidence;
     if(dispatched===0) {
@@ -384,6 +617,7 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
       rejectedBeforeDispatch,
       closed:isClosed,
       modelCancellationVerified:false,
+      observationBytes:activeObservationBytes,
       recordsTruncated,
       records:records.map(record=>({
         sequence:record.sequence,
