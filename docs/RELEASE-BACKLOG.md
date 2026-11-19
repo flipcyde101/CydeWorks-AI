@@ -475,12 +475,12 @@ The patch follow-up subject names the unconditional provenance field and an untr
 
 ### Context library nonblocking follow-ups, owner checkpoint 2026-11-19
 
-Owner reports context integration at `24311b784e0289cb3c3713f1156af12b80c2138b`, independent Codex GPT-6.2 Sol High review, 19 focused offline passes and 321/321 full harness passes on that exact commit. These results were not rerun by this coordinator. The library remains disconnected from live authentication and browser callers.
+Context integration at `24311b784e0289cb3c3713f1156af12b80c2138b` received independent Codex GPT-6.2 Sol High review, 19 focused offline passes and 321/321 full harness passes on that exact commit. The two follow-ups below were addressed at `30d81da65ca97920234661ed5c17d7c2a3a78eef`, independently re-reviewed and tested with 21/21 focused offline passes on that exact commit. The library remains disconnected from live authentication and browser callers.
 
-- Reject oversized strings before UTF-8 allocation. Add boundary tests showing rejection occurs before allocating an oversized encoded buffer.
-- Tighten Proxy array-key validation. Add data-only input tests covering unexpected array keys while preserving valid dense arrays and fail-closed behavior.
+- Oversized strings are rejected before UTF-8 allocation, with boundary coverage.
+- Proxy array-key validation requires canonical keys while preserving valid dense arrays.
 
-Both are nonblocking reviewer follow-ups, not claims of completed fixes or authority to connect the library to live callers.
+These library-only checks do not authorize connection to live callers.
 
 ### 8.8 Limits of this ledger
 
