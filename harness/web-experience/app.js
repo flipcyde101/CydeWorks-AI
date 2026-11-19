@@ -343,7 +343,7 @@ const actions = {
         state.lockNotice = outcome === 'unconfirmed'
           ? 'The lock response was lost, so this view locked itself. Whether other views were locked is not confirmed. Unlock with the access file; nothing was sent again.'
           : outcome === 'already' ? 'The workspace session had already ended. This view is locked.'
-          : 'Workspace locked in every view. Approved work keeps running, and terminal control was released. Unlock with the access file.';
+          : 'Workspace session terminated in every view. Approved work keeps running, and terminal control was released. Unlock with the access file.';
         render();
       });
   },

@@ -7,11 +7,12 @@ import {diagnosticMessages} from './route-diagnostics.js';
 import {bindProposalEditor} from './proposal-editor.js';
 import {terminalRequest,ownsTerminal} from './terminal-request.js';
 import {bindDraftCopyDialog} from './draft-copy-dialog.js';
+import {bindWorkspaceLock,workspaceLockCopy} from './workspace-lock.js';
 const $ = id => document.getElementById(id);
 const form = $('create');
 const field = name => form.elements.namedItem(name);
 let task, models=[], selection=0, busy=false, editing, lease, detached=false, listRevision=0, listTimer;
-let connection='connected', needsReconcile=false;
+let connection='connected', needsReconcile=false, explicitLock=null;
 let actionRevision=0;
 const resumeKey='bfe-last-task';
 const remember=id=>{try { if (id) sessionStorage.setItem(resumeKey,id); else sessionStorage.removeItem(resumeKey); } catch { /* Storage may be disabled. */ }};
@@ -49,7 +50,7 @@ async function act(fn) {
     if (task && error.status===401) {
       lease=undefined;
       observer.stop();
-      setConnection({phase:'locked'});
+      if(!explicitLock)setConnection({phase:'locked'});
     } else if (task && (!error.status || error.status===409 || error.status>=500)) {
       lease=undefined;
       needsReconcile=true;
@@ -73,9 +74,12 @@ function setConnection(state) {
   $('connection-message').textContent=connection==='reconnecting'
     ? 'Connection interrupted. Saved view may be stale. Read attempt '+state.failures+' failed; retrying in '+(state.retryMs/1000)+' seconds. Run outcome is unknown until reconnected. No commands are replayed. Recovery ETA is unavailable until the local service responds.'
     : connection==='checking' ? 'Checking saved task state before enabling more actions. No command will be replayed.'
-    : connection==='locked' ? 'The workspace session ended. Select its access file to unlock and resume observation. The previous run outcome is unknown.'
+    : connection==='locked' ? (workspaceLockCopy[explicitLock] ?? 'The workspace session ended. Select its access file to unlock and resume observation. The previous run outcome is unknown.')
     : connection==='missing' ? 'This task is no longer available. Open another task or reconnect to check again.' : '';
-  if (connection==='locked') $('unlock').hidden=false;
+  if (connection==='locked') {
+    $('unlock').hidden=false;
+    $('lock-workspace').hidden=true;
+  }
   if (connection!=='connected') $('approve').checked=false;
   if (task) render();
 }
@@ -102,6 +106,19 @@ const observer=createObserver({
   },
   onState:setConnection,
   onDisconnect(){ lease=undefined; needsReconcile=true; },
+});
+bindWorkspaceLock({
+  openButton:$('lock-workspace'),dialog:$('lock-dialog'),confirmButton:$('lock-confirm'),cancelButton:$('lock-cancel'),
+  status:$('access-status'),send:body=>api('/api/session/lock',body),
+  onLocalLock() {
+    lease=undefined;observer.stop();clearTimeout(listTimer);
+    explicitLock='waiting';
+    setConnection({phase:'locked'});
+  },
+  onOutcome(outcome) {
+    explicitLock=outcome;
+    setConnection({phase:'locked'});
+  },
 });
 $('reconnect').onclick=()=>{ if (task) observer.start(task.id); };
 
@@ -134,8 +151,11 @@ function watchList() {
     try {await refreshList();}
     catch(error) {
       if(error.status===401){
-        observer.stop();lease=undefined;needsReconcile=true;setConnection({phase:'locked'});
-        $('access-status').textContent='Unlock to resume the workspace.';
+        observer.stop();lease=undefined;needsReconcile=true;
+        if(!explicitLock){
+          setConnection({phase:'locked'});
+          $('access-status').textContent='Unlock to resume the workspace.';
+        }
         return;
       }
     }
@@ -561,6 +581,11 @@ bindRemovalDialog({openButton:$('remove-task'),dialog:$('removal-dialog'),target
     void refreshList().catch(()=>note('Task record removed, but the task list could not be refreshed.'));
   }});
 async function enter() {
+  explicitLock=null;
+  $('access-status').textContent='';
+  connection='connected';
+  $('connection').hidden=true;
+  $('lock-workspace').hidden=false;
   await refreshList();
   $('unlock').hidden=true;
   $('workspace').hidden=false;

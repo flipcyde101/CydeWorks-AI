@@ -8,7 +8,7 @@
   <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <header class="top"><a href="/" class="brand"><span class="mark" aria-hidden="true">◈</span> CydeWorks AI</a><span class="mode">Local workspace</span></header>
+  <header class="top"><a href="/" class="brand"><span class="mark" aria-hidden="true">◈</span> CydeWorks AI</a><span class="session-tools"><button id="lock-workspace" type="button" hidden>Lock workspace</button><span class="mode">Local workspace</span></span></header>
   <section id="unlock" class="panel">
     <h1>Open workspace</h1>
     <p>Choose <code>harness/.state/access.key</code> from the project folder.</p>
@@ -133,6 +133,14 @@ The team has not decided who will approve the final checklist.</textarea></label
     <p id="removal-status" role="status" aria-live="polite"></p>
     <label>Type REMOVE to confirm<input id="removal-confirmation" autocomplete="off"></label>
     <div class="actions"><button id="removal-submit" disabled>Remove task record</button><button id="removal-close">Cancel</button></div>
+  </dialog>
+  <dialog id="lock-dialog" aria-labelledby="lock-title">
+    <h2 id="lock-title">Lock the workspace?</h2>
+    <p>Every open view of this workspace locks, not only this one. Each needs the access file to unlock.</p>
+    <p>Approved work keeps running while locked. Lock is not Stop: use Stop on a running task to end it.</p>
+    <p>Terminal control is released. After unlocking, views reopen read-only and you take control again yourself.</p>
+    <p>Locking does not erase what was already shown, copied or downloaded.</p>
+    <div class="actions"><button id="lock-confirm" type="button">Lock every view</button><button id="lock-cancel" type="button">Cancel</button></div>
   </dialog>
 </body>
 </html>

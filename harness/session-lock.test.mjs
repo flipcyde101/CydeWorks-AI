@@ -5,6 +5,7 @@ import {writeFile,readFile,access} from 'node:fs/promises';
 import {join} from 'node:path';
 import {terminalWorkspace} from './test-support/terminal-workspace.mjs';
 import {createTerminalControl} from './terminal-control.mjs';
+import {bindWorkspaceLock,workspaceLockCopy} from './web/workspace-lock.js';
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(fn) {
@@ -161,4 +162,225 @@ run:async(task,{signal,terminal})=>{
   assert.equal(current.status,'review');assert.equal(current.attempts[0].id,before.attempts[0].id);
   assert.equal(current.attempts[0].artifact.content,'After');assert.equal(current.live,null);
   assert.equal((await request(path)).status,401);
+});
+
+const sessionIdleMs=15*60*1000;
+const sessionNowNeedle='const sessionNow = () => Date.now();';
+const issuedCookie=/^bfe_session=[a-f0-9]{64}; HttpOnly; SameSite=Strict; Path=\/api$/;
+const expiredCookie='bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api';
+
+function clockPatch(code) {
+  if(!code.includes(sessionNowNeedle))throw Error('Copied server is missing the session clock.');
+  return "import {readFileSync as readSessionClock} from 'node:fs';\n"+code.replace(sessionNowNeedle,
+    `const sessionNow = () => {
+      try {
+        const value=Number(readSessionClock('session-clock.txt','utf8'));
+        if(Number.isSafeInteger(value)&&value>=0)return value;
+      } catch {}
+      return Date.now();
+    };`);
+}
+
+// The copied host reads session-clock.txt. Production keeps Date.now().
+async function withSessionClock(t,{configure,startImmediately=false}={}) {
+  let folder;
+  const rig=await terminalWorkspace(t,{startImmediately,configure:async dir=>{
+    folder=dir;
+    const file=join(dir,'server.mjs');
+    let code=clockPatch(await readFile(file,'utf8'));
+    if(configure){
+      const next=await configure(dir,code);
+      if(typeof next==='string')code=next;
+    }
+    if(!code.includes("readSessionClock('session-clock.txt'"))throw Error('Session clock patch was lost.');
+    await writeFile(file,code);
+    await writeFile(join(dir,'session-clock.txt'),'0');
+  }});
+  return {...rig,folder,at:ms=>writeFile(join(folder,'session-clock.txt'),String(ms))};
+}
+
+test('the workspace idle deadline stays 15 minutes and is not the terminal lease',async()=>{
+  const source=await readFile(new URL('./server.mjs',import.meta.url),'utf8');
+  assert.match(source,/const sessionIdleMs=15\*60\*1000;/);
+  assert.match(source,/const sessionNow = \(\) => Date\.now\(\);/);
+  assert.match(source,/command==='heartbeat'\)\)noteSessionActivity\(\)/);
+});
+
+test('polls and heartbeats do not move the 15-minute deadline',{timeout:15000},async t=>{
+  const {origin,request,path,at}=await withSessionClock(t,{startImmediately:true});
+  const issued=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  assert.equal(issued.status,200);
+  const original=issued.headers.get('set-cookie');
+  assert.match(original,issuedCookie);
+  const before=await (await request(path)).json();
+  const taken=await request(path+'/terminal',{command:'take',...before.live.control});
+  assert.equal(taken.status,200);
+  const held=await taken.json();
+  assert.equal((await request(path+'/terminal',{command:'heartbeat',...held})).status,200);
+  const page=await request('/');
+  const html=await page.text();
+  assert.equal(page.status,200);
+  assert.match(html,/id="lock-workspace"/);
+  assert.match(html,/id="lock-confirm"/);
+  const script=await (await request('/workspace-lock.js')).text();
+  assert.match(script,/Workspace session terminated in every view/);
+  await at(sessionIdleMs-1);
+  for(const target of ['/api/health','/api/tasks','/api/attention','/api/models',path])
+    assert.equal((await request(target)).status,200,target);
+  assert.equal((await request(path+'/terminal',{command:'heartbeat',...held})).status,200);
+  await at(sessionIdleMs);
+  const expired=await request('/api/tasks');
+  assert.equal(expired.status,401);
+  assert.equal(expired.headers.get('set-cookie'),expiredCookie);
+  assert.equal((await request(path)).status,401);
+  assert.equal((await request('/api/health')).status,200);
+  assert.equal((await request('/api/session/lock',{})).status,401);
+  const fresh=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  assert.equal(fresh.status,200);
+  const next=fresh.headers.get('set-cookie');
+  assert.match(next,issuedCookie);
+  assert.notEqual(next.split(';')[0],original.split(';')[0]);
+  assert.equal((await request('/api/tasks')).status,401);
+  assert.equal((await client(origin,next.split(';')[0])('/api/tasks')).status,200);
+});
+
+test('an operator POST moves the deadline and the boundary is exact',{timeout:15000},async t=>{
+  const {request,at}=await withSessionClock(t);
+  await at(sessionIdleMs-1);
+  assert.equal((await request('/api/tasks')).status,200);
+  const created=await request('/api/tasks',{kind:'brief',title:'Idle extension',request:'Summarize',source:'Synthetic source'});
+  assert.equal(created.status,201);
+  await at(sessionIdleMs*2-2);
+  assert.equal((await request('/api/tasks')).status,200);
+  await at(sessionIdleMs*2-1);
+  const expired=await request('/api/tasks');
+  assert.equal(expired.status,401);
+  assert.equal(expired.headers.get('set-cookie'),expiredCookie);
+});
+
+test('unlock at the deadline replaces the secret before issuing a cookie',{timeout:15000},async t=>{
+  const {origin,request,at}=await withSessionClock(t);
+  const first=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  const original=first.headers.get('set-cookie');
+  assert.match(original,issuedCookie);
+  await at(sessionIdleMs);
+  const fresh=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  assert.equal(fresh.status,200);
+  const next=fresh.headers.get('set-cookie');
+  assert.match(next,issuedCookie);
+  assert.notEqual(next.split(';')[0],original.split(';')[0]);
+  assert.equal((await request('/api/tasks')).status,401);
+  assert.equal((await client(origin,next.split(';')[0])('/api/tasks')).status,200);
+});
+
+test('a task body still arriving at the deadline cannot mutate the workspace',{timeout:15000},async t=>{
+  const {origin,request,folder,at}=await withSessionClock(t,{configure:(dir,code)=>{
+    code="import {writeFileSync as markArrival} from 'node:fs';\n"+code;
+    code=code.replace('const authenticatedBody=async()=>{',
+      "const authenticatedBody=async()=>{\n      if(req.headers['x-test-arrival']==='mutation')markArrival('mutation.marker','ready');");
+    if(!code.includes('mutation.marker'))throw Error('Arrival marker was not installed.');
+    return code;
+  }});
+  const session=await login(origin);
+  const baseline=await (await request('/api/tasks')).json();
+  const pending=partialPost(origin,'/api/tasks',{kind:'brief',title:'Late task',request:'Summarize',source:'Synthetic'},session.cookie,'mutation');
+  t.after(pending.abort);
+  await until(()=>exists(join(folder,'mutation.marker')));
+  await at(sessionIdleMs);
+  pending.finish();
+  assert.equal((await pending.response).status,401);
+  const fresh=await login(origin);
+  assert.deepEqual(await (await fresh.request('/api/tasks')).json(),baseline);
+});
+
+test('idle revocation does not stop approved work',{timeout:15000},async t=>{
+  let folder;
+  const {origin,request,path,at}=await withSessionClock(t,{startImmediately:true,configure:async (dir,code)=>{
+    folder=dir;
+    await writeFile(join(dir,'opencode.mjs'),`
+import {access} from 'node:fs/promises';
+export const opencode={availability:async()=>'present',
+models:async()=>[{id:'qwen3:1.7b',bytes:1,digest:'a'.repeat(64),remote:false,cloudDisabled:true}],
+run:async(task,{signal,terminal})=>{
+ terminal('Synthetic adapter active. Waiting for completion gate.');
+ for(let i=0;i<300;i++){signal.throwIfAborted();try{await access('finish.release');break;}catch{}await new Promise(r=>setTimeout(r,10));}
+ signal.throwIfAborted();
+ return {settled:true,artifact:{summary:'Synthetic completion',content:'After'},usage:null};
+}};
+`);
+    return code;
+  }});
+  const before=await (await request(path)).json();
+  assert.equal(before.status,'running');
+  await at(sessionIdleMs);
+  assert.equal((await request(path)).status,401);
+  const fresh=await login(origin);
+  assert.equal((await (await fresh.request(path)).json()).status,'running');
+  await writeFile(join(folder,'finish.release'),'ready');
+  let current;
+  await until(async()=>{current=await (await fresh.request(path)).json();return current.status!=='running';});
+  assert.equal(current.status,'review');
+  assert.equal(current.attempts[0].id,before.attempts[0].id);
+  assert.equal(current.attempts[0].artifact.content,'After');
+  assert.equal((await request(path)).status,401);
+});
+
+function lockHarness(send) {
+  const status={textContent:'stale'};
+  const dialog={open:false,showModal(){this.open=true;},close(){this.open=false;}};
+  const openButton={onclick:null,focus(){this.focused=true;}};
+  const confirmButton={onclick:null,disabled:false};
+  const cancelButton={onclick:null};
+  const sent=[];
+  const outcomes=[];
+  let local=0;
+  bindWorkspaceLock({openButton,dialog,confirmButton,cancelButton,status,send:async body=>{
+    sent.push(structuredClone(body));return send(body);
+  },onLocalLock(){local++;},onOutcome(outcome){outcomes.push(outcome);}});
+  return {status,dialog,openButton,confirmButton,cancelButton,sent,outcomes,local:()=>local};
+}
+
+test('legacy Lock sends nothing until confirm and shows termination only after the server',async()=>{
+  let release;
+  const pending=new Promise(resolve=>{release=resolve;});
+  const ui=lockHarness(()=>pending);
+  ui.openButton.onclick();
+  assert.equal(ui.dialog.open,true);
+  assert.equal(ui.status.textContent,'');
+  assert.equal(ui.local(),0);
+  ui.cancelButton.onclick();
+  assert.equal(ui.dialog.open,false);
+  assert.equal(ui.openButton.focused,true);
+  assert.deepEqual(ui.sent,[]);
+  assert.deepEqual(ui.outcomes,[]);
+  ui.openButton.onclick();
+  const done=ui.confirmButton.onclick();
+  assert.deepEqual(ui.sent,[{}]);
+  assert.equal(ui.status.textContent,workspaceLockCopy.waiting);
+  assert.doesNotMatch(ui.status.textContent,/terminated/);
+  assert.equal(ui.dialog.open,false);
+  assert.equal(ui.local(),1);
+  assert.deepEqual(ui.outcomes,[]);
+  assert.equal(ui.confirmButton.disabled,true);
+  release({locked:true});
+  await done;
+  assert.equal(ui.status.textContent,workspaceLockCopy.confirmed);
+  assert.deepEqual(ui.outcomes,['confirmed']);
+  assert.equal(ui.confirmButton.disabled,false);
+});
+
+test('a lost lock response stays unconfirmed and a 401 is already ended',async()=>{
+  const lost=lockHarness(()=>{throw Error('lost');});
+  const lostDone=lost.confirmButton.onclick();
+  await lostDone;
+  assert.deepEqual(lost.sent,[{}]);
+  assert.equal(lost.status.textContent,workspaceLockCopy.unconfirmed);
+  assert.deepEqual(lost.outcomes,['unconfirmed']);
+  const odd=lockHarness(async()=>({}));
+  await odd.confirmButton.onclick();
+  assert.equal(odd.status.textContent,workspaceLockCopy.unconfirmed);
+  const ended=lockHarness(()=>{throw Object.assign(Error('ended'),{status:401});});
+  await ended.confirmButton.onclick();
+  assert.equal(ended.status.textContent,workspaceLockCopy.already);
+  assert.deepEqual(ended.outcomes,['already']);
 });
