@@ -920,4 +920,3 @@ test('overlapping dispatches and late abort races preserve accurate settlement a
   assert.equal(finalSnap.closed,true);
   assert.equal(finalSnap.modelCancellationVerified,false);
 });
-
