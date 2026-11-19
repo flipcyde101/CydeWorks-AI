@@ -14,6 +14,20 @@ import {tmpdir} from 'node:os';
 import {isAbsolute, join, relative, resolve} from 'node:path';
 import {digest as jsonOrTextDigest} from './runner-lifecycle.mjs';
 
+/**
+ * Standalone patch-binding helper for the fixed two-file synthetic fixture.
+ *
+ * Trust boundary:
+ * - This helper verifies structural consistency and cryptographic SHA-256 binding
+ *   across the pinned base repository, an independently resolved host-owned claim
+ *   record, the unified patch reapplied onto an isolated disposable base copy,
+ *   and verifier output metadata.
+ * - Caller-supplied `trusted: true` flags on `verification` or `resolveClaim`
+ *   results are explicit acceptance gates only; they do NOT prove provenance.
+ *   The host caller must enforce that `resolveClaim` reads only a host-protected
+ *   claim store/journal and that verifier attestations come from a sealed
+ *   verifier boundary outside candidate control.
+ */
 export const APPROVED_FIXTURE_FILES = Object.freeze(['limits.py', 'measurement.py']);
 const MAX_FILE_BYTES = 8192;
 const MAX_PATCH_BYTES = 65536;
@@ -174,6 +188,94 @@ export function buildScope({baseRevision, baseFileDigests, cases, files = APPROV
   return Object.freeze({scope, scopeHash: jsonOrTextDigest(scope)});
 }
 
+function parseAndBindScope(scope, scopeHash, expectedRev, actualBaseDigests, label) {
+  if (typeof scopeHash !== 'string' || !HEX_SHA256_RE.test(scopeHash) || !isPlainObj(scope)) {
+    throw Error(`${label} must include scope and valid scopeHash.`);
+  }
+  if (Object.keys(scope).sort(cmp).join('\0') !== SCOPE_KEYS) {
+    throw Error(`${label} scope keys do not match required binding schema.`);
+  }
+  if (!Array.isArray(scope.files) || scope.files.join('\0') !== APPROVED_FIXTURE_FILES.join('\0') ||
+      scope.baseRevision !== expectedRev ||
+      typeof scope.casesDigest !== 'string' || !HEX_SHA256_RE.test(scope.casesDigest) ||
+      !Number.isSafeInteger(scope.totalCases) || scope.totalCases <= 0 || scope.totalCases > MAX_CASES) {
+    throw Error(`${label} scope binding fields are invalid or mismatched.`);
+  }
+  const boundBaseDigests = normalizeDigestMap(scope.baseFileDigests, `${label}.scope.baseFileDigests`);
+  for (const name of APPROVED_FIXTURE_FILES) {
+    if (boundBaseDigests[name] !== actualBaseDigests[name]) {
+      throw Error(`${label} scope base digest mismatch for ${name}.`);
+    }
+  }
+  const canonicalScope = Object.freeze({
+    files: APPROVED_FIXTURE_FILES,
+    baseRevision: expectedRev,
+    baseFileDigests: boundBaseDigests,
+    casesDigest: scope.casesDigest,
+    totalCases: scope.totalCases,
+  });
+  if (jsonOrTextDigest(scope) !== scopeHash || jsonOrTextDigest(canonicalScope) !== scopeHash) {
+    throw Error(`${label} scopeHash does not match recomputed canonical scope digest.`);
+  }
+  return Object.freeze({scope: canonicalScope, scopeHash});
+}
+
+function resolveProtectedClaim(claim, resolveClaim, expectedRev, actualBaseDigests, approvedCases) {
+  if (!isPlainObj(claim) || typeof claim.claimId !== 'string' || !CLAIM_ID_RE.test(claim.claimId)) {
+    throw Error('Claim must include a valid claimId.');
+  }
+  if (typeof resolveClaim !== 'function') {
+    throw Error('A protected host-owned claim resolver (resolveClaim) is required.');
+  }
+  const resolved = resolveClaim(claim.claimId);
+  if (!isPlainObj(resolved) || resolved.trusted !== true || resolved.untrusted === true) {
+    throw Error('Missing or untrusted host claim resolution.');
+  }
+  if (resolved.claimId !== claim.claimId) {
+    throw Error('Resolved host claimId does not match requested claimId.');
+  }
+
+  const protectedRecord = parseAndBindScope(
+    resolved.scope,
+    resolved.scopeHash,
+    expectedRev,
+    actualBaseDigests,
+    'Protected claim',
+  );
+  const suppliedRecord = parseAndBindScope(
+    claim.scope,
+    claim.scopeHash,
+    expectedRev,
+    actualBaseDigests,
+    'Supplied claim',
+  );
+
+  if (suppliedRecord.scopeHash !== protectedRecord.scopeHash ||
+      suppliedRecord.scope.baseRevision !== protectedRecord.scope.baseRevision ||
+      suppliedRecord.scope.casesDigest !== protectedRecord.scope.casesDigest ||
+      suppliedRecord.scope.totalCases !== protectedRecord.scope.totalCases ||
+      suppliedRecord.scope.files.join('\0') !== protectedRecord.scope.files.join('\0') ||
+      APPROVED_FIXTURE_FILES.some(
+        name => suppliedRecord.scope.baseFileDigests[name] !== protectedRecord.scope.baseFileDigests[name],
+      )) {
+    throw Error('Supplied claim scope or scopeHash does not match protected host record.');
+  }
+
+  if (approvedCases !== undefined) {
+    const parsed = parseApprovedCases(approvedCases);
+    if (parsed.casesDigest !== protectedRecord.scope.casesDigest ||
+        parsed.totalCases !== protectedRecord.scope.totalCases) {
+      throw Error('Protected claim check digest or count does not match parsed approved cases.');
+    }
+  }
+
+  return Object.freeze({
+    claimId: resolved.claimId,
+    scope: protectedRecord.scope,
+    scopeHash: protectedRecord.scopeHash,
+  });
+}
+
 function runGit(args, {cwd, input, encoding = 'utf8'} = {}) {
   if (args.some(a => typeof a !== 'string' || CTRL_RE.test(a))) throw Error('Unsafe Git argument.');
   const env = Object.fromEntries(
@@ -253,45 +355,6 @@ function makeScratch(scratchRoot = tmpdir()) {
   return mkdtempSync(join(assertSafeHostDir(scratchRoot, 'scratchRoot'), 'verified-patch-'));
 }
 
-function validateBoundScope(claim, expectedRev, actualBaseDigests, approvedCases) {
-  if (!isPlainObj(claim) || typeof claim.claimId !== 'string' || !CLAIM_ID_RE.test(claim.claimId) ||
-      typeof claim.scopeHash !== 'string' || !HEX_SHA256_RE.test(claim.scopeHash) || !isPlainObj(claim.scope)) {
-    throw Error('Claim must include claimId, immutable scope, and scopeHash.');
-  }
-  const {scope} = claim;
-  if (Object.keys(scope).sort(cmp).join('\0') !== SCOPE_KEYS) {
-    throw Error('Claim scope keys do not match required binding schema.');
-  }
-  if (!Array.isArray(scope.files) || scope.files.join('\0') !== APPROVED_FIXTURE_FILES.join('\0') ||
-      scope.baseRevision !== expectedRev ||
-      typeof scope.casesDigest !== 'string' || !HEX_SHA256_RE.test(scope.casesDigest) ||
-      !Number.isSafeInteger(scope.totalCases) || scope.totalCases <= 0) {
-    throw Error('Invalid claim scope binding fields.');
-  }
-  const boundBaseDigests = normalizeDigestMap(scope.baseFileDigests, 'claim.scope.baseFileDigests');
-  for (const name of APPROVED_FIXTURE_FILES) {
-    if (boundBaseDigests[name] !== actualBaseDigests[name]) {
-      throw Error(`Claim scope base digest mismatch for ${name}.`);
-    }
-  }
-  if (jsonOrTextDigest(scope) !== claim.scopeHash) {
-    throw Error('Substituted or mutated scope: scopeHash does not match recomputed scope digest.');
-  }
-  if (approvedCases !== undefined) {
-    const parsed = parseApprovedCases(approvedCases);
-    if (parsed.casesDigest !== scope.casesDigest || parsed.totalCases !== scope.totalCases) {
-      throw Error('Claim scope check digest or count does not match parsed approved cases.');
-    }
-  }
-  return Object.freeze({
-    files: APPROVED_FIXTURE_FILES,
-    baseRevision: expectedRev,
-    baseFileDigests: boundBaseDigests,
-    casesDigest: scope.casesDigest,
-    totalCases: scope.totalCases,
-  });
-}
-
 function deriveAndVerifyDisposableIndex(dir) {
   if (readdirSync(dir).sort(cmp).join('\0') !== ['.git', ...APPROVED_FIXTURE_FILES].sort(cmp).join('\0')) {
     throw Error('Disposable copy contains unexpected files after apply.');
@@ -358,6 +421,7 @@ export function verifyAndBindPatch({
   baseRepoDir,
   baseRevision,
   claim,
+  resolveClaim,
   verification,
   patch,
   approvedCases,
@@ -367,14 +431,17 @@ export function verifyAndBindPatch({
   if (typeof baseRevision !== 'string' || !HEX_REV_RE.test(baseRevision)) throw Error('Invalid baseRevision commit SHA.');
   const patchSha256 = validatePatchAllowlist(patch);
   const base = inspectBaseRepo(baseRepoDir, baseRevision);
-  const boundScope = validateBoundScope(claim, baseRevision, base.fileDigests, approvedCases);
+  const resolvedClaim = resolveProtectedClaim(claim, resolveClaim, baseRevision, base.fileDigests, approvedCases);
+  const boundScope = resolvedClaim.scope;
 
+  // Note: `verification.trusted === true` is only a caller-supplied attestation gate;
+  // provenance must be enforced by the host caller via a sealed verifier channel.
   if (!isPlainObj(verification) || verification.trusted !== true || verification.passed !== true ||
-      verification.claimId !== claim.claimId || verification.baseRevision !== baseRevision ||
+      verification.claimId !== resolvedClaim.claimId || verification.baseRevision !== baseRevision ||
       verification.casesDigest !== boundScope.casesDigest || verification.totalCases !== boundScope.totalCases ||
       verification.passedCases !== boundScope.totalCases ||
       !Array.isArray(verification.failures) || verification.failures.length !== 0) {
-    throw Error('Missing, mismatched, or invalid protected verifier evidence.');
+    throw Error('Missing, mismatched, or invalid verifier attestation.');
   }
   if (verification.results !== undefined) {
     if (!Array.isArray(verification.results) || verification.results.length !== boundScope.totalCases ||
@@ -424,8 +491,8 @@ export function verifyAndBindPatch({
 
   return Object.freeze({
     status: 'verified-patch',
-    claimId: claim.claimId,
-    scopeHash: claim.scopeHash,
+    claimId: resolvedClaim.claimId,
+    scopeHash: resolvedClaim.scopeHash,
     scope: boundScope,
     baseRevision,
     baseFileDigests: base.fileDigests,
@@ -436,9 +503,10 @@ export function verifyAndBindPatch({
     patchSha256,
     patchedFiles: derivedChanged,
     verification: Object.freeze({
-      trusted: true,
+      callerAssertedTrusted: true,
+      provenanceEnforcedByCaller: true,
       passed: true,
-      claimId: claim.claimId,
+      claimId: resolvedClaim.claimId,
       baseRevision,
       casesDigest: boundScope.casesDigest,
       totalCases: boundScope.totalCases,
