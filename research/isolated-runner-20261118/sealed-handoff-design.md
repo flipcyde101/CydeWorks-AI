@@ -48,7 +48,10 @@ Stop handing pathnames downstream. Verification and use become the same operatio
    - `st_nlink != 1`
 5. Listing is bounded. Directory names are counted while they are iterated, and the walk fails at `max_entries` before anything is collected or sorted. Byte, depth and path limits are also enforced before reading.
 6. Files are read through the handle, then `fstat` runs again. A change in size, mtime or ctime fails with `SEALED_ENTRY_CHANGED`.
-7. The output is a canonical `CWSEAL1` bundle: sorted entries, per-file SHA-256 and a `sealDigest` over the manifest. `build_bundle` copies all entry data into immutable `bytes` before hashing and keeps only those copies.
+7. The output is a canonical `CWSEAL1` bundle: sorted entries, per-file SHA-256 and a `sealDigest` over the manifest. `build_bundle` works in three phases:
+   1. It takes at most `max_entries + 1` items from the input iterable.
+   2. It inspects each entry without copying or hashing: exact `SealedEntry`, `bytes`/`bytearray`, `int` and `str` types (subclasses could misreport `__len__`), and the actual data and digest lengths checked against the declared size, the per-file limit, the 32-byte digest length and the running total.
+   3. Only then does it copy the data into immutable `bytes`, hash the copy and keep only the copies.
 
 Fail-closed fallback: if `openat2` is missing, blocked by seccomp, or unsupported on the architecture, `require_supported` raises `SEALED_HANDOFF_UNSUPPORTED`. There is no fallback to `openat` without `RESOLVE_NO_XDEV`.
 
@@ -174,7 +177,7 @@ If WQ-01 to WQ-07 cannot all pass, option A is rejected for Windows and option B
 
 - `sealed_handoff.py`: handle-owning reader, codec, materializer and CLI `seal`.
 - `sealed-handoff.mjs`: controller verifier, consumer contract and platform gate.
-- `test_sealed_handoff.py` (31 tests) and `sealed-handoff.test.mjs` (15 tests).
+- `test_sealed_handoff.py` (33 tests) and `sealed-handoff.test.mjs` (15 tests).
 - `sealed-handoff-vector.json`: ASCII and non-ASCII vectors, generated in the sandbox and checked by both languages.
 - `sealed-handoff-sandbox.sh`: runs the Python tests as `nobody` in private user, net, mount and pid namespaces. The source is a read-only bind, scratch is tmpfs, host drives are hidden, and `prlimit` and `timeout` limits apply. A probe aborts the run if any write, network or mount boundary is missing.
 - The Node tests run in an already-present local Node 22 image with `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, tmpfs scratch, memory, pid and CPU limits and a read-only source mount, after a similar probe.

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import ctypes
 import errno
 import hashlib
+import itertools
 import os
 import platform as _platform
 import secrets
@@ -191,21 +192,46 @@ def _manifest_bytes(entries):
     return b"".join(out)
 
 
-def _immutable_entry(e):
-    """Copy caller data into immutable bytes before anything is hashed or retained."""
-    if not isinstance(e, SealedEntry):
+_BYTES_TYPES = (bytes, bytearray)
+_INT = int
+_STR = str
+
+
+def _inspect_entry(e, limits):
+    """Validate an entry using only O(1) inspection; no copy, hash or conversion.
+
+    Returns the actual data length. Runs before _immutable_entry so a small declared size
+    cannot smuggle a large buffer into a copy or hash.
+    """
+    if type(e) is not SealedEntry:
         _fail("SEALED_BUNDLE_INVALID", "Entry is not a SealedEntry.")
+    # Exact types only: a subclass could override __len__ or __bytes__ to misreport its size.
+    if type(e.data) not in _BYTES_TYPES or type(e.sha256) not in _BYTES_TYPES:
+        _fail("SEALED_BUNDLE_INVALID", "Entry data and digest must be exact bytes or bytearray.")
+    if type(e.size) is not _INT or type(e.kind) is not _INT or type(e.path) is not _STR:
+        _fail("SEALED_BUNDLE_INVALID", "Entry size, kind and path must be exact int and str.")
+    data_len = len(e.data)
+    sha_len = len(e.sha256)
     if e.kind == KIND_DIR:
-        if e.size or e.data or e.sha256:
+        if e.size != 0 or data_len != 0 or sha_len != 0:
             _fail("SEALED_BUNDLE_INVALID", "Directory entry carries data.")
-        return SealedEntry(KIND_DIR, e.path)
+        return 0
     if e.kind != KIND_FILE:
         _fail("SEALED_BUNDLE_INVALID", "Unsupported entry kind.")
-    if not isinstance(e.data, (bytes, bytearray, memoryview)) or not isinstance(e.sha256, (bytes, bytearray)):
-        _fail("SEALED_BUNDLE_INVALID", "File entry data must be bytes.")
+    if data_len > limits["max_file_bytes"] or e.size > limits["max_file_bytes"] or e.size < 0:
+        _fail("SEALED_LIMIT_EXCEEDED", "File entry is too large.")
+    if data_len != e.size or sha_len != DIGEST_LEN:
+        _fail("SEALED_BUNDLE_INVALID", "File entry length or digest length is wrong.")
+    return data_len
+
+
+def _immutable_entry(e):
+    """Copy inspected caller data into immutable bytes, then verify the digest on the copy."""
+    if e.kind == KIND_DIR:
+        return SealedEntry(KIND_DIR, e.path)
     data = bytes(e.data)
     sha = bytes(e.sha256)
-    if not isinstance(e.size, int) or len(data) != e.size or hashlib.sha256(data).digest() != sha:
+    if len(data) != e.size or len(sha) != DIGEST_LEN or hashlib.sha256(data).digest() != sha:
         _fail("SEALED_BUNDLE_INVALID", "File entry content does not match its digest.")
     return SealedEntry(KIND_FILE, e.path, e.size, sha, data)
 
@@ -231,18 +257,17 @@ def _check_canonical_order(entries, limits):
 
 def build_bundle(entries, limits=None, root_dev=-1, root_ino=-1):
     limits = {**DEFAULT_LIMITS, **(limits or {})}
-    entries = list(entries)
-    if len(entries) > limits["max_entries"]:
+    # Bounded consumption: never pull more than max_entries + 1 items from the iterable.
+    taken = list(itertools.islice(iter(entries), limits["max_entries"] + 1))
+    if len(taken) > limits["max_entries"]:
         _fail("SEALED_LIMIT_EXCEEDED", "Too many entries.")
+    # Inspection pass on actual buffer lengths before any copy, hash or conversion.
     total = 0
-    for e in entries:
-        size = getattr(e, "size", 0)
-        if not isinstance(size, int) or size < 0 or size > limits["max_file_bytes"]:
-            _fail("SEALED_LIMIT_EXCEEDED", "File entry is too large.")
-        total += size
-    if total > limits["max_total_bytes"]:
-        _fail("SEALED_LIMIT_EXCEEDED", "Too many bytes.")
-    copied = [_immutable_entry(e) for e in entries]
+    for e in taken:
+        total += _inspect_entry(e, limits)
+        if total > limits["max_total_bytes"]:
+            _fail("SEALED_LIMIT_EXCEEDED", "Too many bytes.")
+    copied = [_immutable_entry(e) for e in taken]
     for e in copied:
         validate_rel_path(e.path, limits)
     ordered = tuple(sorted(copied, key=lambda e: e.path.encode("utf-8")))

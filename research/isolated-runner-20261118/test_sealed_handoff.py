@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -350,6 +351,56 @@ class CodecTests(Base):
                         [sh.SealedEntry(sh.KIND_FILE, "a", 9, b"", bytearray(9))], limits)
         self.assertCode("SEALED_LIMIT_EXCEEDED", sh.build_bundle,
                         [sh.SealedEntry(sh.KIND_DIR, "a"), sh.SealedEntry(sh.KIND_DIR, "b")], limits)
+
+    def test_entry_iterable_consumption_is_bounded(self):
+        pulled = {"n": 0}
+
+        def endless():
+            while True:
+                pulled["n"] += 1
+                if pulled["n"] > 1000:
+                    raise AssertionError("iterable consumed without bound")
+                yield sh.SealedEntry(sh.KIND_DIR, f"d{pulled['n']}")
+
+        self.assertCode("SEALED_LIMIT_EXCEEDED", sh.build_bundle, endless(), {"max_entries": 3})
+        self.assertLessEqual(pulled["n"], 4)
+
+    def test_declared_size_cannot_smuggle_large_buffers_into_copy_or_hash(self):
+        calls = []
+
+        def trip(*_args, **_kwargs):
+            calls.append(1)
+            raise AssertionError("copied or hashed before inspection")
+
+        class Liar(bytearray):
+            def __len__(self):
+                return 1
+
+        big = bytearray(1 << 20)
+        small_sha = d(b"x")
+        eight = bytearray(8)
+        eight_sha = d(eight)
+        liar = Liar(big)
+        limits = {"max_file_bytes": 8, "max_total_bytes": 16}
+        F, D = sh.KIND_FILE, sh.KIND_DIR
+        with mock.patch.object(sh, "bytes", trip, create=True), \
+                mock.patch.object(sh, "hashlib", types.SimpleNamespace(sha256=trip)):
+            cases = [
+                ("SEALED_LIMIT_EXCEEDED", [sh.SealedEntry(F, "a", 1, small_sha, big)]),
+                ("SEALED_BUNDLE_INVALID", [sh.SealedEntry(F, "a", 1, small_sha, bytearray(5))]),
+                ("SEALED_BUNDLE_INVALID", [sh.SealedEntry(F, "a", 1, big, b"x")]),
+                ("SEALED_LIMIT_EXCEEDED", [sh.SealedEntry(F, n, 8, eight_sha, eight) for n in "abc"]),
+                ("SEALED_BUNDLE_INVALID", [sh.SealedEntry(D, "d", 0, b"", big)]),
+                ("SEALED_BUNDLE_INVALID", [sh.SealedEntry(F, "a", 1, small_sha, liar)]),
+                ("SEALED_BUNDLE_INVALID", [sh.SealedEntry(F, "a", 1, small_sha, memoryview(big))]),
+                ("SEALED_BUNDLE_INVALID", [sh.SealedEntry(F, "a", True, small_sha, b"x")]),
+            ]
+            for expected, entries in cases:
+                self.assertCode(expected, sh.build_bundle, entries, limits)
+            self.assertEqual(calls, [])
+            with self.assertRaises(AssertionError):  # positive control: a valid entry reaches the copy
+                sh.build_bundle([sh.SealedEntry(F, "a", 1, small_sha, bytearray(b"x"))], limits)
+        self.assertEqual(len(calls), 1)
 
     def test_invalid_paths_and_order_rejected(self):
         for bad in ("..", "a/../b", "/abs", "a\\b", "c:x", "a//b", "x\x01"):
