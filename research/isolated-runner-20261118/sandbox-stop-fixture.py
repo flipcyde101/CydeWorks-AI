@@ -35,14 +35,21 @@ def main():
     args += ['--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
              '--proc', '/proc', '--dev', '/dev', '--', '/usr/bin/python3.12', '-I', '-B', '-c',
              'import os,time; print(os.getpid(),flush=True); time.sleep(30)']
-    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        if not select.select([process.stdout], [], [], 5)[0] or process.stdout.readline() != b'1\n':
-            raise RuntimeError('BLOCKED: private PID namespace startup failed')
+        ready = select.select([process.stdout], [], [], 5)[0]
+        frame = process.stdout.readline() if ready else b''
+        if not frame.strip().isdigit():
+            process.kill() if process.poll() is None else None
+            process.wait(timeout=3)
+            detail = process.stderr.read(1024).decode('utf-8', 'replace')
+            raise RuntimeError('BLOCKED: private PID namespace startup failed: ' + detail.strip())
         children = Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text().split()
         if not children:
             raise RuntimeError('BLOCKED: namespace child identity unavailable')
         child = identity(int(children[0]))
+        if child['namespace'] == identity(process.pid)['namespace']:
+            raise RuntimeError('BLOCKED: child PID namespace is not private')
         fd = os.pidfd_open(child['pid'])
         try:
             if identity(child['pid']) != child:
