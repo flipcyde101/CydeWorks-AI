@@ -1,4 +1,13 @@
-"""Trusted entry point inside the disposable pilot namespace."""
+"""Trusted entry point inside the disposable pilot namespace.
+
+Check-result integrity note:
+Candidate code can print or forge bytes on shared file descriptors. The invoke
+path discards candidate stdout and stderr and only emits a host-framed result.
+Complete integrity is still not established under this trust model because a
+candidate that discovers the result pipe through /proc/self/fd can write a
+well-formed forgery. Callers must fail closed on ambiguous evidence and must
+not treat a bare passing value as proof of a sealed verifier.
+"""
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import errno
@@ -7,17 +16,26 @@ import json
 import os
 from pathlib import Path
 import resource
+import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 
 
 PYTHON = "/usr/bin/python3.12"
 MODEL = "qwen3-4b-local"
 FILES = ("limits.py", "measurement.py")
 MAX_MESSAGE = 2000000
+CHECK_FUNCTIONS = frozenset({"clamp", "normalize"})
+CHECK_RESULT_MAX = 256
+CHECK_WALL_SECONDS = 2.0
+CHECK_CPU_SECONDS = 1
+# Production bwrap clears the environment, so this stays /input there.
+INPUT_ROOT = Path(os.environ["CYDEWORKS_PILOT_INPUT"]) if os.environ.get("CYDEWORKS_PILOT_INPUT") else Path("/input")
 
 
 def emit(message):
@@ -63,8 +81,8 @@ def probe(marker, port):
     child_check = subprocess.run([PYTHON, "-I", "-B", "-c",
                                   "import os,sys; sys.exit(os.path.exists(sys.argv[1]))", marker],
                                  check=False, timeout=4)
-    emit({"approvedInputReadable": can_open("/input/limits.py", "r"),
-          "approvedBaseReadOnly": not can_open("/input/limits.py", "a"),
+    emit({"approvedInputReadable": can_open(str(INPUT_ROOT / "limits.py"), "r"),
+          "approvedBaseReadOnly": not can_open(str(INPUT_ROOT / "limits.py"), "a"),
           "workerCanWrite": Path("/work/write-probe").read_text() == "isolated",
           "outsideReadDenied": not can_open(marker, "r"),
           "outsideWriteDenied": not can_open(marker, "a"),
@@ -110,7 +128,7 @@ def generate():
     approved = receive()
     sources = {}
     for name in FILES:
-        source = Path("/input", name).read_bytes()
+        source = (INPUT_ROOT / name).read_bytes()
         if hashlib.sha256(source).hexdigest() != approved["fileDigests"][name]:
             raise RuntimeError("The approved source changed before inference.")
         Path("/work", name).write_bytes(source)
@@ -158,7 +176,7 @@ def generate():
 
 
 def limit_candidate():
-    limit(3, 262144)
+    limit(CHECK_CPU_SECONDS, 262144)
     resource.setrlimit(resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024))
     resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
 
@@ -174,20 +192,117 @@ def check_limits():
           "candidateMemoryBounded": resource.getrlimit(resource.RLIMIT_AS) == (134217728, 134217728)})
 
 
-def invoke():
-    limit_candidate()
-    case = receive()
-    sys.path.insert(0, "/input")
-    from limits import clamp
-    from measurement import normalize
+def _alarm_handler(_signum, _frame):
+    raise TimeoutError("check wall clock exceeded")
 
-    functions = {"clamp": clamp, "normalize": normalize}
+
+def _run_candidate_check(case, writer):
+    """Execute one candidate call with stdout and stderr discarded."""
+    null = os.open(os.devnull, os.O_RDWR)
     try:
-        value = functions[case["name"]](case["input"])
-        if type(value) is int:
-            emit({"value": value})
-    except (TypeError, ValueError):
-        pass
+        os.dup2(null, 1)
+        os.dup2(null, 2)
+    finally:
+        os.close(null)
+    limit_candidate()
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, CHECK_WALL_SECONDS)
+    try:
+        sys.path.insert(0, str(INPUT_ROOT))
+        from limits import clamp
+        from measurement import normalize
+
+        value = {"clamp": clamp, "normalize": normalize}[case["name"]](case["input"])
+        if type(value) is not int:
+            return
+        payload = json.dumps({"value": value}, separators=(",", ":")).encode() + b"\n"
+        if len(payload) > CHECK_RESULT_MAX:
+            return
+        os.write(writer, payload)
+    except (TypeError, ValueError, ImportError, KeyError, OSError, TimeoutError):
+        return
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def _read_result_pipe(reader, seconds):
+    deadline = time.monotonic() + seconds
+    chunks = []
+    total = 0
+    while total < CHECK_RESULT_MAX + 1:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([reader], [], [], remaining)
+        if not ready:
+            break
+        piece = os.read(reader, CHECK_RESULT_MAX + 1 - total)
+        if not piece:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    return b"".join(chunks)
+
+
+def parse_check_payload(raw):
+    """Accept only one bounded JSON object with an int value. Fail closed otherwise."""
+    if not raw or len(raw) > CHECK_RESULT_MAX or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise ValueError("Check evidence framing is invalid.")
+    value = json.loads(raw)
+    if not isinstance(value, dict) or set(value) != {"value"} or type(value["value"]) is not int:
+        raise ValueError("Check evidence shape is invalid.")
+    return value
+
+
+def invoke():
+    """Run one protected check and emit at most one framed result on stdout."""
+    case = receive()
+    if not isinstance(case, dict) or set(case) != {"name", "input"}:
+        return
+    if case["name"] not in CHECK_FUNCTIONS:
+        return
+
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(reader)
+        try:
+            _run_candidate_check(case, writer)
+        finally:
+            os.close(writer)
+            os._exit(0)
+
+    os.close(writer)
+    raw = b""
+    try:
+        raw = _read_result_pipe(reader, CHECK_WALL_SECONDS + 0.5)
+    finally:
+        os.close(reader)
+
+    deadline = time.monotonic() + 0.5
+    status = None
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            break
+        time.sleep(0.01)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        return
+
+    if status is None or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+        return
+    try:
+        emit(parse_check_payload(raw))
+    except (ValueError, json.JSONDecodeError):
+        return
 
 
 if __name__ == "__main__":
