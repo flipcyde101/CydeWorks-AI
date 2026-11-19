@@ -33,6 +33,12 @@ This is a useful usability reference for persistent sessions without a prompt on
 
 [Code-server's usage guide](https://coder.com/docs/code-server/guide) documents password authentication and recommends protected transports for remote access. [Open WebUI's hardening guide](https://docs.openwebui.com/getting-started/advanced-topics/hardening/) describes HTTPS, cookie settings, session lifetime and revocation. These are comparison inputs, not proof that either product meets the CydeWorks session and Lock requirements.
 
+## Unreviewed simpler session proposal
+
+Grok's read-only T3 design handoff, run 25 of thread `mcp:d610e0a2-8bf6-441f-b94c-37bba91b53ed`, proposes replacing the held custom browser proof design with one revocable server-side session shared by tabs in a browser profile. The proposed authorization and Lock transactions establish whether a download was authorized before revocation, so that an already authorized download may finish. Expiry, session rotation, cross-site request defenses, duplicate cookie rejection and concurrent unlock and Lock handling remain part of the proposed design. A lost Lock response must not be reported as confirmed server revocation without evidence.
+
+This is unreviewed design input, not an implementation or a finding that the earlier security review is closed. The proposal explicitly leaves authenticated initial content and intended service identity unresolved until a suitable protected transport is designed and approved. It also acknowledges that a copied bearer cookie can be used in another profile or device until revocation or expiry. The owner has not approved unauthorized cross-profile or cross-device access, so that limitation must be addressed or separately presented to the owner as a concrete residual risk before adoption. It does not resolve desktop save recovery, launcher-claim lifecycle or the Windows runner gates.
+
 ## Evidence required before use
 
 1. A reviewed state machine for admission, reload, same-profile duplicate tabs, Lock across all session tabs, idle expiry, service restart and download authorization, including browser restart and a replaced local service.
