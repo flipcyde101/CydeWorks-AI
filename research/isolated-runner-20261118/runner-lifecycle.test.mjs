@@ -72,7 +72,7 @@ test('unresolved cleanup and unknown inference cannot complete a claim', async (
       const path=join(dir,name); const claim=claimRun(path,{synthetic:true});
       try {
         await assert.rejects(runOwned({claim,cleanupTimeoutMs:20,adapter:{
-          start:async({record})=>{record({nonce:'inert',birthIdentity:'fixture'});return {};},
+          start:async({nonce,record})=>{record({nonce,birthIdentity:'fixture'});return {};},
           stopAndVerify:stop,
         },execute:async()=>1}),/unresolved/);
         assert.equal(reconcileClaim(path).state,'unresolved');
@@ -90,11 +90,39 @@ for (const hangs of [true, false]) test(`execute settlement independent of clean
       record({nonce, birthIdentity:'fixture'}); return {};
     }, stopAndVerify: async () => ({cleanup: hangs ? 'verified' : 'unknown', inference:'settled'})};
     await assert.rejects(runOwned({claim, adapter, executeTimeoutMs:20, settlementTimeoutMs:20,
+      confirmInferenceSettled: async () => true,
       execute: async () => hangs ? new Promise(() => {}) : 1}), /unresolved/);
     const last = reconcileClaim(path).rows.at(-1);
     assert.equal(last.cleanup, hangs ? 'verified' : 'unknown');
     assert.equal(last.inference, hangs ? 'unknown' : 'settled');
   } finally { claim.close(); rmSync(dir,{recursive:true}); }
+});
+
+test('verified process cleanup cannot stand in for broker evidence', async () => {
+  const dir = mkdtempSync(new URL('./lifecycle-test-', import.meta.url));
+  try {
+    for (const confirmed of [false, true]) {
+      const path = join(dir, String(confirmed));
+      const claim = claimRun(path, {synthetic: true});
+      try {
+        const attempt = runOwned({
+          claim,
+          adapter: {
+            start: async ({nonce, record}) => {
+              record({nonce, birthIdentity: 'fixture'});
+              return {};
+            },
+            stopAndVerify: async () => ({cleanup: 'verified', inference: 'settled'}),
+          },
+          execute: async () => 'fixture',
+          confirmInferenceSettled: async () => confirmed,
+        });
+        if (confirmed) assert.equal(await attempt, 'fixture');
+        else await assert.rejects(attempt, /unresolved/);
+        assert.equal(reconcileClaim(path).state, confirmed ? 'complete' : 'unresolved');
+      } finally { claim.close(); }
+    }
+  } finally { rmSync(dir, {recursive: true}); }
 });
 
 test('startup deadline aborts owned startup and retains uncertainty', async () => {

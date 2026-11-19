@@ -33,7 +33,7 @@ export function reconcileClaim(path) {
 
 // The adapter must prove guest identity and complete tree termination, not just
 // termination of the Windows launcher. No PID-only recovery or broad taskkill.
-export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutMs = 5000, startupTimeoutMs = 7000, executeTimeoutMs = 5000, settlementTimeoutMs = 100}) {
+export async function runOwned({claim, adapter, signal, execute, confirmInferenceSettled, cleanupTimeoutMs = 5000, startupTimeoutMs = 7000, executeTimeoutMs = 5000, settlementTimeoutMs = 100}) {
   if (!adapter || typeof adapter.start !== 'function' || typeof adapter.stopAndVerify !== 'function') {
     claim.append({state: 'unresolved', cleanup: 'unknown', inference: 'unknown'});
     throw Error('A qualified process ownership adapter is required.');
@@ -54,11 +54,15 @@ export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutM
     controller.signal.throwIfAborted();
     // start must persist identity through record before allowing worker work.
     const nonce = randomUUID();
+    let owned = false;
     claim.append({state: 'launching', nonce});
     worker = await bounded(adapter.start({nonce, signal: controller.signal, record: identity => {
-      if (!identity || !identity.nonce || !identity.birthIdentity) throw Error('Incomplete ownership identity.');
+      controller.signal.throwIfAborted();
+      if (owned || identity?.nonce !== nonce || !identity.birthIdentity) throw Error('Invalid ownership identity.');
       claim.append({state: 'owned', identity});
+      owned = true;
     }}), startupTimeoutMs, 'Startup deadline exceeded.');
+    if (!owned) throw Error('Worker ownership was not recorded.');
     controller.signal.throwIfAborted();
     let cancel;
     try {
@@ -85,7 +89,14 @@ export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutM
   if (execution && !executionDone) {
     try { await bounded(execution.catch(() => {}), settlementTimeoutMs, 'Settlement deadline exceeded.'); } catch {}
   }
-  const inference = executionDone ? 'settled' : 'unknown';
+  let inference = 'unknown';
+  if (executionDone && typeof confirmInferenceSettled === 'function') {
+    try {
+      const confirmed = await bounded(Promise.resolve().then(confirmInferenceSettled),
+        settlementTimeoutMs, 'Inference evidence deadline exceeded.');
+      if (confirmed === true) inference = 'settled';
+    } catch {}
+  }
   const cleanup = evidence?.cleanup === 'verified' ? 'verified' : 'unknown';
   const verified = cleanup === 'verified' && inference === 'settled';
   claim.append({state: verified && !failure ? 'complete' : 'unresolved',
