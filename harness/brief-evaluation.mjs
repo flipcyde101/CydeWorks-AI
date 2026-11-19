@@ -1,6 +1,7 @@
 // Offline anchored brief evaluation (RB-P08-C).
 // Pure in-memory scoring against the tracked synthetic suite and holdout set.
-// Deterministic checks cannot establish factual truth without human semantic review.
+// A resolved citation is structural only. Token overlap, a bare citation, and a
+// caller assertion do not verify a factual claim. Human semantic review is required.
 
 import { deepFreeze } from './portable-manifest-contract.mjs';
 import {
@@ -17,7 +18,8 @@ export const BRIEF_EVALUATION_FORMAT = 'cydeworks.brief-evaluation';
 export const BRIEF_EVALUATION_VERSION = 1;
 
 export const CLAIM_VERIFICATION_KINDS = Object.freeze([
-  'verified-by-anchor',
+  'structurally-cited',
+  'not-classified-as-factual',
   'unsupported',
   'missing-evidence',
 ]);
@@ -29,6 +31,11 @@ export const STRUCTURAL_CHECK_DISCLAIMER =
 
 export const HUMAN_SEMANTIC_REVIEW_REQUIRED =
   'Deterministic checks cannot establish factual truth; human semantic review is required.';
+
+export const STRUCTURAL_PASS_LABEL = 'structural-rubric-only';
+
+export const RUBRIC_SCORING_LIMIT =
+  'Dimension scores and the minor-edit threshold are structural signals. They do not prove factual claims.';
 
 export const RUBRIC_DIMENSIONS = Object.freeze([
   'accuracy',
@@ -46,7 +53,6 @@ export const BRIEF_EVALUATION_LIMITS = deepFreeze({
   maxLineAnchors: 512,
   maxMaterialErrors: 64,
   maxSuiteMapEntries: 32,
-  factualAnchorOverlapMinimum: 0.45,
 });
 
 export {
@@ -286,29 +292,6 @@ function resolveExplicitLineReferences(lineNumbers, sourceLines) {
   return resolved;
 }
 
-function tokenOverlapScore(claimText, excerpt) {
-  const claimTokens = new Set(
-    normalizeForMatch(claimText)
-      .split(/[^a-z0-9]+/i)
-      .filter((token) => token.length >= 3),
-  );
-  const excerptTokens = new Set(
-    normalizeForMatch(excerpt)
-      .split(/[^a-z0-9]+/i)
-      .filter((token) => token.length >= 3),
-  );
-  if (claimTokens.size === 0 || excerptTokens.size === 0) {
-    return 0;
-  }
-  let overlap = 0;
-  for (const token of claimTokens) {
-    if (excerptTokens.has(token)) {
-      overlap += 1;
-    }
-  }
-  return overlap / claimTokens.size;
-}
-
 function looksLikeFactualClaim(text) {
   const normalized = normalizeForMatch(text);
   if (normalized.length < 8) {
@@ -445,6 +428,9 @@ function computeUsability(dimensions, materialErrors) {
   return deepFreeze({
     dimensionSum: sum,
     usableWithMinorEdits,
+    passLabel: STRUCTURAL_PASS_LABEL,
+    factsProven: false,
+    factualVerificationPerformed: false,
     structuralOnly: true,
     requiresHumanSemanticReview: true,
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
@@ -513,15 +499,15 @@ function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCo
     );
   }
 
-  const needsSemanticFollowUp = claims.some(
-    (claim) =>
-      claim.requiresHumanSemanticReview === true &&
-      (claim.verificationKind === 'missing-evidence' || claim.verificationKind === 'unsupported'),
-  );
+  const structuralFindingCount = claims.filter(
+    (claim) => claim.verificationKind === 'missing-evidence' || claim.verificationKind === 'unsupported',
+  ).length;
   push(
     'Human semantic review guidance',
     true,
-    needsSemanticFollowUp ? HUMAN_SEMANTIC_REVIEW_REQUIRED : 'No missing-evidence or unsupported claims flagged',
+    structuralFindingCount > 0
+      ? `${HUMAN_SEMANTIC_REVIEW_REQUIRED} Structural findings: ${structuralFindingCount} missing-evidence or unsupported segment(s). Lack of semantic proof is not proof of fabrication.`
+      : `${HUMAN_SEMANTIC_REVIEW_REQUIRED} No missing-evidence or unsupported segments. Structurally cited claims are still unproven.`,
   );
 
   return checks;
@@ -652,12 +638,19 @@ function scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, stru
   return { dimensions, lookForHits };
 }
 
-function hasSubstantiveAnchorSupport(claimText, anchorRecords) {
-  if (anchorRecords.length === 0) {
-    return false;
-  }
-  const overlap = Math.max(...anchorRecords.map((anchor) => tokenOverlapScore(claimText, anchor.excerpt)), 0);
-  return overlap >= BRIEF_EVALUATION_LIMITS.factualAnchorOverlapMinimum;
+function claimHasResolvableAnchor(anchorRecords) {
+  return anchorRecords.some((anchor) => anchor.invalidLineReference !== true);
+}
+
+function freezeClaim(fields) {
+  return deepFreeze({
+    ...fields,
+    structuralOnly: true,
+    requiresHumanSemanticReview: true,
+    factualVerificationPerformed: false,
+    disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+    humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
+  });
 }
 
 function classifyClaims(caseSpec, claimSegments, noteIndex, anchors, sourceLines) {
@@ -670,16 +663,14 @@ function classifyClaims(caseSpec, claimSegments, noteIndex, anchors, sourceLines
     const normalized = normalizeForMatch(text);
     if (seen.has(normalized)) {
       claims.push(
-        deepFreeze({
+        freezeClaim({
           claimId: `claim-${index + 1}`,
           text,
           verificationKind: 'unsupported',
           duplicate: true,
           sourceLineAnchors: [],
-          structuralOnly: true,
-          requiresHumanSemanticReview: true,
-          disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
-          humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
+          citedNoteIds: [],
+          citedLines: [],
         }),
       );
       continue;
@@ -729,48 +720,39 @@ function classifyClaims(caseSpec, claimSegments, noteIndex, anchors, sourceLines
     const flagHit = matchesAnyPattern(text, caseSpec.flags);
     const emptySourceFabrication = emptySource && looksLikeFabricationOnEmptySource(text);
 
+    const invalidCitation = citationIds.length > 0 && citationIds.some((id) => !noteIndex.has(id));
+    const invalidLine = anchorRecords.some((anchor) => anchor.invalidLineReference === true);
     let verificationKind = 'missing-evidence';
-    let requiresHumanSemanticReview = true;
 
     if (
       emptySourceFabrication ||
       flagHit ||
       semanticViolations.length > 0 ||
-      anchorRecords.some((anchor) => anchor.invalidLineReference === true)
+      invalidLine ||
+      invalidCitation
     ) {
       verificationKind = 'unsupported';
-    } else if (citationIds.length > 0 && citationIds.some((id) => !noteIndex.has(id))) {
-      verificationKind = 'unsupported';
     } else if (looksLikeFactualClaim(text)) {
-      if (anchorRecords.length === 0) {
+      if (!claimHasResolvableAnchor(anchorRecords)) {
         verificationKind = emptySource ? 'unsupported' : 'missing-evidence';
-      } else if (hasSubstantiveAnchorSupport(text, anchorRecords)) {
-        verificationKind = 'verified-by-anchor';
-        requiresHumanSemanticReview = true;
       } else {
-        verificationKind = 'missing-evidence';
-        requiresHumanSemanticReview = true;
+        verificationKind = 'structurally-cited';
       }
-    } else if (looksLikeNoteRequestBrief(text) || !looksLikeFactualClaim(text)) {
-      verificationKind = 'verified-by-anchor';
-      requiresHumanSemanticReview = !looksLikeNoteRequestBrief(text);
+    } else if (claimHasResolvableAnchor(anchorRecords)) {
+      verificationKind = 'structurally-cited';
     } else {
-      verificationKind = 'missing-evidence';
+      verificationKind = 'not-classified-as-factual';
     }
 
     claims.push(
-      deepFreeze({
+      freezeClaim({
         claimId: `claim-${index + 1}`,
         text,
         verificationKind,
         sourceLineAnchors: anchorRecords,
         citedNoteIds: citationIds,
         citedLines: lineRefs,
-        structuralOnly: true,
-        requiresHumanSemanticReview,
         emptySourceFabrication,
-        disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
-        humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
         matchedFlagPattern: flagHit ? String(flagHit) : null,
         semanticViolations: semanticViolations.map((item) => item.code),
       }),
@@ -901,9 +883,12 @@ export function evaluateBrief(input) {
       flagHits,
       usability,
       scoringNotes: caseSpec.notes,
+      scoringLimit: RUBRIC_SCORING_LIMIT,
     }),
     limitations,
     dataOnlyBoundary: true,
+    factsProven: false,
+    factualVerificationPerformed: false,
     requiresHumanSemanticReview: true,
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
     humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
@@ -1015,12 +1000,16 @@ export function runTrackedSyntheticSuite(briefsByCaseId) {
       materialUnsupportedClaimCount,
       usableWithMinorEditsCount: usableCount,
       zeroMaterialUnsupportedClaims: materialUnsupportedClaimCount === 0,
+      factsProven: false,
+      factualVerificationPerformed: false,
     }),
     gates: deepFreeze({
       proposedUsableThreshold: 16,
       usableWithMinorEditsCount: usableCount,
       meetsProposedUsableGate: usableCount >= 16,
       zeroMaterialUnsupportedClaimsAcrossTracked: materialUnsupportedClaimCount === 0,
+      factsProven: false,
+      factualVerificationPerformed: false,
     }),
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
     humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
@@ -1056,6 +1045,8 @@ export function runHoldoutSyntheticSuite(briefsByCaseId) {
       expectedCount: SYNTHETIC_HOLDOUT_CASE_IDS.length,
       notDrawnFromTrackedSuite: true,
       materialUnsupportedClaimCount,
+      factsProven: false,
+      factualVerificationPerformed: false,
     }),
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
     humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
