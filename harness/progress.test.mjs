@@ -1667,18 +1667,40 @@ test('status reports aggregate measured counts and separate current-step labels 
   assert.match(waitingWithLabel.explanation,/Run checks/);
 });
 
-test('source validation rejects UTF-16 and output-derived sources even with valid discrete units while allowing discrete sources',()=>{
+test('source validation rejects UTF-16, output-derived, and unknown sources across separator/case variants while allowing discrete sources',()=>{
   const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
 
   const badSources=[
     'model-output-utf16',
     'utf-16-length',
+    'utf_16_length',
+    'utf.16.length',
+    'UTF_16_LENGTH',
+    'utf16Length',
+    'model.output',
+    'model_output',
+    'model-output',
+    'Model.Output',
+    'MODEL_OUTPUT',
+    'modelOutput',
+    'model..output',
+    'model/output',
     'stream-output',
+    'stream_output',
+    'stream.output',
     'code-unit-counter',
+    'code_unit_counter',
+    'code.unit.counter',
     'string.length',
+    'string_length',
+    'text.length',
     'response-output-size',
+    'completion_output',
     'heuristic',
+    'custom-tracker',
+    'unknown.telemetry',
     '<script>worker</script>',
+    'a'.repeat(65),
   ];
   for (const badSource of badSources) {
     const rejected=describeProgress({
@@ -1707,7 +1729,64 @@ test('source validation rejects UTF-16 and output-derived sources even with vali
     assert.ok(typeof rejected.stepRejectionReason==='string'&&rejected.stepRejectionReason.length>0,badSource);
   }
 
-  const goodSources=['worker','file-scanner','test-runner','compiler'];
+  // Output-derived or unknown sources on currentStep are also rejected without invalidating valid overall counters.
+  const badSubSource=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4500).toISOString(),
+      steps:{
+        measured:true,
+        unit:'files',
+        source:'worker',
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Verify',
+          source:'model.output',
+          unit:'checks',
+          completed:1,
+          total:3,
+          samples:[
+            {at:new Date(then+3000).toISOString(),done:0},
+            {at:new Date(then+4000).toISOString(),done:1},
+          ],
+        },
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(badSubSource.unit,'files');
+  assert.equal(badSubSource.overallEtaMs,6000);
+  assert.equal(badSubSource.currentStep.unit,null);
+  assert.equal(badSubSource.currentStep.etaMs,null);
+  assert.equal(badSubSource.currentStepEtaMs,null);
+  assert.match(badSubSource.unavailableReasons.currentStepEta,/source/i);
+
+  const goodSources=[
+    'worker',
+    'Worker',
+    'WORKER',
+    'file-scanner',
+    'file_scanner',
+    'file.scanner',
+    'File.Scanner',
+    'FileScanner',
+    'test-runner',
+    'test_runner',
+    'test.runner',
+    'TestRunner',
+    'compiler',
+    'Compiler',
+    'harness',
+    'scheduler',
+    'executor',
+    'build-runner',
+    'task-runner',
+  ];
   for (const goodSource of goodSources) {
     const accepted=describeProgress({
       status:'running',
