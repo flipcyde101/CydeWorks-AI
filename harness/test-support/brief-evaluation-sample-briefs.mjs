@@ -1,5 +1,21 @@
 // Representative synthetic briefs for offline structural scoring fixtures.
 
+export const BRIEF_EVALUATION_EXPECTED_TRACKED = Object.freeze({
+  B01: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1 },
+  B13: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1 },
+  B16: { usableWithMinorEdits: true, materialUnsupportedCount: 0, mustOmitOfficeMove: true },
+  B18: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1 },
+  B20: { usableWithMinorEdits: false, materialUnsupportedCount: 0, traceabilityMin: 2, dimensionSumMin: 7 },
+});
+
+export const BRIEF_EVALUATION_EXPECTED_HOLDOUT = Object.freeze({
+  H01: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
+  H02: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
+  H03: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
+  H04: { usableWithMinorEdits: false, materialUnsupportedCount: 0, dimensionSumMin: 7 },
+  H05: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
+});
+
 export const BRIEF_EVALUATION_GOOD_B01 = [
   'Decision open: no room is reserved [3].',
   'Cedar holds 24 and cannot fit 28 confirmed attendees [1][2].',
@@ -24,10 +40,26 @@ export const BRIEF_EVALUATION_BAD_B18_EXACTLY_500 = [
   'The pilot already started Monday [2].',
 ].join(' ');
 
+export const BRIEF_EVALUATION_BAD_B18_PARAPHRASE_INCLUSIVE_500 = [
+  'New invoices up to $500 qualify for the one-week pilot [1].',
+  'Taylor is preparing the checklist [2].',
+].join(' ');
+
+export const BRIEF_EVALUATION_GOOD_B18_PARAPHRASE_UNDER_500 = [
+  'The pilot applies to new invoices below $500 while larger invoices keep existing review [1].',
+  'Taylor will prepare the pilot checklist [2].',
+].join(' ');
+
 export const BRIEF_EVALUATION_GOOD_B13 = [
-  'Guest A offers June 11 audio-only; Guest B offers June 14 with a video option [1].',
-  'Either date can fit the June 20 target if editing starts promptly after recording [2][3].',
-  'Producer preference is open; no guest is selected yet [2][3].',
+  'Guest A offers June 11 audio-only; Guest B offers June 14 and is open to video [1].',
+  'The producer prefers video, but either format is acceptable [2].',
+  'No guest is selected yet and either date may fit if editing starts promptly [2][3].',
+].join(' ');
+
+export const BRIEF_EVALUATION_GOOD_B13_NOT_AGREED_VIDEO = [
+  'Guest A has not agreed to video and remains audio-only for June 11 [1].',
+  'Guest B is open to video for June 14 [1].',
+  'The producer prefers video, but either format is acceptable [2].',
 ].join(' ');
 
 export const BRIEF_EVALUATION_BAD_B13_INFERENCE = [
@@ -35,8 +67,18 @@ export const BRIEF_EVALUATION_BAD_B13_INFERENCE = [
   'Guest B is confirmed for June 14 [1].',
 ].join(' ');
 
+export const BRIEF_EVALUATION_BAD_B13_PARAPHRASE_CONFIRMED = [
+  'Guest B is locked in for the June 14 recording slot [1].',
+  'The recording slot is confirmed pending studio setup [1][2].',
+].join(' ');
+
+export const BRIEF_EVALUATION_BAD_B20_FABRICATED_SHIPMENT = [
+  'Shipment will leave the warehouse on June 12 with 500 units.',
+  'Taylor owns delivery and the handoff is approved.',
+].join(' ');
+
 export const BRIEF_EVALUATION_GOOD_B20 = [
-  'No notes were supplied in the input.',
+  'Empty input: no notes were supplied.',
   'Please provide source notes or decision context before drafting a decision brief.',
 ].join(' ');
 
@@ -108,7 +150,7 @@ export function buildTrackedSyntheticBriefMap() {
     },
     B16: {
       briefText:
-        'Headline-only home page update approved; Jules owns delivery by Thursday [1]. Pricing page remains draft pending legal review [2]. Office move is unrelated [3].',
+        'Headline-only home page update approved; Jules owns delivery by Thursday [1]. Pricing page remains draft pending legal review [2].',
     },
     B17: {
       briefText:
