@@ -3,7 +3,7 @@
 
 import {createDemoAdapter} from './demo/adapter.js';
 import {createHttpAdapter} from './adapters/http.js';
-import {classifyError} from './adapters/contract.js';
+import {classifyError, classifyLockOutcome} from './adapters/contract.js';
 import {swap, stableKey} from './core/dom.js';
 import {mode, readAdapterMode} from './core/mode.js';
 import {shortHash} from './core/format.js';
@@ -336,14 +336,14 @@ const actions = {
     navigate('#/work');
     render();
     return Promise.resolve().then(() => adapter.lock({}))
-      .then(() => 'locked', error => classifyError(error).kind === 'locked' ? 'already' : 'unconfirmed')
+      .then(result => classifyLockOutcome(result), error => classifyLockOutcome(undefined, error))
       .then(outcome => {
         // A later unlock or Lock owns the screen now.
         if (state.sessionEpoch !== epoch || state.session.unlocked) return;
-        state.lockNotice = outcome === 'unconfirmed'
-          ? 'The lock response was lost, so this view locked itself. Whether other views were locked is not confirmed. Unlock with the access file; nothing was sent again.'
+        state.lockNotice = outcome === 'confirmed'
+          ? 'Workspace session terminated in every view. Approved work keeps running, and terminal control was released. Unlock with the access file.'
           : outcome === 'already' ? 'The workspace session had already ended. This view is locked.'
-          : 'Workspace session terminated in every view. Approved work keeps running, and terminal control was released. Unlock with the access file.';
+          : 'The lock response was lost, so this view locked itself. Whether other views were locked is not confirmed. Unlock with the access file; nothing was sent again.';
         render();
       });
   },

@@ -5,7 +5,8 @@ import {writeFile,readFile,access} from 'node:fs/promises';
 import {join} from 'node:path';
 import {terminalWorkspace} from './test-support/terminal-workspace.mjs';
 import {createTerminalControl} from './terminal-control.mjs';
-import {bindWorkspaceLock,workspaceLockCopy} from './web/workspace-lock.js';
+import {bindWorkspaceLock,createSessionEpoch,workspaceLockCopy} from './web/workspace-lock.js';
+import {classifyLockOutcome} from './web-experience/adapters/contract.js';
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(fn) {
@@ -165,23 +166,45 @@ run:async(task,{signal,terminal})=>{
 });
 
 const sessionIdleMs=15*60*1000;
-const sessionNowNeedle='const sessionNow = () => Date.now();';
+const sessionClockNeedle=`const sessionMonotonic = () => performance.now();
+const sessionWall = () => Date.now();`;
 const issuedCookie=/^bfe_session=[a-f0-9]{64}; HttpOnly; SameSite=Strict; Path=\/api$/;
 const expiredCookie='bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api';
 
 function clockPatch(code) {
-  if(!code.includes(sessionNowNeedle))throw Error('Copied server is missing the session clock.');
-  return "import {readFileSync as readSessionClock} from 'node:fs';\n"+code.replace(sessionNowNeedle,
-    `const sessionNow = () => {
+  if(!code.includes(sessionClockNeedle))throw Error('Copied server is missing the session clock.');
+  return "import {readFileSync as readSessionClock} from 'node:fs';\n"+code.replace(sessionClockNeedle,
+    `const readSessionClocks = () => {
+      const parts=readSessionClock('session-clock.txt','utf8').trim().split(/\\s+/).map(Number);
+      const wall=parts[0], mono=parts.length>1?parts[1]:wall;
+      return {wall, mono};
+    };
+    const sessionMonotonic = () => {
       try {
-        const value=Number(readSessionClock('session-clock.txt','utf8'));
+        const value=readSessionClocks().mono;
+        if(Number.isSafeInteger(value)&&value>=0)return value;
+      } catch {}
+      return performance.now();
+    };
+    const sessionWall = () => {
+      try {
+        const value=readSessionClocks().wall;
         if(Number.isSafeInteger(value)&&value>=0)return value;
       } catch {}
       return Date.now();
     };`);
 }
 
-// The copied host reads session-clock.txt. Production keeps Date.now().
+function applyCookie(jar, header) {
+  if(!header)return;
+  const [pair]=String(header).split(';');
+  const name=pair.slice(0,pair.indexOf('='));
+  const value=pair.slice(pair.indexOf('=')+1);
+  if(/Max-Age=0/i.test(header))delete jar[name];
+  else jar[name]=value;
+}
+
+// The copied host reads session-clock.txt. Production uses performance.now() and Date.now().
 async function withSessionClock(t,{configure,startImmediately=false}={}) {
   let folder;
   const rig=await terminalWorkspace(t,{startImmediately,configure:async dir=>{
@@ -196,14 +219,18 @@ async function withSessionClock(t,{configure,startImmediately=false}={}) {
     await writeFile(file,code);
     await writeFile(join(dir,'session-clock.txt'),'0');
   }});
-  return {...rig,folder,at:ms=>writeFile(join(folder,'session-clock.txt'),String(ms))};
+  return {...rig,folder,at:(wall,mono)=>writeFile(join(folder,'session-clock.txt'),mono===undefined?String(wall):wall+' '+mono)};
 }
 
 test('the workspace idle deadline stays 15 minutes and is not the terminal lease',async()=>{
   const source=await readFile(new URL('./server.mjs',import.meta.url),'utf8');
   assert.match(source,/const sessionIdleMs=15\*60\*1000;/);
-  assert.match(source,/const sessionNow = \(\) => Date\.now\(\);/);
-  assert.match(source,/command==='heartbeat'\)\)noteSessionActivity\(\)/);
+  assert.match(source,/const sessionMonotonic = \(\) => performance\.now\(\);/);
+  assert.match(source,/const sessionWall = \(\) => Date\.now\(\);/);
+  assert.match(source,/sessionSeenWall===undefined\|\|wall>=sessionSeenWall/);
+  assert.match(source,/path==='\/api\/cost-presentation'/);
+  assert.match(source,/data\.command==='heartbeat'\|\|data\.command==='detach'/);
+  assert.doesNotMatch(source,/const sessionNow = \(\) => Date\.now\(\);/);
 });
 
 test('polls and heartbeats do not move the 15-minute deadline',{timeout:15000},async t=>{
@@ -325,7 +352,7 @@ run:async(task,{signal,terminal})=>{
   assert.equal((await request(path)).status,401);
 });
 
-function lockHarness(send) {
+function lockHarness(send, focusTarget) {
   const status={textContent:'stale'};
   const dialog={open:false,showModal(){this.open=true;},close(){this.open=false;}};
   const openButton={onclick:null,focus(){this.focused=true;}};
@@ -334,7 +361,7 @@ function lockHarness(send) {
   const sent=[];
   const outcomes=[];
   let local=0;
-  bindWorkspaceLock({openButton,dialog,confirmButton,cancelButton,status,send:async body=>{
+  bindWorkspaceLock({openButton,dialog,confirmButton,cancelButton,status,focusTarget,send:async body=>{
     sent.push(structuredClone(body));return send(body);
   },onLocalLock(){local++;},onOutcome(outcome){outcomes.push(outcome);}});
   return {status,dialog,openButton,confirmButton,cancelButton,sent,outcomes,local:()=>local};
@@ -383,4 +410,176 @@ test('a lost lock response stays unconfirmed and a 401 is already ended',async()
   await ended.confirmButton.onclick();
   assert.equal(ended.status.textContent,workspaceLockCopy.already);
   assert.deepEqual(ended.outcomes,['already']);
+});
+
+test('confirm moves focus to a visible unlock control',async()=>{
+  const unlock={hidden:false,focused:false,focus(){this.focused=true;}};
+  const ui=lockHarness(async()=>({locked:true}),unlock);
+  ui.openButton.onclick();
+  await ui.confirmButton.onclick();
+  assert.equal(unlock.focused,true);
+  assert.notEqual(ui.openButton.focused,true);
+  const hidden={hidden:true,focused:false,focus(){this.focused=true;}};
+  const concealed=lockHarness(async()=>({locked:true}),hidden);
+  concealed.openButton.focused=false;
+  await concealed.confirmButton.onclick();
+  assert.equal(hidden.focused,false);
+  assert.notEqual(concealed.openButton.focused,true);
+});
+
+test('a pending task read and an older lock outcome cannot restore a concealed or unlocked view',async()=>{
+  const gate=createSessionEpoch();
+  gate.unlock();
+  let controls='open';
+  let releaseRead;
+  const read=new Promise(resolve=>{releaseRead=resolve;});
+  const started=gate.epoch();
+  const pending=read.then(()=>gate.current(started)?'restored':'dropped');
+  const lockEpoch=gate.conceal();
+  controls='concealed';
+  releaseRead({id:'task'});
+  assert.equal(await pending,'dropped');
+  assert.equal(controls,'concealed');
+  assert.equal(gate.locked(),true);
+  assert.equal(gate.current(started),false);
+  assert.equal(gate.outcomeCurrent(lockEpoch),true);
+  let notice='waiting';
+  let releaseLock;
+  const lockResult=new Promise(resolve=>{releaseLock=resolve;});
+  const outcome=lockResult.then(result=>{
+    if(!gate.outcomeCurrent(lockEpoch))return 'ignored';
+    notice=result?.locked===true?'confirmed':'unconfirmed';
+    return 'applied';
+  });
+  gate.unlock();
+  notice='unlocked';
+  controls='open';
+  releaseLock({locked:true});
+  assert.equal(await outcome,'ignored');
+  assert.equal(notice,'unlocked');
+  assert.equal(controls,'open');
+  assert.equal(gate.locked(),false);
+  const failed=createSessionEpoch();
+  failed.unlock();
+  const failedEpoch=failed.conceal();
+  assert.equal(failed.locked(),true);
+  assert.equal(failed.outcomeCurrent(failedEpoch),true);
+  assert.equal(failed.current(failed.epoch()),false);
+});
+
+test('lock confirmation requires locked true',()=>{
+  assert.equal(classifyLockOutcome({locked:true}),'confirmed');
+  assert.equal(classifyLockOutcome({}),'unconfirmed');
+  assert.equal(classifyLockOutcome({locked:false}),'unconfirmed');
+  assert.equal(classifyLockOutcome(null),'unconfirmed');
+  assert.equal(classifyLockOutcome(undefined,Object.assign(Error('ended'),{status:401})),'already');
+  assert.equal(classifyLockOutcome(undefined,Error('lost')),'unconfirmed');
+});
+
+test('legacy lock stays hidden until the workspace opens and continuations check the epoch',async()=>{
+  const html=await readFile(new URL('./web/index.html',import.meta.url),'utf8');
+  const app=await readFile(new URL('./web/app.js',import.meta.url),'utf8');
+  const experience=await readFile(new URL('./web-experience/app.js',import.meta.url),'utf8');
+  assert.match(html,/id="lock-workspace"[^>]*hidden/);
+  const enterStart=app.indexOf('async function enter()');
+  const enter=app.slice(enterStart,app.indexOf("$('access-file')",enterStart));
+  const listed=enter.indexOf('await refreshList()');
+  const reveal=enter.indexOf("$('lock-workspace').hidden=false");
+  assert.ok(listed>0&&reveal>listed);
+  assert.match(app,/if \(stamp!==selection\|\|!sessionGate\.current\(epoch\)\) return;/);
+  assert.match(app,/if\(stamp!==listRevision\|\|!sessionGate\.current\(epoch\)\)return;/);
+  assert.match(app,/if\(!sessionGate\.outcomeCurrent\(lockEpoch\)\)/);
+  assert.match(app,/if \(busy\|\|sessionGate\.locked\(\)\) return;/);
+  assert.match(experience,/classifyLockOutcome\(result\)/);
+  assert.match(experience,/state\.sessionEpoch !== epoch \|\| state\.session\.unlocked/);
+});
+
+test('a backward session clock ends the workspace session',{timeout:15000},async t=>{
+  const {origin,request,at}=await withSessionClock(t);
+  await at(1000);
+  assert.equal((await request('/api/tasks')).status,200);
+  await at(500,1000);
+  const wall=await request('/api/tasks');
+  assert.equal(wall.status,401);
+  assert.equal(wall.headers.get('set-cookie'),expiredCookie);
+  const unlocked=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  assert.equal(unlocked.status,200);
+  const cookie=unlocked.headers.get('set-cookie');
+  assert.match(cookie,issuedCookie);
+  const next=client(origin,cookie.split(';')[0]);
+  assert.equal((await next('/api/tasks')).status,200);
+  await at(2000,500);
+  const mono=await next('/api/tasks');
+  assert.equal(mono.status,401);
+  assert.equal(mono.headers.get('set-cookie'),expiredCookie);
+});
+
+test('cost presentation and detach do not move the 15-minute deadline',{timeout:15000},async t=>{
+  const {request,path,at}=await withSessionClock(t,{startImmediately:true});
+  const before=await (await request(path)).json();
+  const taken=await request(path+'/terminal',{command:'take',...before.live.control});
+  assert.equal(taken.status,200);
+  const held=await taken.json();
+  await at(sessionIdleMs-1);
+  assert.equal((await request('/api/tasks')).status,200);
+  assert.equal((await request('/api/cost-presentation',{})).status,400);
+  assert.equal((await request(path+'/terminal',{command:'detach',...held})).status,200);
+  await at(sessionIdleMs);
+  const expired=await request('/api/tasks');
+  assert.equal(expired.status,401);
+  assert.equal(expired.headers.get('set-cookie'),expiredCookie);
+});
+
+test('handoff review and terminal status still move the deadline',{timeout:15000},async t=>{
+  const {request,path,at}=await withSessionClock(t,{startImmediately:true});
+  const before=await (await request(path)).json();
+  const taken=await request(path+'/terminal',{command:'take',...before.live.control});
+  assert.equal(taken.status,200);
+  const held=await taken.json();
+  await at(sessionIdleMs-1);
+  assert.equal((await request('/api/tasks')).status,200);
+  assert.equal((await request('/api/handoffs/review',{})).status,400);
+  await at(sessionIdleMs*2-2);
+  assert.equal((await request('/api/tasks')).status,200);
+  assert.equal((await request(path+'/terminal',{command:'status',...held})).status,200);
+  await at(sessionIdleMs*3-3);
+  assert.equal((await request('/api/tasks')).status,200);
+  await at(sessionIdleMs*3-2);
+  const expired=await request('/api/tasks');
+  assert.equal(expired.status,401);
+  assert.equal(expired.headers.get('set-cookie'),expiredCookie);
+});
+
+test('a late idle probe does not clear a cookie issued by a newer unlock',{timeout:15000},async t=>{
+  const {origin,request,folder,at}=await withSessionClock(t,{configure:async dir=>{
+    await writeFile(join(dir,'providers.mjs'),`
+import {writeFile,access} from 'node:fs/promises';
+export const ollamaEndpoint='http://127.0.0.1:1';
+export const ollama={inspect:async()=>{
+ await writeFile('probe.marker','ready');
+ for(let i=0;i<300;i++){try{await access('probe.release');break;}catch{}await new Promise(r=>setTimeout(r,10));}
+ return {models:[],cloudDisabled:true};
+}};
+export const fixture={models:async()=>[]};
+`);
+  }});
+  const pending=request('/api/models');
+  await until(()=>exists(join(folder,'probe.marker')));
+  await at(sessionIdleMs);
+  const unlocked=await client(origin)('/api/session',{key:'a'.repeat(64)});
+  assert.equal(unlocked.status,200);
+  const issued=unlocked.headers.get('set-cookie');
+  assert.match(issued,issuedCookie);
+  await writeFile(join(folder,'probe.release'),'ready');
+  const late=await pending;
+  assert.equal(late.status,401);
+  const lateCookie=late.headers.get('set-cookie');
+  assert.ok(lateCookie==null||!String(lateCookie).includes('Max-Age=0'));
+  assert.equal(Object.hasOwn(await late.json(),'models'),false);
+  const jar={};
+  applyCookie(jar,issued);
+  applyCookie(jar,lateCookie);
+  assert.equal(jar.bfe_session,issued.split(';')[0].slice('bfe_session='.length));
+  assert.equal((await client(origin,'bfe_session='+jar.bfe_session)('/api/tasks')).status,200);
+  assert.equal((await request('/api/tasks')).status,401);
 });

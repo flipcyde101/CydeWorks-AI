@@ -7,13 +7,15 @@ import {diagnosticMessages} from './route-diagnostics.js';
 import {bindProposalEditor} from './proposal-editor.js';
 import {terminalRequest,ownsTerminal} from './terminal-request.js';
 import {bindDraftCopyDialog} from './draft-copy-dialog.js';
-import {bindWorkspaceLock,workspaceLockCopy} from './workspace-lock.js';
+import {bindWorkspaceLock,createSessionEpoch,workspaceLockCopy} from './workspace-lock.js';
 const $ = id => document.getElementById(id);
 const form = $('create');
 const field = name => form.elements.namedItem(name);
 let task, models=[], selection=0, busy=false, editing, lease, detached=false, listRevision=0, listTimer;
 let connection='connected', needsReconcile=false, explicitLock=null;
 let actionRevision=0;
+const sessionGate=createSessionEpoch();
+let lockEpoch=0;
 const resumeKey='bfe-last-task';
 const remember=id=>{try { if (id) sessionStorage.setItem(resumeKey,id); else sessionStorage.removeItem(resumeKey); } catch { /* Storage may be disabled. */ }};
 const remembered=()=>{try { return sessionStorage.getItem(resumeKey); } catch { return null; }};
@@ -40,12 +42,14 @@ async function api(path,body) {
   return data;
 }
 async function act(fn) {
-  if (busy) return;
+  if (busy||sessionGate.locked()) return;
+  const epoch=sessionGate.epoch();
   busy=true;
   actionRevision++;
   $('new-task').disabled=true;
   note();
   try { await fn(); } catch (error) {
+    if(!sessionGate.current(epoch))return;
     note(error.message);
     if (task && error.status===401) {
       lease=undefined;
@@ -59,7 +63,10 @@ async function act(fn) {
       note(error.status===409 ? error.message+' Checking current saved state.'
         : 'The last action could not be confirmed. Checking saved state. No action will be sent again automatically.');
     }
-  } finally { busy=false; $('new-task').disabled=false; }
+  } finally {
+    busy=false;
+    if(sessionGate.current(epoch)&&connection==='connected'&&!needsReconcile)$('new-task').disabled=false;
+  }
 }
 const path = () => '/api/tasks/'+task.id;
 const seconds = ms => ms == null ? null : (ms/1000).toFixed(2)+' s';
@@ -67,7 +74,23 @@ const active = status => status==='running';
 const labels = {draft:'Needs approval', review:'Needs review', running:'Running', accepted:'Accepted', rejected:'Rejected',
   failed:'Needs attention', cancelled:'Request cancelled', interrupted:'Needs recovery'};
 
+function concealLocalSession() {
+  lockEpoch=sessionGate.conceal();
+  lease=undefined;
+  observer.stop();
+  clearTimeout(listTimer);
+  $('new-task').disabled=true;
+  for (const id of ['run-button','terminal-take','terminal-release','terminal-status','terminal-stop','terminal-detach','terminal-attach','edit','edit-proposal','reject','copy-task','download','download-patch','refresh-routes','export','remove-task']) {
+    const node=$(id);
+    if (node) node.disabled=true;
+  }
+  cancel.disabled=true;
+  $('accept').disabled=true;
+  return lockEpoch;
+}
 function setConnection(state) {
+  if (sessionGate.locked() && state.phase!=='locked') return;
+  if (state.phase==='locked' && !sessionGate.locked()) concealLocalSession();
   connection=state.phase;
   $('connection').hidden=connection==='connected';
   $('reconnect').hidden=connection==='locked';
@@ -86,7 +109,8 @@ function setConnection(state) {
 const observer=createObserver({
   read:id=>api('/api/tasks/'+id),
   async onData(latest,isCurrent) {
-    if (busy) return false;
+    const epoch=sessionGate.epoch();
+    if (busy || !sessionGate.current(epoch)) return false;
     const id=task?.id, stamp=selection, actionStamp=actionRevision;
     if (latest.id!==id || latest.version<task.version) return false;
     if(lease&&!ownsTerminal(latest,lease))lease=undefined;
@@ -95,7 +119,7 @@ const observer=createObserver({
       try { await api('/api/tasks/'+id+'/terminal',terminalRequest(latest,held,'heartbeat')); }
       catch { if (lease===held && isCurrent()) lease=undefined; }
     }
-    if (!isCurrent() || busy || actionStamp!==actionRevision || stamp!==selection || task?.id!==id || latest.version<task.version) return false;
+    if (!isCurrent() || busy || !sessionGate.current(epoch) || actionStamp!==actionRevision || stamp!==selection || task?.id!==id || latest.version<task.version) return false;
     const changed=latest.version!==task.version;
     task=latest;
     if (needsReconcile) {
@@ -109,23 +133,27 @@ const observer=createObserver({
 });
 bindWorkspaceLock({
   openButton:$('lock-workspace'),dialog:$('lock-dialog'),confirmButton:$('lock-confirm'),cancelButton:$('lock-cancel'),
-  status:$('access-status'),send:body=>api('/api/session/lock',body),
+  status:$('access-status'),send:body=>api('/api/session/lock',body),focusTarget:$('access-file'),
   onLocalLock() {
-    lease=undefined;observer.stop();clearTimeout(listTimer);
+    concealLocalSession();
     explicitLock='waiting';
     setConnection({phase:'locked'});
   },
   onOutcome(outcome) {
+    if(!sessionGate.outcomeCurrent(lockEpoch)){
+      if(!sessionGate.locked())$('access-status').textContent='';
+      return;
+    }
     explicitLock=outcome;
     setConnection({phase:'locked'});
   },
 });
-$('reconnect').onclick=()=>{ if (task) observer.start(task.id); };
+$('reconnect').onclick=()=>{ if (task&&!sessionGate.locked()) observer.start(task.id); };
 
 async function refreshList() {
-  const stamp=++listRevision;
+  const epoch=sessionGate.epoch(), stamp=++listRevision;
   const [all,alerts]=await Promise.all([api('/api/tasks'),api('/api/attention')]);
-  if(stamp!==listRevision)return;
+  if(stamp!==listRevision||!sessionGate.current(epoch))return;
   const activeElement=document.activeElement;
   const focusedId=activeElement?.dataset?.taskId,focusedList=activeElement?.dataset?.taskList;
   for(const [list,items] of [['tasks',all.tasks],['attention',alerts.tasks]]) {
@@ -148,10 +176,12 @@ async function refreshList() {
 function watchList() {
   clearTimeout(listTimer);
   listTimer=setTimeout(async()=>{
+    const epoch=sessionGate.epoch();
     try {await refreshList();}
     catch(error) {
+      if(!sessionGate.current(epoch))return;
       if(error.status===401){
-        observer.stop();lease=undefined;needsReconcile=true;
+        needsReconcile=true;
         if(!explicitLock){
           setConnection({phase:'locked'});
           $('access-status').textContent='Unlock to resume the workspace.';
@@ -159,7 +189,7 @@ function watchList() {
         return;
       }
     }
-    if(!$('workspace').hidden)watchList();
+    if(sessionGate.current(epoch)&&!$('workspace').hidden)watchList();
   },5000);
 }
 function showRoute() {
@@ -199,11 +229,13 @@ function populateRoutes(inventory,preferred) {
   showRoute();
 }
 async function openTask(id,{chooseRoute=false}={}) {
+  if(sessionGate.locked())return;
+  const epoch=sessionGate.epoch();
   releaseView();
   observer.stop();
   const stamp=++selection;
   const [record, inventory]=await Promise.all([api('/api/tasks/'+id),api('/api/models')]);
-  if (stamp!==selection) return;
+  if (stamp!==selection||!sessionGate.current(epoch)) return;
   task=record;
   remember(id);
   connection='connected';
@@ -422,7 +454,10 @@ $('terminal-detach').onclick=()=>act(async()=>{
   task=await api(path());
   render();
 });
-$('terminal-attach').onclick=()=>{detached=false;render();$('terminal-detach').focus({preventScroll:true});};
+$('terminal-attach').onclick=()=>{
+  if(sessionGate.locked()||connection!=='connected')return;
+  detached=false;render();$('terminal-detach').focus({preventScroll:true});
+};
 function render() {
   const attempt=task.attempts.at(-1);
   $('task-title').textContent=task.title;
@@ -462,11 +497,13 @@ function render() {
   }
   renderUsage();
   $('events').replaceChildren(...task.events.map(event=>element('li',new Date(event.at).toLocaleString()+' · '+event.event.replaceAll('.',' / ').replaceAll('_',' '))));
-  for (const id of ['run-button','terminal-take','terminal-release','terminal-status','terminal-stop','edit','edit-proposal','reject','copy-task']) {
-    $(id).disabled=connection!=='connected'||needsReconcile;
+  const actionsBlocked=connection!=='connected'||needsReconcile||sessionGate.locked();
+  for (const id of ['run-button','terminal-take','terminal-release','terminal-status','terminal-stop','terminal-detach','terminal-attach','edit','edit-proposal','reject','copy-task','download','download-patch','refresh-routes','export','remove-task']) {
+    $(id).disabled=actionsBlocked;
   }
-  cancel.disabled=connection!=='connected'||needsReconcile;
-  $('accept').disabled=connection!=='connected'||needsReconcile||!attempt?.checks||attempt.checks.some(check=>!check.pass);
+  $('new-task').disabled=actionsBlocked||busy;
+  cancel.disabled=actionsBlocked;
+  $('accept').disabled=actionsBlocked||!attempt?.checks||attempt.checks.some(check=>!check.pass);
 }
 function download(name,content,type='text/plain') {
   const url=URL.createObjectURL(new Blob([content],{type}));
@@ -477,7 +514,7 @@ function download(name,content,type='text/plain') {
   setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 $('new-task').onclick=()=>{
-  if (busy) return;
+  if (busy||sessionGate.locked()||connection!=='connected') return;
   releaseView();
   selection++;
   task=undefined;
@@ -492,6 +529,7 @@ $('new-task').onclick=()=>{
 };
 field('kind').onchange=()=>{$('change-fields').hidden=field('kind').value!=='change';};
 $('edit').onclick=()=>{
+  if(sessionGate.locked()||connection!=='connected')return;
   editing={id:task.id,version:task.version};
   for (const name of ['title','kind','request','source','filename','expected']) field(name).value=task[name]??'';
   field('kind').onchange();
@@ -551,8 +589,14 @@ bindProposalEditor({openButton:$('edit-proposal'),dialog:$('proposal-dialog'),fo
     if(task?.id===id && result.version>=task.version) {task=result;render();note('Edited proposal saved for review.');}
     void refreshList().catch(()=>note('Edited proposal saved, but the task list could not be refreshed.'));
   }});
-$('download').onclick=()=>download(task.kind==='change'?'proposed-'+task.filename:'brief.md',task.attempts.at(-1).artifact.content);
-$('download-patch').onclick=()=>download('proposal.patch',task.attempts.at(-1).artifact.patch);
+$('download').onclick=()=>{
+  if(sessionGate.locked()||connection!=='connected')return;
+  download(task.kind==='change'?'proposed-'+task.filename:'brief.md',task.attempts.at(-1).artifact.content);
+};
+$('download-patch').onclick=()=>{
+  if(sessionGate.locked()||connection!=='connected')return;
+  download('proposal.patch',task.attempts.at(-1).artifact.patch);
+};
 bindDraftCopyDialog({openButton:$('copy-task'),dialog:$('copy-dialog'),target:$('copy-target'),status:$('copy-status'),
   copyButton:$('copy-submit'),checkButton:$('copy-check'),retryButton:$('copy-retry'),closeButton:$('copy-close'),current:()=>task,
   submit:(id,body)=>api('/api/tasks/'+id+'/copy-draft',body),
@@ -568,6 +612,7 @@ bindRemovalDialog({openButton:$('remove-task'),dialog:$('removal-dialog'),target
   status:$('removal-status'),confirmation:$('removal-confirmation'),removeButton:$('removal-submit'),closeButton:$('removal-close'),
   currentTaskId:()=>task?.id,load:id=>api('/api/tasks/'+id+'/removal-preview'),
   remove:(id,body)=>api('/api/tasks/'+id+'/remove',body),onRemoved:id=>{
+    if(sessionGate.locked())return;
     if(task?.id===id) {
       observer.stop();lease=undefined;task=undefined;editing=undefined;remember(null);selection++;
       form.reset();
@@ -583,17 +628,31 @@ bindRemovalDialog({openButton:$('remove-task'),dialog:$('removal-dialog'),target
 async function enter() {
   explicitLock=null;
   $('access-status').textContent='';
-  connection='connected';
-  $('connection').hidden=true;
-  $('lock-workspace').hidden=false;
-  await refreshList();
-  $('unlock').hidden=true;
-  $('workspace').hidden=false;
-  watchList();
-  const id=task?.id??remembered();
-  if (id) {
-    try { await openTask(id); }
-    catch(error) { if (error.status===404) remember(null); else throw error; }
+  $('lock-workspace').hidden=true;
+  const epoch=sessionGate.unlock();
+  try {
+    await refreshList();
+    if(!sessionGate.current(epoch))return;
+    connection='connected';
+    $('connection').hidden=true;
+    $('unlock').hidden=true;
+    $('workspace').hidden=false;
+    $('lock-workspace').hidden=false;
+    watchList();
+    const id=task?.id??remembered();
+    if (id) {
+      try { await openTask(id); }
+      catch(error) {
+        if (error.status===404) remember(null);
+        else if(!sessionGate.current(epoch))return;
+        else throw error;
+      }
+    }
+  } catch(error) {
+    if(!sessionGate.current(epoch))return;
+    concealLocalSession();
+    $('lock-workspace').hidden=true;
+    throw error;
   }
 }
 $('access-file').onchange=async()=>{

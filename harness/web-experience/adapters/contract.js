@@ -62,3 +62,10 @@ export function classifyError(error) {
   if (error?.status && error.status < 500) return {kind: 'rejected', message: error.message};
   return {kind: 'unknown', message: 'The outcome could not be confirmed. Checking saved state. Nothing is sent again automatically.'};
 }
+
+// Confirmed only when the workspace says this view's lock revoked the session.
+// A 401 means it had already ended. Any other result stays unconfirmed.
+export function classifyLockOutcome(result, error) {
+  if (error) return classifyError(error).kind === 'locked' ? 'already' : 'unconfirmed';
+  return result?.locked === true ? 'confirmed' : 'unconfirmed';
+}

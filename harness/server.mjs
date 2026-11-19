@@ -50,9 +50,19 @@ if (database !== ':memory:') {
 if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
 let session=randomBytes(32).toString('hex');
 // Workspace inactivity deadline. This is not the 15-second terminal control lease.
+// Either clock moving backward ends the session. It does not extend the deadline.
 const sessionIdleMs=15*60*1000;
-const sessionNow = () => Date.now();
-let sessionActivityAt=sessionNow();
+const sessionMonotonic = () => performance.now();
+const sessionWall = () => Date.now();
+let sessionSeenMono, sessionSeenWall, sessionActivityMono, sessionActivityWall;
+function sessionClock() {
+  const mono=sessionMonotonic(), wall=sessionWall();
+  const finite=Number.isFinite(mono)&&Number.isFinite(wall);
+  const forward=finite&&(sessionSeenMono===undefined||mono>=sessionSeenMono)&&(sessionSeenWall===undefined||wall>=sessionSeenWall);
+  if(finite){sessionSeenMono=mono;sessionSeenWall=wall;}
+  else {sessionSeenMono=undefined;sessionSeenWall=undefined;}
+  return forward?{mono,wall}:null;
+}
 const removalSecret=randomBytes(32);
 function equal(candidate, expected) {
   return typeof candidate==='string' && /^[a-f0-9]{64}$/.test(candidate) &&
@@ -73,16 +83,35 @@ const now = () => new Date().toISOString();
 const hash = value => createHash('sha256').update(value).digest('hex');
 const providers = {fixture, ollama, opencode};
 let active;
-function sessionIdle(at=sessionNow()) {
-  return at-sessionActivityAt>=sessionIdleMs;
+function sessionIdle() {
+  const clock=sessionClock();
+  if(!clock||!Number.isFinite(sessionActivityMono)||!Number.isFinite(sessionActivityWall))return true;
+  return clock.mono-sessionActivityMono>=sessionIdleMs||clock.wall-sessionActivityWall>=sessionIdleMs;
 }
-function noteSessionActivity(at=sessionNow()) {
-  sessionActivityAt=at;
+function noteSessionActivity() {
+  const clock=sessionClock();
+  if(!clock){
+    sessionActivityMono=undefined;
+    sessionActivityWall=undefined;
+    endWorkspaceSession();
+    fail(401,'Unlock this workspace with its local access.key file.');
+  }
+  sessionActivityMono=clock.mono;
+  sessionActivityWall=clock.wall;
 }
-function endWorkspaceSession(at=sessionNow()) {
+function endWorkspaceSession() {
   session=randomBytes(32).toString('hex');
-  sessionActivityAt=at;
+  sessionSeenMono=undefined;
+  sessionSeenWall=undefined;
+  const clock=sessionClock();
+  sessionActivityMono=clock?clock.mono:undefined;
+  sessionActivityWall=clock?clock.wall:undefined;
   active?.control.revoke();
+}
+{
+  const clock=sessionClock();
+  sessionActivityMono=clock?clock.mono:undefined;
+  sessionActivityWall=clock?clock.wall:undefined;
 }
 
 function save(task, event) {
@@ -286,7 +315,11 @@ const server=http.createServer(async (req,res) => {
       const data=await jsonBody(req);
       // Lock or the idle deadline may have happened while an authenticated body was still arriving.
       requireSession();
-      if(!(/^\/api\/tasks\/[a-f0-9-]{36}\/terminal$/.test(path)&&data.command==='heartbeat'))noteSessionActivity();
+      // Heartbeat renews only the 15-second terminal lease. Detach and cost presentation
+      // are automatic teardown or read-only presentation, so they do not move this deadline.
+      const passiveSessionRequest=path==='/api/cost-presentation'||
+        (/^\/api\/tasks\/[a-f0-9-]{36}\/terminal$/.test(path)&&(data.command==='heartbeat'||data.command==='detach'));
+      if(!passiveSessionRequest)noteSessionActivity();
       return data;
     };
     if(path==='/api/session/lock') {
