@@ -89,32 +89,7 @@ To allow safe iteration and verification of the user experience without exposing
 
 ## 4. Next Bounded Workwave Plan
 
-The next bounded workwave consists of three sequential, test-driven milestones, concluding with the safety gate:
-
-```
-+-------------------------------------------------------------+
-| Milestone 1: Runner Core Fixes & Verifier Hardening         |
-| (Offline research tree: Windows Stop, recovery, verifier)   |
-+-------------------------------------------------------------+
-                              |
-                              v
-+-------------------------------------------------------------+
-| Milestone 2: Inert Synthetic Staging Adapter & Harness Gate |
-| (Off-by-default flag, synthetic multi-file runner adapter)  |
-+-------------------------------------------------------------+
-                              |
-                              v
-+-------------------------------------------------------------+
-| Milestone 3: End-to-End Browser Staging Rehearsal           |
-| (Approval -> Observation -> Reattach -> Review -> v2 Receipt)|
-+-------------------------------------------------------------+
-                              |
-                              v
-+=============================================================+
-| GATE: Independent Safety Review & Prerequisite Check        |
-| (Required before any live runner is wired to the browser)   |
-+=============================================================+
-```
+The remaining wave starts in the research worktree. After the runner fixes and tests, record the independent safety review. Browser staging begins only if that review and the lifecycle and verifier evidence pass. The first browser rehearsal uses the inert fixture. Any later connection to the actual worker also requires proof for that worker path.
 
 ### Milestone 1: Runner Core Fixes and Verifier Hardening (Offline)
 - Scope: Work exclusively in `research/isolated-runner-20261118/` and new test suites.
@@ -149,7 +124,7 @@ The next bounded workwave consists of three sequential, test-driven milestones, 
 Each milestone has clear, unambiguous completion criteria:
 
 1. Milestone 1 Completion Criteria:
-   - [ ] Windows Stop test terminates worker process tree and child processes within 2000ms.
+   - [ ] Windows Stop test terminates worker process tree and child processes within the test’s documented deadline.
    - [ ] Injected candidate attempting to write to verifier stdout/stderr fails and is recorded as a failed check.
    - [ ] Controller restart leaves active claim in an explicit unresolved recovery hold.
    - [ ] Verified candidate tree hash strictly matches the base plus unified patch hash.

@@ -1,9 +1,9 @@
 # Isolated runner regression plan
 
-Date: 2026-11-18  
-Scope owner: `work/t3-runner-regressions`  
-Owned artifact: this file only  
-Pilot source: `research/isolated-runner-20261118/`  
+Date: 2026-11-18
+Scope owner: `work/t3-runner-regressions`
+Owned artifact: this file only
+Pilot source: `research/isolated-runner-20261118/`
 Roadmap gates: `docs/ROADMAP.md` next gates 1 through 3
 
 This plan turns the November 18 pilot and roadmap findings into a concrete pass or fail matrix. Every case uses benign inert fixtures only: synthetic `limits.py` and `measurement.py`, a disposable `host-marker.txt`, local sleep or echo workers, and recorded JSON claim or result stubs. No live inference, no external targets, no real repositories, and no credential access.
