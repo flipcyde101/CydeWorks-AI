@@ -807,6 +807,7 @@ export function describeProgress(task, attempt, now = Date.now()) {
     ended = null;
   }
 
+  const chars = Number.isSafeInteger(live?.chars) && live.chars >= 0 ? live.chars : null;
   const lastCheck = inspectTime(live?.lastActivity, validNow, 'Last activity');
   if (lastCheck.anomaly) anomalies.push(lastCheck.anomaly);
   let last = lastCheck.time;
@@ -815,8 +816,13 @@ export function describeProgress(task, attempt, now = Date.now()) {
     anomalies.push('Last activity timestamp precedes attempt start time.');
     last = null;
   } else if (dispatched !== null && last !== null && last < dispatched) {
-    anomalies.push('Last activity timestamp precedes dispatch time.');
-    last = null;
+    // The host initially records claim activity, before dispatch and before any output.
+    // Once dispatch is recorded, it is the more recent known activity in that case.
+    if (chars === 0) last = dispatched;
+    else {
+      anomalies.push('Last activity timestamp precedes dispatch time.');
+      last = null;
+    }
   } else if (recordedEnded !== null && last !== null && last > recordedEnded) {
     anomalies.push('Last activity timestamp occurs after completion time.');
     lastAfterEnded = true;
@@ -827,7 +833,6 @@ export function describeProgress(task, attempt, now = Date.now()) {
   if (heartbeatCheck.anomaly) anomalies.push(heartbeatCheck.anomaly);
   const heartbeat = heartbeatCheck.time;
 
-  const chars = Number.isSafeInteger(live?.chars) && live.chars >= 0 ? live.chars : null;
   const outputIdle = validNow !== null && last !== null ? validNow - last : null;
   const heartbeatAgeMs = validNow !== null && heartbeat !== null ? validNow - heartbeat : null;
 
@@ -1298,6 +1303,15 @@ export function describeProgress(task, attempt, now = Date.now()) {
 /**
  * Format an accessible live-region announcement matching `describeProgress` state.
  */
+function safeRemainingAnnouncement(value) {
+  if (typeof value !== 'string' || value.length > 100) return null;
+  const match = /^(\d{1,16}) of (\d{1,16}) (current-step )?([a-z-]+) remaining\.$/.exec(value);
+  if (!match || !ALLOWED_MEASURED_UNITS.has(match[4])) return null;
+  const remaining = Number(match[1]), total = Number(match[2]);
+  if (!Number.isSafeInteger(remaining) || !Number.isSafeInteger(total) || remaining > total) return null;
+  return value;
+}
+
 export function progressAnnouncement(task, progress, connection) {
   if (connection !== 'connected') return 'Connection interrupted. The saved task state may be stale.';
   if (!task) return '';
@@ -1306,8 +1320,9 @@ export function progressAnnouncement(task, progress, connection) {
   if (hasProgress) {
     if (progress.failed === true || progress.phase === 'failed') {
       if (progress.status === 'Incomplete termination') {
-        return progress.remaining
-          ? `Incomplete termination. ${progress.remaining}`
+        const remaining = safeRemainingAnnouncement(progress.remaining);
+        return remaining
+          ? `Incomplete termination. ${remaining}`
           : 'Incomplete termination. Completion was reported before all measured work finished.';
       }
       return 'Attempt failed. Review the problem and recovery status.';
@@ -1321,6 +1336,10 @@ export function progressAnnouncement(task, progress, connection) {
     if (progress.phase === 'cancelled') {
       return 'Cancellation recorded. Review recovery status.';
     }
+    if ((task.status === 'review' || task.status === 'complete' || task.status === 'completed') &&
+        (progress.clockAnomaly === true || progress.stepSamplesValid === false)) {
+      return 'Progress could not be verified. Review the recorded status.';
+    }
     if (progress.complete === false && (
       task.status === 'complete'
       || task.status === 'completed'
@@ -1328,8 +1347,7 @@ export function progressAnnouncement(task, progress, connection) {
       || task.status === 'accepted'
       || task.status === 'rejected'
     )) {
-      const detail = progress.remaining ?? progress.explanation ?? 'Completion could not be verified.';
-      return progress.status ? `${progress.status}. ${detail}` : detail;
+      return 'Completion is not confirmed. Review measured work and recovery status.';
     }
   } else if (
     task.status === 'complete'
@@ -1375,7 +1393,12 @@ export function progressAnnouncement(task, progress, connection) {
     }
   }
 
-  if (task.status === 'running') return progress?.status ?? 'Waiting for run state';
+  if (task.status === 'running') {
+    if (progress?.phase === 'stalled') return 'Progress may be stalled. Review the latest activity.';
+    if (progress?.phase === 'stopping') return 'Stop requested. Waiting for confirmation.';
+    if (progress?.phase === 'active') return 'Attempt is running.';
+    return 'Waiting for progress.';
+  }
   if (task.status === 'complete' || task.status === 'completed') return 'Attempt complete.';
   if (task.status === 'review') return 'Proposal ready for review.';
   if (task.status === 'interrupted' && task.attempts?.at(-1)?.recovery?.state === 'retry-safe') {

@@ -1,7 +1,7 @@
 import {createObserver} from './observer.js';
 import {bindExportDialog} from './export-dialog.js';
 import {summarizeUsage,describeStepReceipt} from './usage.js';
-import {describeProgress,progressAnnouncement} from './progress.js';
+import {progressUiState} from './progress-ui.js';
 import {bindRemovalDialog} from './removal-dialog.js';
 import {diagnosticMessages} from './route-diagnostics.js';
 import {bindProposalEditor} from './proposal-editor.js';
@@ -204,13 +204,13 @@ async function openTask(id,{chooseRoute=false}={}) {
 
 function renderProgress(attempt) {
   const box=$('progress');
-  const progress=active(task.status)&&connection==='connected'?describeProgress(task,attempt):null;
-  const announcement=progressAnnouncement(task,progress,connection);
+  const progressConnection=needsReconcile&&connection==='connected'?'checking':connection;
+  const {view:presentation,announcement}=progressUiState(task,Date.now(),progressConnection);
   if ($('progress-announcement').textContent!==announcement) $('progress-announcement').textContent=announcement;
   box.hidden=!attempt;
   box.replaceChildren();
   if (box.hidden) return;
-  if (connection!=='connected') {
+  if (progressConnection!=='connected') {
     box.append(element('p','The saved task state may be stale while the workspace is disconnected.'));
     return;
   }
@@ -228,15 +228,13 @@ function renderProgress(attempt) {
     return;
   }
   box.append(element('h2',attempt?.provider==='fixture'?'Synthetic fixture request':'Local model request'));
-  box.append(element('p',progress.explanation));
+  if (!presentation) {
+    box.append(element('p','Progress is unavailable.'));
+    return;
+  }
+  box.append(element('p',presentation.explanation));
   const dl=element('dl');
-  definition(dl,[['Status',progress.status],['Current step',progress.status],
-    ['Completed','Scope approved'],['Remaining',progress.remaining],
-    ['Elapsed',seconds(progress.elapsedMs)],['Output',progress.chars===null?null:progress.chars+' characters; total unknown'],
-    ['Rate',progress.rate===null?null:progress.rate.toFixed(1)+' characters/s since dispatch'],
-    ['Workspace heartbeat',progress.heartbeat===null?null:new Date(progress.heartbeat).toLocaleTimeString()],
-    ['Last activity recorded',progress.lastActivity===null?null:new Date(progress.lastActivity).toLocaleTimeString()],
-    ['Current step ETA',progress.eta],['Projected local completion',progress.completion]]);
+  definition(dl,presentation.pairs);
   box.append(dl);
   // Keep the control stable while polling so keyboard focus is retained.
 }
@@ -445,7 +443,7 @@ function render() {
   for (const id of ['run-button','terminal-take','terminal-release','terminal-status','terminal-stop','edit','edit-proposal','reject','copy-task']) {
     $(id).disabled=connection!=='connected'||needsReconcile;
   }
-  cancel.disabled=connection!=='connected'||needsReconcile;
+  cancel.disabled=connection!=='connected'||needsReconcile||task.live?.stopping===true;
   $('accept').disabled=connection!=='connected'||needsReconcile||!attempt?.checks||attempt.checks.some(check=>!check.pass);
 }
 function download(name,content,type='text/plain') {
