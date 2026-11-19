@@ -170,6 +170,38 @@ function assertNoKeyLeak(value) {
   assert.equal(text.includes(OTHER_KEY.toString('utf8')), false);
 }
 
+test('controller owns an independent key snapshot and rejects shared memory', () => {
+  withScratch(ctx => {
+    const backing = Buffer.alloc(SYNTHETIC_KEY.length + 8);
+    SYNTHETIC_KEY.copy(backing, 4);
+    const inputKey = backing.subarray(4, 4 + SYNTHETIC_KEY.length);
+    const controller = createVerifiedPatchController({
+      attestationKey: inputKey,
+      expectedInvocationNonce: SYNTHETIC_NONCE,
+      claimRecord: ctx.claim,
+    });
+    backing.fill(0);
+    const candDigests = computeSortedFileDigests(CANDIDATE_FILES);
+    const built = buildCandidatePatch({
+      baseRepoDir: ctx.baseRepoDir, baseRevision: ctx.baseRevision,
+      candidateFiles: CANDIDATE_FILES, scratchRoot: ctx.helperScratch,
+    });
+    const options = {controller, patch: built.patch, candidateFiles: CANDIDATE_FILES};
+    const replacement = makeEvidence(ctx.claim, candDigests, ctx.baseDigests, {}, {key: inputKey});
+    assert.throws(() => bindPatch(ctx, replacement, options), /HMAC verification failed/);
+    const original = makeEvidence(ctx.claim, candDigests, ctx.baseDigests);
+    assert.equal(bindPatch(ctx, original, options).status, 'verified-patch');
+
+    const shared = new Uint8Array(new SharedArrayBuffer(SYNTHETIC_KEY.length));
+    shared.set(SYNTHETIC_KEY);
+    assert.throws(() => createVerifiedPatchController({
+      attestationKey: shared,
+      expectedInvocationNonce: SYNTHETIC_NONCE,
+      claimRecord: ctx.claim,
+    }), /Host attestation key is invalid/);
+  });
+});
+
 test('reproduces exact checked bytes from host-authenticated evidence without mutating the base repo', () => {
   assert.equal(FIXED_CASES_DIGEST, PYTHON_CASES_DIGEST);
   const a = computeSortedFileDigests({'limits.py': CANDIDATE_FILES['limits.py'], 'measurement.py': CANDIDATE_FILES['measurement.py']});
