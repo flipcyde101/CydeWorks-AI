@@ -422,6 +422,310 @@ test('settlement rejects oversized SSE lines and marks mixed settled plus unknow
   assert.equal(snap.records[0].state,'settled');
   assert.deepEqual(snap.records[0].finishReasons,['length']);
   assert.equal(snap.records[1].state,'unknown');
-  assert.equal(snap.records[1].evidence,'response-truncated');
+  assert.equal(snap.records[1].evidence,'observation-limit-exceeded');
+});
+
+test('settlement validates per-choice terminal evidence for JSON and SSE including missing, duplicate, and contradictory cases',async t=>{
+  const target=await backend(t,(req,res)=>{
+    let raw='';
+    req.on('data',chunk=>{raw+=chunk;});
+    req.on('end',()=>{
+      const {scenario}=JSON.parse(raw);
+      if(scenario==='json-n2-ok') {
+        res.writeHead(200,{'content-type':'application/json'});
+        res.end(JSON.stringify({id:'c1',object:'chat.completion',choices:[
+          {index:1,message:{role:'assistant',content:'b'},finish_reason:'length'},
+          {index:0,message:{role:'assistant',content:'a'},finish_reason:'stop'},
+        ]}));
+        return;
+      }
+      if(scenario==='json-n2-missing-choice') {
+        res.writeHead(200,{'content-type':'application/json'});
+        res.end(JSON.stringify({id:'c2',object:'chat.completion',choices:[
+          {index:0,message:{role:'assistant',content:'a'},finish_reason:'stop'},
+        ]}));
+        return;
+      }
+      if(scenario==='json-n2-duplicate-index') {
+        res.writeHead(200,{'content-type':'application/json'});
+        res.end(JSON.stringify({id:'c3',object:'chat.completion',choices:[
+          {index:0,finish_reason:'stop'},
+          {index:0,finish_reason:'stop'},
+        ]}));
+        return;
+      }
+      if(scenario==='json-n1-extra-choice') {
+        res.writeHead(200,{'content-type':'application/json'});
+        res.end(JSON.stringify({id:'c4',object:'chat.completion',choices:[
+          {index:0,finish_reason:'stop'},
+          {index:1,finish_reason:'stop'},
+        ]}));
+        return;
+      }
+      if(scenario==='sse-n2-ok') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"id":"s1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}\n\n');
+        res.write('data: {"id":"s1","object":"chat.completion.chunk","choices":[{"index":1,"delta":{"content":"b"},"finish_reason":null}]}\n\n');
+        res.write('data: {"id":"s1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"id":"s1","object":"chat.completion.chunk","choices":[{"index":1,"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+        res.write('data: {"id":"s1","object":"chat.completion.chunk","choices":[],"usage":{"total_tokens":5}}\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+      if(scenario==='sse-n2-choice1-unfinished') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"choices":[{"index":1,"delta":{"content":"unfinished"},"finish_reason":null}]}\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+      if(scenario==='sse-n2-duplicate-finish') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"choices":[{"index":1,"finish_reason":"stop"}]}\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+      if(scenario==='sse-n1-delta-after-finish') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"extra"},"finish_reason":null}]}\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+      res.writeHead(200,{'content-type':'application/json'});
+      res.end(JSON.stringify({choices:[{index:0,finish_reason:'stop'}]}));
+    });
+  });
+
+  const postScenario=async(payload)=>{
+    const broker=await createInferenceBroker(target,{model:'synthetic-model'});
+    t.after(()=>broker.close());
+    const r=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+      body:JSON.stringify({model:'synthetic-model',...payload}),
+      headers:{'x-cydeworks-local':broker.token}});
+    assert.equal(r.status,200);
+    await r.text();
+    return broker.settlement();
+  };
+
+  const jsonOk=await postScenario({n:2,scenario:'json-n2-ok'});
+  assert.equal(jsonOk.state,'settled');
+  assert.deepEqual(jsonOk.records[0].finishReasons,['stop','length']);
+
+  for(const [payload,label] of [
+    [{n:2,scenario:'json-n2-missing-choice'},'json-n2-missing-choice'],
+    [{n:2,scenario:'json-n2-duplicate-index'},'json-n2-duplicate-index'],
+    [{n:1,scenario:'json-n1-extra-choice'},'json-n1-extra-choice'],
+    [{n:2,scenario:'sse-n2-choice1-unfinished'},'sse-n2-choice1-unfinished'],
+    [{n:2,scenario:'sse-n2-duplicate-finish'},'sse-n2-duplicate-finish'],
+    [{n:1,scenario:'sse-n1-delta-after-finish'},'sse-n1-delta-after-finish'],
+    [{n:0,scenario:'json-n1-ok'},'invalid-n-zero'],
+  ]) {
+    const snap=await postScenario(payload);
+    assert.equal(snap.state,'unknown',label);
+    assert.equal(snap.records[0].evidence,'ambiguous-response',label);
+  }
+
+  const sseOk=await postScenario({n:2,scenario:'sse-n2-ok'});
+  assert.equal(sseOk.state,'settled');
+  assert.deepEqual(sseOk.records[0].finishReasons,['stop','tool_calls']);
+});
+
+test('SSE parser handles CR, LF, and split CRLF across chunks and rejects errors after [DONE]',async t=>{
+  let mode='cr-ok';
+  const target=await backend(t,(_req,res)=>{
+    res.writeHead(200,{'content-type':'text/event-stream'});
+    if(mode==='cr-ok') {
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}\r\r');
+      res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\r');
+      res.write('\n\r');
+      res.write('\ndata: [DONE]\r');
+      res.end('\n\r\n');
+      return;
+    }
+    if(mode==='comment-cr-error-after-done') {
+      res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+      res.write('data: [DONE]\n\n');
+      res.end(': comment\revent: error\rdata: {"error":"late"}\r\r');
+      return;
+    }
+    res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+    res.write('data: [DONE]\n\n');
+    res.end('data: {"error":"late-json"}\n\n');
+  });
+
+  const broker=await createInferenceBroker(target,{model:'synthetic-model'});
+  t.after(()=>broker.close());
+
+  const okResp=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+    body:JSON.stringify({model:'synthetic-model'}),
+    headers:{'x-cydeworks-local':broker.token}});
+  await okResp.text();
+  assert.equal(broker.settlement().state,'settled');
+
+  mode='comment-cr-error-after-done';
+  const lateErr1=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+    body:JSON.stringify({model:'synthetic-model'}),
+    headers:{'x-cydeworks-local':broker.token}});
+  await lateErr1.text();
+  let snap=broker.settlement();
+  assert.equal(snap.state,'unknown');
+  assert.equal(snap.records[1].evidence,'upstream-error');
+
+  mode='data-error-after-done';
+  const lateErr2=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+    body:JSON.stringify({model:'synthetic-model'}),
+    headers:{'x-cydeworks-local':broker.token}});
+  await lateErr2.text();
+  snap=broker.settlement();
+  assert.equal(snap.state,'unknown');
+  assert.equal(snap.records[2].evidence,'upstream-error');
+});
+
+test('concurrent observation memory and active entry limits keep outcomes unknown without truncating forwarded replies',async t=>{
+  const padding='p'.repeat(1600000);
+  const largePayload=JSON.stringify({choices:[{index:0,message:{role:'assistant',content:padding},finish_reason:'stop'}]});
+  const pending=[];
+  const pendingLarge=[];
+  const target=await backend(t,(req,res)=>{
+    let body='';
+    req.on('data',chunk=>{body+=chunk;});
+    req.on('end',()=>{
+      const {hold}=JSON.parse(body);
+      res.writeHead(200,{'content-type':'application/json'});
+      if(hold) {
+        pending.push(()=>res.end(JSON.stringify({choices:[{index:0,finish_reason:'stop'}]})));
+        return;
+      }
+      res.write(largePayload.slice(0,1500000));
+      pendingLarge.push(()=>res.end(largePayload.slice(1500000)));
+    });
+  });
+
+  const broker=await createInferenceBroker(target,{model:'synthetic-model'});
+  t.after(()=>broker.close());
+
+  const largeFetches=[0,1,2].map(async()=>{
+    const r=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+      body:JSON.stringify({model:'synthetic-model',hold:false}),
+      headers:{'x-cydeworks-local':broker.token}});
+    assert.equal(r.status,200);
+    const json=await r.json();
+    assert.equal(json.choices[0].message.content.length,padding.length);
+    return json;
+  });
+  while(pendingLarge.length<3)await new Promise(resolve=>setTimeout(resolve,5));
+  await new Promise(resolve=>setTimeout(resolve,20));
+  for(const finish of pendingLarge)finish();
+  const concurrent=await Promise.all(largeFetches);
+  assert.equal(concurrent.length,3);
+  const memSnap=broker.settlement();
+  assert.equal(memSnap.state,'unknown');
+  assert.equal(memSnap.observationBytes,0);
+  assert.ok(memSnap.unknown>=1);
+  assert.ok(memSnap.records.some(r=>r.evidence==='observation-limit-exceeded'));
+
+  const overflowBroker=await createInferenceBroker(target,{model:'synthetic-model'});
+  t.after(()=>overflowBroker.close());
+  const inflightFetches=Array.from({length:66},()=>fetch(overflowBroker.endpoint+'/v1/chat/completions',{
+    method:'POST',
+    body:JSON.stringify({model:'synthetic-model',hold:true}),
+    headers:{'x-cydeworks-local':overflowBroker.token},
+  }).then(async r=>{assert.equal(r.status,200);return r.json();}));
+  while(pending.length<66)await new Promise(resolve=>setTimeout(resolve,5));
+  const mid=overflowBroker.settlement();
+  assert.equal(mid.state,'unknown');
+  assert.equal(mid.inFlight,66);
+  for(const finish of pending)finish();
+  const bodies=await Promise.all(inflightFetches);
+  assert.equal(bodies.length,66);
+  const end=overflowBroker.settlement();
+  assert.equal(end.state,'unknown');
+  assert.equal(end.dispatched,66);
+  assert.equal(end.inFlight,0);
+  assert.equal(end.unknown,2);
+  assert.equal(end.completed,64);
+  assert.equal(end.recordsTruncated,true);
+});
+
+test('overlapping dispatches and late abort races preserve accurate settlement and zero model cancellation claim',async t=>{
+  let releaseSlow;
+  const slowReleased=new Promise(resolve=>{releaseSlow=resolve;});
+  const target=await backend(t,(req,res)=>{
+    let body='';
+    req.on('data',chunk=>{body+=chunk;});
+    req.on('end',()=>{
+      const {kind}=JSON.parse(body);
+      if(kind==='slow-sse') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"wait"},"finish_reason":null}]}\n\n');
+        slowReleased.then(()=>{
+          if(!res.destroyed&&!res.writableEnded) {
+            res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+            res.end('data: [DONE]\n\n');
+          }
+        });
+        return;
+      }
+      if(kind==='fast-json') {
+        res.writeHead(200,{'content-type':'application/json'});
+        res.end(JSON.stringify({choices:[{index:0,finish_reason:'stop'}]}));
+        return;
+      }
+      res.writeHead(200,{'content-type':'text/event-stream'});
+      res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+    });
+  });
+
+  const broker=await createInferenceBroker(target,{model:'synthetic-model'});
+  t.after(()=>broker.close());
+
+  const slowResp=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+    body:JSON.stringify({model:'synthetic-model',kind:'slow-sse'}),
+    headers:{'x-cydeworks-local':broker.token}});
+  const slowReader=slowResp.body.getReader();
+  assert.equal((await slowReader.read()).done,false);
+
+  const fastResp=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+    body:JSON.stringify({model:'synthetic-model',kind:'fast-json'}),
+    headers:{'x-cydeworks-local':broker.token}});
+  await fastResp.json();
+
+  const overlapSnap=broker.settlement();
+  assert.equal(overlapSnap.state,'unknown');
+  assert.equal(overlapSnap.evidence,'in-flight');
+  assert.equal(overlapSnap.dispatched,2);
+  assert.equal(overlapSnap.inFlight,1);
+  assert.equal(overlapSnap.completed,1);
+
+  releaseSlow();
+  while(!(await slowReader.read()).done);
+
+  const settledBoth=broker.settlement();
+  assert.equal(settledBoth.state,'settled');
+  assert.equal(settledBoth.inFlight,0);
+  assert.equal(settledBoth.completed,2);
+
+  // Late abort after finish_reason arrived without [DONE], racing with broker.close()
+  const lateAbort=new AbortController();
+  const racingResp=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
+    body:JSON.stringify({model:'synthetic-model',kind:'hang-after-finish'}),
+    headers:{'x-cydeworks-local':broker.token},signal:lateAbort.signal});
+  const racingReader=racingResp.body.getReader();
+  assert.equal((await racingReader.read()).done,false);
+  lateAbort.abort();
+  await broker.close();
+  await assert.rejects(()=>racingReader.read());
+
+  const finalSnap=broker.settlement();
+  assert.equal(finalSnap.state,'unknown');
+  assert.equal(finalSnap.dispatched,3);
+  assert.equal(finalSnap.inFlight,0);
+  assert.equal(finalSnap.completed,2);
+  assert.equal(finalSnap.unknown,1);
+  assert.equal(finalSnap.closed,true);
+  assert.equal(finalSnap.modelCancellationVerified,false);
 });
 
