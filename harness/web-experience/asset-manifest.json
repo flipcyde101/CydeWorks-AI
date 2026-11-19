@@ -1,7 +1,7 @@
 [
   {
     "file": "app.js",
-    "sha256": "3a23f92b6a644f1d35cf8b964f490cbbb7bdb6808acbeccc5187421abd98e6b2"
+    "sha256": "c764238b153e78f300825cd6b70fad57e51ef603bf3c1597050da7e55c94f0b7"
   },
   {
     "file": "favicon.svg",
@@ -13,11 +13,11 @@
   },
   {
     "file": "adapters/contract.js",
-    "sha256": "3ec073cf9589039d3abe69b28bcc691e369baf2f63213436b6b1247e65412b16"
+    "sha256": "39e16c1d8cdb22533830e9a992bdde90621ddaaaf6e4b871da2b809d572b7ff6"
   },
   {
     "file": "adapters/http.js",
-    "sha256": "bce3182727cfc380c6eb2e868d1136c7aac6beef83f3634c1a0a2df4bef577ed"
+    "sha256": "e59c08d77e06725500f897f6ee637020a888b2e25a9a9f2773f64708a966bb83"
   },
   {
     "file": "adapters/slots.js",

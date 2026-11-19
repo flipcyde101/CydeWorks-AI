@@ -5,8 +5,8 @@ import {writeFile,readFile,access} from 'node:fs/promises';
 import {join} from 'node:path';
 import {terminalWorkspace} from './test-support/terminal-workspace.mjs';
 import {createTerminalControl} from './terminal-control.mjs';
-import {bindWorkspaceLock,createLegacySessionController,createSessionEpoch,workspaceLockCopy} from './web/workspace-lock.js';
-import {classifyLockOutcome} from './web-experience/adapters/contract.js';
+import {bindWorkspaceLock,createAccessAttempt,createLegacySessionController,createSessionEpoch,createTabAdmission,workspaceLockCopy} from './web/workspace-lock.js';
+import {classifyLockOutcome,createTabAdmission as createExperienceAdmission} from './web-experience/adapters/contract.js';
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(fn) {
@@ -522,8 +522,36 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(enter,/sessionUi\.failRestore\(entered\)/);
   assert.match(enter,/observer\.stop\(\)/);
   assert.match(enter,/clearTimeout\(listTimer\)/);
+  assert.match(app,/admission\.promiseLock\(\)/);
+  assert.match(app,/admission\.admit\(/);
+  assert.match(app,/attempt\.current\(\)/);
+  const access=app.slice(app.indexOf("$('access-file').onchange"),app.indexOf('function holdConcealed'));
+  const postAt=access.indexOf("api('/api/session'");
+  assert.ok(access.indexOf('attempt.current()')>0&&access.indexOf('attempt.current()')<postAt);
+  assert.ok(access.indexOf('attempt.current()',postAt)>postAt);
+  assert.ok(access.indexOf('admission.admit(')>access.indexOf('attempt.current()',postAt));
+  assert.match(app,/X-Workspace-View/);
+  assert.match(app,/if\(!sessionUi\.current\(token\)\)return;/);
+  assert.match(app,/if\(!sessionUi\.current\(actionToken\)\)return;/);
+  assert.match(app,/addEventListener\('storage'/);
+  assert.match(app,/addEventListener\('pageshow'/);
+  assert.match(app,/visibilitychange/);
   assert.match(experience,/classifyLockOutcome\(result\)/);
   assert.match(experience,/state\.sessionEpoch !== epoch \|\| state\.session\.unlocked/);
+  const unlock=experience.slice(experience.indexOf('unlock: file'),experience.indexOf('lock() {'));
+  assert.ok(unlock.indexOf('epoch !== state.sessionEpoch')>=0);
+  assert.ok(unlock.indexOf('epoch !== state.sessionEpoch')<unlock.indexOf('adapter.unlock'));
+  assert.match(experience,/addEventListener\('storage'/);
+  assert.match(experience,/pageshow/);
+  assert.match(experience,/viewStorageKeys\.sharedGeneration/);
+  const http=await readFile(new URL('./web-experience/adapters/http.js',import.meta.url),'utf8');
+  assert.match(http,/X-Workspace-View/);
+  assert.match(http,/mustConceal\(\)/);
+  assert.match(http,/x-view-generation/);
+  const server=await readFile(new URL('./server.mjs',import.meta.url),'utf8');
+  assert.match(server,/admittedViews/);
+  assert.match(server,/sec-fetch-site'\]==='same-origin'/);
+  assert.match(server,/must not\s+rotate the session or expire the cookie/);
 });
 
 test('a backward session clock ends the workspace session',{timeout:15000},async t=>{
@@ -754,7 +782,9 @@ test('Lock closes dialogs and refuses a cached export download',async()=>{
   ui.openDialog(dialog);
   dialog.cached='export-body';
   assert.equal(ui.allowDownload(dialog),true);
-  assert.deepEqual(ui.view.downloads,['export-body']);
+  assert.equal(ui.view.downloads,1);
+  assert.equal(Array.isArray(ui.view.downloads),false);
+  assert.equal(JSON.stringify(ui.view.downloads).includes('export-body'),false);
   ui.beginLock();
   assert.equal(dialog.open,false);
   assert.equal(dialog.inert,true);
@@ -763,7 +793,8 @@ test('Lock closes dialogs and refuses a cached export download',async()=>{
   assert.equal(ui.view.workspaceInert,true);
   assert.equal(ui.view.fields.source,'already shown');
   assert.equal(ui.allowDownload({open:true,inert:false,cached:'export-body'}),false);
-  assert.deepEqual(ui.view.downloads,['export-body']);
+  assert.equal(ui.view.downloads,1);
+  assert.equal(JSON.stringify(ui.view).includes('export-body'),false);
 });
 
 test('a failed restore after the access panel is hidden recovers unlock and drops the late read',async()=>{
@@ -813,4 +844,174 @@ test('a settled result that arrives after Lock is stale',async()=>{
   late.release({id:'task'});
   await assert.rejects(pending,error=>error.stale===true);
   assert.equal(ui.view.uiWrites,0);
+});
+
+function memoryStore() {
+  const data=new Map();
+  return {
+    getItem(key){return data.has(key)?data.get(key):null;},
+    setItem(key,value){data.set(key,String(value));},
+    removeItem(key){data.delete(key);},
+  };
+}
+function headerList(headers, name) {
+  const value=headers[name.toLowerCase()]??headers[name];
+  if(!value) return [];
+  return Array.isArray(value)?value:[value];
+}
+function rawRequest(origin, path, {method='GET', body, headers={}}={}) {
+  const payload=body===undefined?null:JSON.stringify(body);
+  return new Promise((resolve,reject)=>{
+    const req=httpRequest(new URL(origin+path),{method,headers:{
+      Origin:origin,Accept:'application/json',
+      ...(payload?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{}),
+      ...headers,
+    }},res=>{
+      const chunks=[];
+      res.on('data',chunk=>chunks.push(chunk));
+      res.on('end',()=>{
+        const text=Buffer.concat(chunks).toString();
+        let data=null;
+        try { data=text?JSON.parse(text):null; } catch { data=null; }
+        resolve({status:res.statusCode,headers:res.headers,data});
+      });
+    });
+    req.on('error',reject);
+    req.setTimeout(5000,()=>req.destroy(Error('View request timed out')));
+    if(payload) req.write(payload);
+    req.end();
+  });
+}
+function jarCookie(jar) {
+  return Object.entries(jar).map(([key,value])=>key.split('\n')[0]+'='+value).join('; ');
+}
+
+test('an unconfirmed lock survives reload and the other view does not inherit the next unlock',()=>{
+  const viewA='a'.repeat(32), viewB='b'.repeat(32), viewC='c'.repeat(32);
+  const generationA='1'.repeat(32), generationB='2'.repeat(32);
+  for(const create of [createTabAdmission, createExperienceAdmission]) {
+    const shared=memoryStore(), sessionA=memoryStore(), sessionB=memoryStore();
+    const first=create({session:sessionA, shared});
+    const second=create({session:sessionB, shared});
+    assert.equal(first.admit(viewA, generationA), true);
+    assert.equal(second.admit(viewB, generationA), true);
+    assert.equal(first.mayOpenWorkspace(), true);
+    assert.equal(second.mayOpenWorkspace(), true);
+    first.promiseLock();
+    assert.equal(first.localLock(), 'unconfirmed');
+    assert.equal(shared.getItem('bfe-shared-generation'), 'locked');
+    assert.equal(first.mustConceal(), true);
+    assert.equal(second.mustConceal(), true);
+    const reloaded=create({session:sessionA, shared});
+    assert.equal(reloaded.localLock(), 'unconfirmed');
+    assert.equal(reloaded.mayOpenWorkspace(), false);
+    assert.equal(workspaceLockCopy[reloaded.localLock()], workspaceLockCopy.unconfirmed);
+    assert.notEqual(workspaceLockCopy[reloaded.localLock()], workspaceLockCopy.confirmed);
+    assert.equal(first.admit(viewC, generationB), true);
+    assert.equal(first.mayOpenWorkspace(), true);
+    assert.equal(first.viewId(), viewC);
+    assert.equal(second.viewId(), viewB);
+    assert.equal(second.mustConceal(), true);
+    second.markSharedLocked();
+    assert.equal(shared.getItem('bfe-shared-generation'), generationB);
+    assert.equal(first.mayOpenWorkspace(), true);
+    assert.equal(second.localLock(), 'unconfirmed');
+    assert.notEqual(second.viewId(), viewC);
+  }
+});
+
+test('a delayed access-file read does not submit after Lock or a newer selection',async()=>{
+  const gate=createSessionEpoch();
+  gate.conceal();
+  const attempts=createAccessAttempt(gate);
+  const first=attempts.begin();
+  assert.equal(gate.current(first.epoch), false);
+  assert.equal(first.current(), true);
+  let posts=0;
+  const late=deferred();
+  const pending=(async()=>{
+    const key=await late.promise;
+    if(!first.current()) return 'dropped';
+    posts+=1;
+    return key;
+  })();
+  const second=attempts.begin();
+  late.release('access-key');
+  assert.equal(await pending, 'dropped');
+  assert.equal(posts, 0);
+  assert.equal(second.current(), true);
+  const blocked=deferred();
+  const secondRead=(async()=>{
+    const key=await blocked.promise;
+    if(!second.current()) return 'dropped';
+    posts+=1;
+    return key;
+  })();
+  gate.conceal();
+  blocked.release('later-key');
+  assert.equal(await secondRead, 'dropped');
+  assert.equal(posts, 0);
+  assert.equal(second.current(), false);
+  const third=attempts.begin();
+  const arrived=deferred();
+  const inflight=(async()=>{
+    if(!third.current()) return 'dropped-before';
+    posts+=1;
+    const opened=await arrived.promise;
+    if(!third.current()) return 'dropped-after';
+    return opened;
+  })();
+  assert.equal(posts, 1);
+  gate.conceal();
+  arrived.release({viewId:'c'.repeat(32),viewGeneration:'2'.repeat(32)});
+  assert.equal(await inflight, 'dropped-after');
+  assert.equal(third.current(), false);
+});
+
+test('a shared cookie jar does not keep a view that did not unlock again',{timeout:15000},async t=>{
+  const {origin}=await withSessionClock(t);
+  const jar={};
+  async function unlock() {
+    const response=await rawRequest(origin,'/api/session',{method:'POST',body:{key:'a'.repeat(64)}});
+    assert.equal(response.status, 200);
+    assert.equal(response.data.authorized, true);
+    assert.match(response.data.viewId, /^[a-f0-9]{32}$/);
+    assert.match(response.data.viewGeneration, /^[a-f0-9]{32}$/);
+    assert.equal(headerList(response.headers,'x-view-generation')[0], response.data.viewGeneration);
+    for(const header of headerList(response.headers,'set-cookie')) applyCookie(jar, header);
+    return response.data;
+  }
+  async function viewGet(viewId,{site=true}={}) {
+    const headers={Cookie:jarCookie(jar)};
+    if(site) headers['Sec-Fetch-Site']='same-origin';
+    if(viewId) headers['X-Workspace-View']=viewId;
+    return rawRequest(origin,'/api/tasks',{headers});
+  }
+  const first=await unlock();
+  const second=await unlock();
+  assert.equal(first.viewGeneration, second.viewGeneration);
+  assert.notEqual(first.viewId, second.viewId);
+  assert.equal((await viewGet(first.viewId)).status, 200);
+  assert.equal((await viewGet(second.viewId)).status, 200);
+  const locked=await rawRequest(origin,'/api/session/lock',{method:'POST',body:{},headers:{
+    Cookie:jarCookie(jar),'Sec-Fetch-Site':'same-origin','X-Workspace-View':first.viewId,
+  }});
+  assert.equal(locked.status, 200);
+  assert.deepEqual(locked.data,{locked:true,scope:'all-workspace-views',terminalControlReleased:true,stopsWork:false,requiresAccessFile:true});
+  for(const header of headerList(locked.headers,'set-cookie')) applyCookie(jar, header);
+  assert.equal(jar['bfe_session\n/api'], undefined);
+  assert.match(jar['bfe_session\n/api/']??'', /^[a-f0-9]{64}$/);
+  const reauth=await unlock();
+  assert.notEqual(reauth.viewId, first.viewId);
+  assert.notEqual(reauth.viewGeneration, first.viewGeneration);
+  assert.equal(jar['bfe_session\n/api'], jar['bfe_session\n/api/']);
+  const stale=await viewGet(second.viewId);
+  assert.equal(stale.status, 401);
+  assert.equal(headerList(stale.headers,'set-cookie').length, 0);
+  const staleFirst=await viewGet(first.viewId);
+  assert.equal(staleFirst.status, 401);
+  assert.equal(headerList(staleFirst.headers,'set-cookie').length, 0);
+  assert.equal((await viewGet(null)).status, 401);
+  assert.equal((await viewGet(null,{site:false})).status, 200);
+  assert.equal((await viewGet(reauth.viewId)).status, 200);
 });

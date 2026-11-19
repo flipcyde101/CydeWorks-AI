@@ -14,7 +14,7 @@
 // the method must degrade as described). No endpoint is invented here.
 
 export const ADAPTER_METHODS = Object.freeze({
-  session: ['composed', 'GET /api/tasks', 'No session endpoint. A 200 read means unlocked; a 401 from any read means the session ended.'],
+  session: ['composed', 'GET /api/tasks', 'No separate session route. GET /api/tasks is a backstop. A 200 does not admit a view. POST /api/session admits only the view that presented the access file, and that view sends X-Workspace-View. A 401 means this view is locked.'],
   unlock: ['existing', 'POST /api/session', 'Body {key} read from the chosen access file, sent once, never stored. A 409 means a Lock happened while unlocking; choose the file again. The demo takes no key.'],
   lock: ['existing', 'POST /api/session/lock', 'Body exactly {}. Locks every view and releases terminal control; approved work continues. After a lost response, lock locally anyway and never resubmit earlier commands.'],
   listTasks: ['composed', 'GET /api/tasks + GET /api/attention', 'Merged into one row per task.'],
@@ -68,4 +68,84 @@ export function classifyError(error) {
 export function classifyLockOutcome(result, error) {
   if (error) return classifyError(error).kind === 'locked' ? 'already' : 'unconfirmed';
   return result?.locked === true ? 'confirmed' : 'unconfirmed';
+}
+
+export const viewStorageKeys = Object.freeze({
+  viewId: 'bfe-view-id',
+  viewGeneration: 'bfe-view-generation',
+  localLock: 'bfe-local-lock',
+  sharedGeneration: 'bfe-shared-generation',
+});
+const viewToken = /^[a-f0-9]{32}$/;
+const storedOutcomes = new Set(['unconfirmed', 'confirmed', 'already']);
+
+// One browser tab. The session store survives reload of this tab. The shared store
+// is visible to other tabs on this origin. The view id is never written there.
+export function createTabAdmission({session, shared} = {}) {
+  let storageFailed = false;
+  function read(store, key) {
+    try { return store ? store.getItem(key) : null; }
+    catch { storageFailed = true; return null; }
+  }
+  function write(store, key, value) {
+    try {
+      if (!store) { storageFailed = true; return false; }
+      if (value == null) store.removeItem(key);
+      else store.setItem(key, value);
+      return true;
+    } catch { storageFailed = true; return false; }
+  }
+  return {
+    viewId() { return read(session, viewStorageKeys.viewId); },
+    generation() { return read(session, viewStorageKeys.viewGeneration); },
+    localLock() { return read(session, viewStorageKeys.localLock); },
+    sharedGeneration() { return read(shared, viewStorageKeys.sharedGeneration); },
+    header() {
+      const id = read(session, viewStorageKeys.viewId);
+      return viewToken.test(id ?? '') ? id : '';
+    },
+    promiseLock() {
+      write(session, viewStorageKeys.localLock, 'unconfirmed');
+      write(shared, viewStorageKeys.sharedGeneration, 'locked');
+    },
+    markSharedLocked() {
+      const existing = read(session, viewStorageKeys.localLock);
+      if (existing !== 'confirmed' && existing !== 'already') write(session, viewStorageKeys.localLock, 'unconfirmed');
+      const sharedValue = read(shared, viewStorageKeys.sharedGeneration);
+      const own = read(session, viewStorageKeys.viewGeneration);
+      // A newer unlock has already published its generation. Do not replace it.
+      if (viewToken.test(sharedValue ?? '') && sharedValue !== own) return;
+      write(shared, viewStorageKeys.sharedGeneration, 'locked');
+    },
+    noteLockOutcome(outcome) {
+      if (!storedOutcomes.has(outcome)) return false;
+      return write(session, viewStorageKeys.localLock, outcome);
+    },
+    admit(viewId, viewGeneration) {
+      if (!viewToken.test(viewId ?? '') || !viewToken.test(viewGeneration ?? '')) return false;
+      const wrote = write(session, viewStorageKeys.viewId, viewId)
+        && write(session, viewStorageKeys.viewGeneration, viewGeneration)
+        && write(session, viewStorageKeys.localLock, null)
+        && write(shared, viewStorageKeys.sharedGeneration, viewGeneration);
+      return wrote && !storageFailed;
+    },
+    dropAdmission() {
+      write(session, viewStorageKeys.viewId, null);
+      write(session, viewStorageKeys.viewGeneration, null);
+    },
+    mustConceal() {
+      if (storageFailed || !session || !shared) return true;
+      const local = read(session, viewStorageKeys.localLock);
+      if (storageFailed || local) return true;
+      const sharedValue = read(shared, viewStorageKeys.sharedGeneration);
+      if (storageFailed || sharedValue === 'locked') return true;
+      const own = read(session, viewStorageKeys.viewGeneration);
+      if (storageFailed) return true;
+      return !!(sharedValue && sharedValue !== own);
+    },
+    mayOpenWorkspace() {
+      if (this.mustConceal()) return false;
+      return viewToken.test(this.viewId() ?? '') && viewToken.test(this.generation() ?? '');
+    },
+  };
 }

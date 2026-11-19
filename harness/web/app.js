@@ -7,7 +7,7 @@ import {diagnosticMessages} from './route-diagnostics.js';
 import {bindProposalEditor} from './proposal-editor.js';
 import {terminalRequest,ownsTerminal} from './terminal-request.js';
 import {bindDraftCopyDialog} from './draft-copy-dialog.js';
-import {bindWorkspaceLock,createLegacySessionController,workspaceLockCopy} from './workspace-lock.js';
+import {bindWorkspaceLock,createAccessAttempt,createLegacySessionController,createTabAdmission,viewStorageKeys,workspaceLockCopy} from './workspace-lock.js';
 const $ = id => document.getElementById(id);
 const form = $('create');
 const field = name => form.elements.namedItem(name);
@@ -16,6 +16,14 @@ let connection='connected', needsReconcile=false, explicitLock=null;
 let actionRevision=0;
 const sessionUi=createLegacySessionController();
 const sessionGate=sessionUi.gate;
+const accessAttempts=createAccessAttempt(sessionGate);
+function browserStores() {
+  let session=null, shared=null;
+  try { session=sessionStorage; } catch { session=null; }
+  try { shared=localStorage; } catch { shared=null; }
+  return {session, shared};
+}
+const admission=createTabAdmission(browserStores());
 const resumeKey='bfe-last-task';
 const remember=id=>{try { if (id) sessionStorage.setItem(resumeKey,id); else sessionStorage.removeItem(resumeKey); } catch { /* Storage may be disabled. */ }};
 const remembered=()=>{try { return sessionStorage.getItem(resumeKey); } catch { return null; }};
@@ -33,9 +41,15 @@ function definition(container, pairs) {
 }
 function note(message='') { $('notice').textContent=message; }
 async function api(path,body) {
-  const response=await fetch(path,body===undefined ? {signal:AbortSignal.timeout(8000)} : {
-    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),
-    signal:AbortSignal.timeout(8000),
+  const opening=path==='/api/session'||path==='/api/session/lock';
+  if(admission.mustConceal()&&!opening) throw Object.assign(Error('Unlock this workspace with its local access.key file.'),{status:401});
+  const headers={};
+  const viewId=admission.header();
+  if(viewId) headers['X-Workspace-View']=viewId;
+  if(body!==undefined) headers['Content-Type']='application/json';
+  const response=await fetch(path,{
+    method:body===undefined?'GET':'POST',headers,signal:AbortSignal.timeout(8000),
+    ...(body===undefined?{}:{body:JSON.stringify(body)}),
   });
   const data=await response.json();
   if (!response.ok) throw Object.assign(Error(data.error),{status:response.status});
@@ -164,6 +178,7 @@ bindWorkspaceLock({
   openButton:$('lock-workspace'),dialog:$('lock-dialog'),confirmButton:$('lock-confirm'),cancelButton:$('lock-cancel'),
   status:$('access-status'),send:body=>api('/api/session/lock',body),focusTarget:$('access-file'),
   onLocalLock() {
+    admission.promiseLock();
     const epoch=concealLocalSession();
     explicitLock='waiting';
     setConnection({phase:'locked'});
@@ -176,6 +191,7 @@ bindWorkspaceLock({
     }
     sessionUi.finishLock({epoch:lockEpoch}, outcome);
     explicitLock=outcome;
+    admission.noteLockOutcome(outcome);
     setConnection({phase:'locked'});
     return true;
   },
@@ -325,8 +341,9 @@ function renderProgress(attempt) {
   // Keep the control stable while polling so keyboard focus is retained.
 }
 const cancel=element('button','Cancel request');
-cancel.onclick=()=>act(async()=>{
-  await api(path()+'/cancel',{version:task.version});
+cancel.onclick=()=>act(async token=>{
+  await sessionUi.settle(token, ()=>api(path()+'/cancel',{version:task.version}));
+  if(!sessionUi.current(token))return;
   note('Cancellation requested.');
 });
 $('progress').after(cancel);
@@ -649,8 +666,13 @@ bindDraftCopyDialog({openButton:$('copy-task'),dialog:$('copy-dialog'),target:$(
   copyButton:$('copy-submit'),checkButton:$('copy-check'),retryButton:$('copy-retry'),closeButton:$('copy-close'),current:()=>task,
   submit:(id,body)=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/tasks/'+id+'/copy-draft',body)),
   lookup:requestId=>sessionUi.settle(sessionUi.capture(), ()=>api('/api/draft-copies/'+requestId)),onCopied:id=>{
-    if(sessionGate.locked())return;
-    void act(async()=>{await openTask(id,{chooseRoute:true});note('Opened the saved copy. Review its scope and select a route before approving a run.');});
+    const token=sessionUi.capture();
+    if(!sessionUi.current(token))return;
+    void act(async actionToken=>{
+      await openTask(id,{chooseRoute:true});
+      if(!sessionUi.current(actionToken))return;
+      note('Opened the saved copy. Review its scope and select a route before approving a run.');
+    });
   }});
 bindExportDialog({openButton:$('export'),dialog:$('export-dialog'),mode:$('export-mode'),
   description:$('export-description'),status:$('export-status'),preview:$('export-preview'),
@@ -708,6 +730,7 @@ async function enter() {
     }
   } catch(error) {
     if(!sessionGate.current(epoch))return;
+    admission.dropAdmission();
     if(accessHidden){
       const dialogs=[...document.querySelectorAll('dialog')].map(node=>({open:node.open,inert:false,cached:null,node}));
       sessionUi.useDialogs(dialogs);
@@ -730,11 +753,47 @@ async function enter() {
 $('access-file').onchange=async()=>{
   const input=$('access-file'), file=input.files[0];
   if (!file) return;
+  const attempt=accessAttempts.begin();
+  let submitted=false;
   try {
     if (file.size>256) throw Error('Choose the workspace access file.');
-    await api('/api/session',{key:(await file.text()).trim()});
+    const key=(await file.text()).trim();
+    if(!attempt.current())return;
+    const opened=await api('/api/session',{key});
+    if(!attempt.current())return;
+    if(!admission.admit(opened.viewId, opened.viewGeneration)) throw Error('Choose the workspace access file.');
+    submitted=true;
     await enter();
-  } catch(error) { $('access-status').textContent=error.message; }
-  finally { input.value=''; }
+  } catch(error) {
+    if(!submitted&&!attempt.current())return;
+    $('access-status').textContent=error.message;
+  } finally { input.value=''; }
 };
-void enter().catch(()=>{});
+function holdConcealed(outcome) {
+  const stored=outcome==='confirmed'||outcome==='already'||outcome==='unconfirmed'?outcome:'unconfirmed';
+  explicitLock=stored;
+  $('access-status').textContent=workspaceLockCopy[stored];
+  if(!sessionGate.locked()) concealLocalSession();
+  $('lock-workspace').hidden=true;
+  setConnection({phase:'locked'});
+}
+function concealForeignGeneration() {
+  if(!admission.mustConceal())return;
+  if(sessionGate.locked()&&explicitLock)return;
+  admission.markSharedLocked();
+  holdConcealed('unconfirmed');
+}
+function bootWorkspace() {
+  if(admission.mustConceal()||!admission.mayOpenWorkspace()) {
+    const stored=admission.localLock();
+    if(stored) holdConcealed(stored);
+    else if(admission.mustConceal()) holdConcealed('unconfirmed');
+    else { concealLocalSession(); $('lock-workspace').hidden=true; }
+    return;
+  }
+  void enter().catch(()=>{});
+}
+bootWorkspace();
+window.addEventListener('pageshow',()=>{ if(admission.mustConceal()&&!sessionGate.locked()) holdConcealed(admission.localLock()||'unconfirmed'); });
+window.addEventListener('storage',event=>{ if(event.key===viewStorageKeys.sharedGeneration) concealForeignGeneration(); });
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') concealForeignGeneration(); });

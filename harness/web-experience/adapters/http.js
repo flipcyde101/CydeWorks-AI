@@ -12,7 +12,7 @@
 // - Session secrets never pass through here except the access key, which is sent once to
 //   POST /api/session and not kept. The session cookie is HttpOnly and handled by the browser.
 
-import {assertAdapter} from './contract.js';
+import {assertAdapter, createTabAdmission} from './contract.js';
 import {summarizeRun, compareRuns} from '../vendor/inspector-v1/accounting.mjs';
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -162,12 +162,25 @@ async function sha256Hex(bytes) {
 export function createHttpAdapter({base = '', fetchImpl = globalThis.fetch?.bind(globalThis)} = {}) {
   if (typeof fetchImpl !== 'function') throw Error('A fetch implementation is required.');
 
+  function browserAdmission() {
+    let session = null, shared = null;
+    try { session = globalThis.sessionStorage; } catch { session = null; }
+    try { shared = globalThis.localStorage; } catch { shared = null; }
+    return createTabAdmission({session, shared});
+  }
   async function send(method, path, body, signal) {
+    const admission = browserAdmission();
+    const opening = path === '/api/session' || path === '/api/session/lock';
+    if (admission.mustConceal() && !opening) throw statusError(401, 'Unlock this workspace with its local access.key file.');
+    const headers = {Accept: 'application/json'};
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const viewId = admission.header();
+    if (viewId) headers['X-Workspace-View'] = viewId;
     try {
       return await fetchImpl(base + path, {method, signal, credentials: 'same-origin', cache: 'no-store', redirect: 'error',
-        headers: body === undefined ? {Accept: 'application/json'} : {Accept: 'application/json', 'Content-Type': 'application/json'},
-        body: body === undefined ? undefined : JSON.stringify(body)});
+        headers, body: body === undefined ? undefined : JSON.stringify(body)});
     } catch (error) {
+      if (error?.status) throw error;
       throw unknownOutcome('The local workspace did not respond.', error);
     }
   }
@@ -222,10 +235,20 @@ export function createHttpAdapter({base = '', fetchImpl = globalThis.fetch?.bind
   }
 
   const api = {
-    // No session endpoint. A read decides: 200 means unlocked, 401 means locked.
+    // A 200 task list is not this view's unlock. The view id comes from the access-file POST.
     async session() {
-      try { const list = await get('/api/tasks'); return {unlocked: true, firstUse: (list.tasks ?? []).length === 0}; }
-      catch (error) { if (error.status === 401) return {unlocked: false, firstUse: false}; throw error; }
+      const admission = browserAdmission();
+      if (admission.mustConceal() || !admission.mayOpenWorkspace()) return {unlocked: false, firstUse: false};
+      try {
+        const response = await send('GET', '/api/tasks');
+        let data = null, readable = true;
+        try { data = await response.json(); } catch { readable = false; }
+        if (response.status === 401) return {unlocked: false, firstUse: false};
+        if (!response.ok || !readable || !data || typeof data !== 'object') throw statusError(response.status || 401, 'Unlock this workspace with its local access.key file.');
+        const generation = response.headers.get('x-view-generation');
+        if (!generation || generation !== admission.generation() || admission.mustConceal()) return {unlocked: false, firstUse: false};
+        return {unlocked: true, firstUse: (data.tasks ?? []).length === 0};
+      } catch (error) { if (error.status === 401) return {unlocked: false, firstUse: false}; throw error; }
     },
     // The key is read from the access file by the caller, sent once and not retained.
     async unlock(key) {

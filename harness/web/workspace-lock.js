@@ -67,7 +67,7 @@ export function createLegacySessionController(gate=createSessionEpoch()) {
     polling:false,
     lease:null,
     fields:{source:'',filename:''},
-    downloads:[],
+    downloads:0,
     dialogs:[],
     runs:0,
     notice:null,
@@ -133,7 +133,7 @@ export function createLegacySessionController(gate=createSessionEpoch()) {
     },
     allowDownload(dialog) {
       if(gate.locked()||view.workspaceInert||!dialog||dialog.inert||!dialog.open||dialog.cached==null)return false;
-      view.downloads.push(dialog.cached);
+      view.downloads=1;
       return true;
     },
     async settle(token, work) {
@@ -182,6 +182,100 @@ export function createLegacySessionController(gate=createSessionEpoch()) {
       view.polling=true;
       view.uiWrites+=1;
       return result;
+    },
+  };
+}
+
+export const viewStorageKeys={
+  viewId:'bfe-view-id',
+  viewGeneration:'bfe-view-generation',
+  localLock:'bfe-local-lock',
+  sharedGeneration:'bfe-shared-generation',
+};
+const viewToken=/^[a-f0-9]{32}$/;
+const storedOutcomes=new Set(['unconfirmed','confirmed','already']);
+
+// One browser tab. The session store survives reload of this tab. The shared store
+// is visible to other tabs on this origin. The view id is never written there.
+export function createTabAdmission({session, shared}={}) {
+  let storageFailed=false;
+  function read(store, key) {
+    try { return store?store.getItem(key):null; }
+    catch { storageFailed=true; return null; }
+  }
+  function write(store, key, value) {
+    try {
+      if(!store){storageFailed=true;return false;}
+      if(value==null) store.removeItem(key);
+      else store.setItem(key, value);
+      return true;
+    } catch { storageFailed=true; return false; }
+  }
+  return {
+    viewId(){return read(session, viewStorageKeys.viewId);},
+    generation(){return read(session, viewStorageKeys.viewGeneration);},
+    localLock(){return read(session, viewStorageKeys.localLock);},
+    sharedGeneration(){return read(shared, viewStorageKeys.sharedGeneration);},
+    header(){
+      const id=read(session, viewStorageKeys.viewId);
+      return viewToken.test(id??'')?id:'';
+    },
+    promiseLock(){
+      write(session, viewStorageKeys.localLock, 'unconfirmed');
+      write(shared, viewStorageKeys.sharedGeneration, 'locked');
+    },
+    markSharedLocked(){
+      const existing=read(session, viewStorageKeys.localLock);
+      if(existing!=='confirmed'&&existing!=='already') write(session, viewStorageKeys.localLock, 'unconfirmed');
+      const sharedValue=read(shared, viewStorageKeys.sharedGeneration);
+      const own=read(session, viewStorageKeys.viewGeneration);
+      // A newer unlock has already published its generation. Do not replace it.
+      if(viewToken.test(sharedValue??'')&&sharedValue!==own) return;
+      write(shared, viewStorageKeys.sharedGeneration, 'locked');
+    },
+    noteLockOutcome(outcome){
+      if(!storedOutcomes.has(outcome)) return false;
+      return write(session, viewStorageKeys.localLock, outcome);
+    },
+    admit(viewId, viewGeneration){
+      if(!viewToken.test(viewId??'')||!viewToken.test(viewGeneration??'')) return false;
+      const wrote=write(session, viewStorageKeys.viewId, viewId)
+        && write(session, viewStorageKeys.viewGeneration, viewGeneration)
+        && write(session, viewStorageKeys.localLock, null)
+        && write(shared, viewStorageKeys.sharedGeneration, viewGeneration);
+      return wrote&&!storageFailed;
+    },
+    dropAdmission(){
+      write(session, viewStorageKeys.viewId, null);
+      write(session, viewStorageKeys.viewGeneration, null);
+    },
+    mustConceal(){
+      if(storageFailed||!session||!shared) return true;
+      const local=read(session, viewStorageKeys.localLock);
+      if(storageFailed||local) return true;
+      const sharedValue=read(shared, viewStorageKeys.sharedGeneration);
+      if(storageFailed||sharedValue==='locked') return true;
+      const own=read(session, viewStorageKeys.viewGeneration);
+      if(storageFailed) return true;
+      return !!(sharedValue&&sharedValue!==own);
+    },
+    mayOpenWorkspace(){
+      if(this.mustConceal()) return false;
+      return viewToken.test(this.viewId()??'')&&viewToken.test(this.generation()??'');
+    },
+  };
+}
+
+// Covers one access-file selection from the read through the unlock response.
+// The view is locked while the file is chosen, so gate.current would already be
+// false. A newer selection, Lock, or unlock moves this attempt off the epoch.
+export function createAccessAttempt(gate) {
+  let attempt=0;
+  return {
+    begin(){
+      attempt+=1;
+      const id=attempt, epoch=gate.epoch();
+      return {id, epoch, current(){return id===attempt&&gate.epoch()===epoch;}};
     },
   };
 }

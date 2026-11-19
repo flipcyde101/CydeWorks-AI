@@ -49,6 +49,14 @@ if (database !== ':memory:') {
 }
 if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
 let session=randomBytes(32).toString('hex');
+// Changes when the session ends. A view id is admitted only by the unlock that
+// presented the access file. It is not a cookie, so another tab cannot inherit it.
+let viewGeneration=randomBytes(16).toString('hex');
+const admittedViews=new Set();
+function rotateViewGeneration() {
+  viewGeneration=randomBytes(16).toString('hex');
+  admittedViews.clear();
+}
 // Workspace inactivity deadline. This is not the 15-second terminal control lease.
 // Either clock moving backward ends the session. It does not extend the deadline.
 const sessionIdleMs=15*60*1000;
@@ -115,6 +123,7 @@ function noteSessionActivity() {
 }
 function endWorkspaceSession() {
   session=randomBytes(32).toString('hex');
+  rotateViewGeneration();
   sessionSeenMono=undefined;
   sessionSeenWall=undefined;
   const clock=sessionClock();
@@ -309,8 +318,11 @@ const server=http.createServer(async (req,res) => {
       if(sessionAtArrival!==session)fail(409,'The workspace was locked while unlocking. Choose the access file again.');
       if(sessionIdle())endWorkspaceSession();
       noteSessionActivity();
+      const viewId=randomBytes(16).toString('hex');
+      admittedViews.add(viewId);
       res.setHeader('Set-Cookie',sessionCookieHeaders());
-      return send(200,{authorized:true});
+      res.setHeader('X-View-Generation',viewGeneration);
+      return send(200,{authorized:true,viewId,viewGeneration});
     }
     const presentedSessions=presentedSessionValues(req.headers.cookie);
     const expireSessionCookie=()=>res.setHeader('Set-Cookie','bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api');
@@ -322,6 +334,15 @@ const server=http.createServer(async (req,res) => {
         fail(401,'Unlock this workspace with its local access.key file.');
       }
       if(!presentedSessions.some(value=>equal(value,session))) fail(401,'Unlock this workspace with its local access.key file.');
+      // Same-origin browser tabs share the cookie jar. A view is admitted only when
+      // its own unlock presented the access file. A stale view is 401 and must not rotate the session or expire the cookie.
+      // Callers that send neither Sec-Fetch-Site nor X-Workspace-View stay on the cookie check alone.
+      const presentedView=req.headers['x-workspace-view'];
+      if(req.headers['sec-fetch-site']==='same-origin'||presentedView!==undefined) {
+        const viewId=typeof presentedView==='string'?presentedView:'';
+        if(!/^[a-f0-9]{32}$/.test(viewId)||!admittedViews.has(viewId)) fail(401,'Unlock this workspace with its local access.key file.');
+      }
+      res.setHeader('X-View-Generation',viewGeneration);
     };
     requireSession();
     const authenticatedBody=async()=>{

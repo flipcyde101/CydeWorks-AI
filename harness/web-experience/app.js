@@ -3,7 +3,7 @@
 
 import {createDemoAdapter} from './demo/adapter.js';
 import {createHttpAdapter} from './adapters/http.js';
-import {classifyError, classifyLockOutcome} from './adapters/contract.js';
+import {classifyError, classifyLockOutcome, createTabAdmission, viewStorageKeys} from './adapters/contract.js';
 import {swap, stableKey} from './core/dom.js';
 import {mode, readAdapterMode} from './core/mode.js';
 import {shortHash} from './core/format.js';
@@ -22,6 +22,19 @@ const $ = id => document.getElementById(id);
 const PROFILE_KEY = 'cydeworks-candidate-profile';
 const pendingRunKey = taskId => 'cydeworks-candidate-pending-run:' + taskId;
 const storage = (() => { try { return globalThis.sessionStorage; } catch { return null; } })();
+function experienceStores() {
+  let session = null, shared = null;
+  try { session = globalThis.sessionStorage; } catch { session = null; }
+  try { shared = globalThis.localStorage; } catch { shared = null; }
+  return {session, shared};
+}
+function experienceAdmission() { return createTabAdmission(experienceStores()); }
+function storedLockNotice(outcome) {
+  if (outcome === 'confirmed') return 'Workspace session terminated in every view. Approved work keeps running, and terminal control was released. Unlock with the access file.';
+  if (outcome === 'already') return 'The workspace session had already ended. This view is locked.';
+  if (outcome === 'unconfirmed') return 'The lock response was lost, so this view locked itself. Whether other views were locked is not confirmed. Unlock with the access file; nothing was sent again.';
+  return null;
+}
 const profile = (() => { try { return storage?.getItem(PROFILE_KEY) === 'first-use' ? 'first-use' : 'returning'; } catch { return 'returning'; } })();
 mode.adapter = readAdapterMode();
 // The HTTP adapter talks to the workspace service that served this page. The demo adapter runs the
@@ -133,6 +146,11 @@ function readFailed(error) {
 function lockUi() { concealSession({explicit: false}); }
 // explicit: this view pressed Lock, so no task reopens after unlock.
 function concealSession({explicit}) {
+  if (!mode.synthetic) {
+    const admission = experienceAdmission();
+    if (explicit) admission.promiseLock();
+    else admission.markSharedLocked();
+  }
   state.sessionEpoch = (state.sessionEpoch ?? 0) + 1;
   state.lockedTaskId = explicit ? null : state.task?.id ?? state.lockedTaskId ?? null;
   state.session.unlocked = false; state.connection = 'locked';
@@ -167,6 +185,10 @@ function observedAdapter(target) {
 
 async function loop() {
   state.now = Date.now(); state.tick++;
+  if (state.session.unlocked && experienceAdmission().mustConceal()) {
+    state.lockNotice = storedLockNotice('unconfirmed');
+    concealSession({explicit: false});
+  }
   // Reads that finish after a Lock or session end change nothing (see lockUi).
   const epoch = state.sessionEpoch, current = () => state.sessionEpoch === epoch;
   if (state.session.unlocked && !state.busy && Date.now() >= state.retryAt) {
@@ -310,7 +332,16 @@ const actions = {
       if (file.size > 1024) { state.unlockError = 'That file is too large to be a workspace access key. Nothing was sent.'; return; }
       try { key = (await file.text()).trim(); } catch { state.unlockError = 'The access file could not be read. Nothing was sent.'; return; }
     }
-    try { fresh(epoch, await adapter.unlock(key)); }
+    if (epoch !== state.sessionEpoch) return;
+    let opened;
+    try {
+      opened = await adapter.unlock(key);
+      fresh(epoch, opened);
+      if (!mode.synthetic && !experienceAdmission().admit(opened?.viewId, opened?.viewGeneration)) {
+        state.unlockError = 'Choose the workspace access file again.';
+        return;
+      }
+    }
     catch (error) {
       if (error?.stale) throw error;
       state.unlockError = error.status === 401 ? error.message
@@ -318,7 +349,9 @@ const actions = {
         : 'The workspace did not respond. Nothing was sent again.';
       return;
     } finally { key = undefined; }
+    if (state.unlockError) return;
     const session = fresh(epoch, await adapter.session());
+    if (!session?.unlocked) { experienceAdmission().dropAdmission(); state.unlockError = 'Choose the workspace access file again.'; return; }
     state.lockNotice = null; state.session = session;
     state.connection = 'connected'; state.failures = 0; state.lease = null;
     await refreshList();
@@ -340,10 +373,8 @@ const actions = {
       .then(outcome => {
         // A later unlock or Lock owns the screen now.
         if (state.sessionEpoch !== epoch || state.session.unlocked) return;
-        state.lockNotice = outcome === 'confirmed'
-          ? 'Workspace session terminated in every view. Approved work keeps running, and terminal control was released. Unlock with the access file.'
-          : outcome === 'already' ? 'The workspace session had already ended. This view is locked.'
-          : 'The lock response was lost, so this view locked itself. Whether other views were locked is not confirmed. Unlock with the access file; nothing was sent again.';
+        if (!mode.synthetic) experienceAdmission().noteLockOutcome(outcome);
+        state.lockNotice = storedLockNotice(outcome) ?? storedLockNotice('unconfirmed');
         render();
       });
   },
@@ -608,7 +639,22 @@ else {
 }
 window.addEventListener('hashchange', onRoute);
 window.addEventListener('pagehide', releaseView);
+function concealForeignGeneration() {
+  if (!state.session.unlocked || !experienceAdmission().mustConceal()) return;
+  state.lockNotice = storedLockNotice('unconfirmed');
+  concealSession({explicit: false});
+  render();
+}
+window.addEventListener('storage', event => { if (event.key === viewStorageKeys.sharedGeneration) concealForeignGeneration(); });
+window.addEventListener('pageshow', concealForeignGeneration);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') concealForeignGeneration(); });
 state.session = await adapter.session().catch(() => state.session);
+{
+  const stored = experienceAdmission().localLock();
+  const notice = storedLockNotice(stored);
+  if (notice) { state.lockNotice = notice; state.connection = 'locked'; state.session = {...state.session, unlocked: false}; }
+  else if (experienceAdmission().mustConceal()) state.session = {...state.session, unlocked: false};
+}
 // Parity with harness/web remember(): opening the workspace root in this tab reopens the last task,
 // read-only, once unlocked. Only its ID was kept. A removed task falls back to the list with a notice.
 // The demo rebuilds its synthetic tasks on every load, so there is nothing to resume there.
