@@ -316,6 +316,18 @@ function hasGenuineActiveStall(task, options) {
  * - `reasons` only uses static generic reason labels so raw progress diagnostics,
  *   recovery hold messages, secrets, and provider error text are never passed through.
  */
+function safeRetryHold(task) {
+  try {
+    const attempts = task.attempts;
+    if (attempts !== undefined && attempts !== null && typeof attempts?.at !== 'function') {
+      return retryHold({status: task.status, attempts: undefined});
+    }
+    return retryHold(task);
+  } catch {
+    return null;
+  }
+}
+
 export function attentionFor(task, options = undefined) {
   if (task === null || typeof task !== 'object') return null;
 
@@ -324,13 +336,17 @@ export function attentionFor(task, options = undefined) {
     if (task.status === 'draft') pushUniqueReason(reasons, 'Approval needed');
     if (task.status === 'review') {
       pushUniqueReason(reasons, 'Proposal needs review');
-      if (task.attempts?.at?.(-1)?.checks?.some?.(check => check && !check.pass)) {
-        pushUniqueReason(reasons, 'A check failed');
+      try {
+        if (task.attempts?.at?.(-1)?.checks?.some?.(check => check && !check.pass)) {
+          pushUniqueReason(reasons, 'A check failed');
+        }
+      } catch {
+        // Malformed review check metadata must not discard the top-level review reason.
       }
     }
     if (task.status === 'failed') pushUniqueReason(reasons, 'Run failed');
     if (task.status === 'interrupted') pushUniqueReason(reasons, 'Run interrupted');
-    if (retryHold(task)) pushUniqueReason(reasons, 'Earlier outcome needs recovery');
+    if (safeRetryHold(task)) pushUniqueReason(reasons, 'Earlier outcome needs recovery');
     if (hasGenuineActiveStall(task, options)) {
       pushUniqueReason(reasons, POSSIBLE_STALL_REASON);
     }
