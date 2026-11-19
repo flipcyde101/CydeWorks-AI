@@ -2,6 +2,7 @@
 // Pure in-memory scoring against the tracked synthetic suite and holdout set.
 // A resolved citation is structural only. Token overlap, a bare citation, and a
 // caller assertion do not verify a factual claim. Human semantic review is required.
+// A detected-pattern scan does not prove that fabrication is absent.
 
 import { deepFreeze } from './portable-manifest-contract.mjs';
 import {
@@ -170,6 +171,7 @@ function parseSourceLineAnchors(sourceText) {
   let activeNote = null;
   let activeHeaderLine = null;
   let activeStartLine = null;
+  let activeLastContentLine = null;
   const lineBuffer = [];
 
   function flushActiveNote() {
@@ -178,8 +180,7 @@ function parseSourceLineAnchors(sourceText) {
     }
     const excerpt = lineBuffer.join('\n').trim();
     const contentStart = activeStartLine ?? activeHeaderLine;
-    const lineEnd =
-      lineBuffer.length === 0 ? activeHeaderLine : activeHeaderLine + lineBuffer.length;
+    const lineEnd = activeLastContentLine ?? activeHeaderLine;
     const record = {
       anchorId: activeNote,
       lineNumber: contentStart,
@@ -193,6 +194,7 @@ function parseSourceLineAnchors(sourceText) {
     activeNote = null;
     activeHeaderLine = null;
     activeStartLine = null;
+    activeLastContentLine = null;
     lineBuffer.length = 0;
   }
 
@@ -208,15 +210,20 @@ function parseSourceLineAnchors(sourceText) {
       }
       activeNote = noteId;
       activeHeaderLine = lineNumber;
+      activeLastContentLine = null;
       if (noteMatch[2].length > 0) {
         activeStartLine = lineNumber;
+        activeLastContentLine = lineNumber;
         lineBuffer.push(noteMatch[2]);
       }
       continue;
     }
     if (activeNote !== null) {
-      if (activeStartLine === null) {
-        activeStartLine = lineNumber;
+      if (trimmed.length > 0) {
+        if (activeStartLine === null) {
+          activeStartLine = lineNumber;
+        }
+        activeLastContentLine = lineNumber;
       }
       lineBuffer.push(lines[index]);
     } else if (trimmed.length > 0) {
@@ -316,16 +323,48 @@ function looksLikeFabricationOnEmptySource(text) {
   return FABRICATION_ON_EMPTY_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+const NEGATION_BEFORE_FLAG = /\b(?:neither|not|no|never)\s+$/i;
+
+function flagOccursWithoutNegation(text, flag) {
+  const source = normalizeForMatch(text);
+  const needle = normalizeForMatch(flag);
+  if (needle.length === 0) {
+    return false;
+  }
+  let from = 0;
+  while (from <= source.length - needle.length) {
+    const at = source.indexOf(needle, from);
+    if (at < 0) {
+      return false;
+    }
+    const beforeChar = at === 0 ? '' : source[at - 1];
+    const afterIndex = at + needle.length;
+    const afterChar = afterIndex >= source.length ? '' : source[afterIndex];
+    const leftBound = beforeChar === '' || /[^a-z0-9]/.test(beforeChar);
+    const rightBound = afterChar === '' || /[^a-z0-9]/.test(afterChar);
+    const before = source.slice(Math.max(0, at - 24), at);
+    if (leftBound && rightBound && !NEGATION_BEFORE_FLAG.test(before)) {
+      return true;
+    }
+    from = at + needle.length;
+  }
+  return false;
+}
+
 function matchesFlagLiteral(normalizedText, flag, rawText = '') {
   const source = rawText.length > 0 ? rawText : normalizedText;
-  const flagNorm = flag.toLowerCase();
+  const flagNorm = normalizeForMatch(flag);
   if (flagNorm === 'agreed to video') {
     if (/\b(?:has\s+)?not\s+agreed\s+to\s+video\b/i.test(source)) {
       return null;
     }
     return /\bagreed\s+to\s+video\b/i.test(source) ? flag : null;
   }
-  return normalizedText.includes(flagNorm) ? flag : null;
+  return flagOccursWithoutNegation(source, flag) ? flag : null;
+}
+
+function isNoteRequestOnly(claims) {
+  return claims.length > 0 && claims.every((claim) => NOTE_REQUEST_PATTERN.test(claim.text));
 }
 
 function matchesAnyPattern(text, patterns) {
@@ -420,14 +459,18 @@ function scoreDimensionFromSignals(signals) {
   return 0;
 }
 
-function computeUsability(dimensions, materialErrors) {
+function computeUsability(dimensions, materialErrors, options = {}) {
   const values = RUBRIC_DIMENSIONS.map((name) => dimensions[name]);
   const sum = values.reduce((acc, value) => acc + value, 0);
   const hasZero = values.some((value) => value === 0);
-  const usableWithMinorEdits = sum >= 8 && !hasZero && materialErrors.length === 0;
+  const blocksStructuralAcceptance = options.blocksStructuralAcceptance === true;
+  const usableWithMinorEdits =
+    sum >= 8 && !hasZero && materialErrors.length === 0 && !blocksStructuralAcceptance;
   return deepFreeze({
     dimensionSum: sum,
     usableWithMinorEdits,
+    usableGateProvesFactualAcceptance: false,
+    usableGateLabel: 'provisional-structural-threshold',
     passLabel: STRUCTURAL_PASS_LABEL,
     factsProven: false,
     factualVerificationPerformed: false,
@@ -440,7 +483,7 @@ function computeUsability(dimensions, materialErrors) {
 
 function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCount, claims }) {
   const checks = [];
-  const push = (name, pass, detail) => {
+  const push = (name, pass, detail, extra = null) => {
     checks.push(
       deepFreeze({
         name,
@@ -450,6 +493,7 @@ function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCo
         requiresHumanSemanticReview: true,
         humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
         detail: detail ?? null,
+        ...(extra ?? {}),
       }),
     );
   };
@@ -462,13 +506,19 @@ function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCo
       looksLikeNoteRequestBrief(briefText),
       'B20 empty-source handling',
     );
-    const fabricatedClaims = claims.filter(
-      (claim) => claim.emptySourceFabrication === true || claim.verificationKind === 'unsupported',
-    );
+    const patternedClaims = claims.filter((claim) => claim.emptySourceFabrication === true);
+    const scanClean = isNoteRequestOnly(claims) && patternedClaims.length === 0;
     push(
-      'Brief does not fabricate project facts on empty input',
-      fabricatedClaims.length === 0,
-      fabricatedClaims.length > 0 ? `${fabricatedClaims.length} fabricated claim segment(s)` : null,
+      'Empty-source detected-pattern scan',
+      scanClean,
+      scanClean
+        ? 'Detected-pattern scan found no configured patterns in note-request text. This does not prove that fabrication is absent.'
+        : 'Detected-pattern scan found non-note-request text or configured patterns. Fabrication judgment remains pending human review.',
+      {
+        scanKind: 'detected-pattern',
+        provesAbsenceOfFabrication: false,
+        fabricationJudgment: 'pending-human-review',
+      },
     );
   } else {
     push('At least one note citation is present', hasCitation, null);
@@ -570,6 +620,159 @@ function detectMaterialErrors(caseSpec, briefText) {
   return { errors, flagHits };
 }
 
+function buildClaimSpanMap(briefText, claims) {
+  const collapsed = normalizeForMatch(briefText);
+  const spans = [];
+  let cursor = 0;
+  for (const claim of claims) {
+    const norm = normalizeForMatch(claim.text);
+    if (norm.length === 0) {
+      continue;
+    }
+    const at = collapsed.indexOf(norm, cursor);
+    if (at < 0) {
+      continue;
+    }
+    spans.push({ claimId: claim.claimId, start: at, end: at + norm.length });
+    cursor = at + norm.length;
+  }
+  return { collapsed, spans };
+}
+
+function claimIdsOverlappingRange(spans, start, end) {
+  const ids = [];
+  for (const span of spans) {
+    if (span.end > start && span.start < end && !ids.includes(span.claimId)) {
+      ids.push(span.claimId);
+    }
+  }
+  return ids;
+}
+
+function claimIdsOverlappingNeedle(spanMap, needle) {
+  const normalizedNeedle = normalizeForMatch(needle);
+  if (normalizedNeedle.length === 0) {
+    return [];
+  }
+  const ids = [];
+  let from = 0;
+  while (from <= spanMap.collapsed.length - normalizedNeedle.length) {
+    const at = spanMap.collapsed.indexOf(normalizedNeedle, from);
+    if (at < 0) {
+      break;
+    }
+    const beforeChar = at === 0 ? '' : spanMap.collapsed[at - 1];
+    const afterIndex = at + normalizedNeedle.length;
+    const afterChar = afterIndex >= spanMap.collapsed.length ? '' : spanMap.collapsed[afterIndex];
+    const leftBound = beforeChar === '' || /[^a-z0-9]/.test(beforeChar);
+    const rightBound = afterChar === '' || /[^a-z0-9]/.test(afterChar);
+    const before = spanMap.collapsed.slice(Math.max(0, at - 24), at);
+    if (leftBound && rightBound && !NEGATION_BEFORE_FLAG.test(before)) {
+      for (const id of claimIdsOverlappingRange(spanMap.spans, at, at + normalizedNeedle.length)) {
+        if (!ids.includes(id)) {
+          ids.push(id);
+        }
+      }
+    }
+    from = at + normalizedNeedle.length;
+  }
+  return ids;
+}
+
+function claimIdsOverlappingPattern(spanMap, pattern) {
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const re = new RegExp(pattern.source, flags);
+  const ids = [];
+  for (const match of spanMap.collapsed.matchAll(re)) {
+    const at = match.index ?? 0;
+    for (const id of claimIdsOverlappingRange(spanMap.spans, at, at + match[0].length)) {
+      if (!ids.includes(id)) {
+        ids.push(id);
+      }
+    }
+  }
+  return ids;
+}
+
+function semanticPatterns(caseSpec) {
+  const rules = caseSpec.semanticRules;
+  if (!rules) {
+    return [];
+  }
+  return [
+    ...(Array.isArray(rules.materialInferencePatterns) ? rules.materialInferencePatterns : []),
+    ...(Array.isArray(rules.pilotUpperBoundViolationPatterns) ? rules.pilotUpperBoundViolationPatterns : []),
+  ];
+}
+
+function collectDetectedPatternHits(caseSpec, briefText, claims) {
+  const spanMap = buildClaimSpanMap(briefText, claims);
+  const hits = [];
+  const claimIds = [];
+
+  function addHit(pattern, ids) {
+    const uniqueIds = [];
+    for (const id of ids) {
+      if (id && !uniqueIds.includes(id)) {
+        uniqueIds.push(id);
+      }
+      if (id && !claimIds.includes(id)) {
+        claimIds.push(id);
+      }
+    }
+    hits.push({ pattern: String(pattern), claimIds: uniqueIds });
+  }
+
+  for (const flag of caseSpec.flags) {
+    if (matchesFlagLiteral(spanMap.collapsed, flag, briefText)) {
+      addHit(flag, claimIdsOverlappingNeedle(spanMap, flag));
+    }
+  }
+
+  for (const pattern of semanticPatterns(caseSpec)) {
+    const collapsedHit = pattern.test(spanMap.collapsed);
+    pattern.lastIndex = 0;
+    const rawHit = pattern.test(briefText);
+    pattern.lastIndex = 0;
+    if (collapsedHit || rawHit) {
+      const ids = claimIdsOverlappingPattern(spanMap, pattern);
+      addHit(
+        pattern.source,
+        ids.length > 0
+          ? ids
+          : claims
+              .filter((claim) => {
+                const hit = pattern.test(claim.text) || pattern.test(normalizeForMatch(claim.text));
+                pattern.lastIndex = 0;
+                return hit;
+              })
+              .map((claim) => claim.claimId),
+      );
+    }
+  }
+
+  if (caseSpec.sourceText.trim().length === 0) {
+    for (const claim of claims) {
+      for (const pattern of FABRICATION_ON_EMPTY_PATTERNS) {
+        if (pattern.test(claim.text)) {
+          addHit(pattern.source, [claim.claimId]);
+        }
+        pattern.lastIndex = 0;
+      }
+    }
+  }
+
+  return deepFreeze({
+    scanKind: 'detected-pattern',
+    provesAbsenceOfFabrication: false,
+    provesZeroUnsupportedFacts: false,
+    fabricationJudgment: 'pending-human-review',
+    detectedPatternHitCount: hits.length,
+    detectedPatternClaimCount: claimIds.length,
+    detectedPatternClaimIds: claimIds,
+  });
+}
+
 function scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, structuralChecks) {
   const normalizedBrief = normalizeForMatch(briefText);
   const lookForHits = caseSpec.lookFor.filter((phrase) => normalizedBrief.includes(phrase.toLowerCase()));
@@ -595,7 +798,12 @@ function scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, stru
   let traceabilityStrong =
     (citedRatio >= 0.5 && missingCount <= Math.ceil(claims.length / 2) && uncitedFactualCount <= 1) ||
     (anchorCitedClaims.length >= 3 && uncitedFactualCount === 0);
-  if (emptySource && looksLikeNoteRequestBrief(briefText) && materialErrors.length === 0) {
+  if (
+    emptySource &&
+    isNoteRequestOnly(claims) &&
+    materialErrors.length === 0 &&
+    !claims.some((claim) => claim.emptySourceFabrication === true)
+  ) {
     traceabilityStrong = true;
   }
 
@@ -854,6 +1062,7 @@ export function evaluateBrief(input) {
     claims,
   });
   const { errors: materialErrors, flagHits } = detectMaterialErrors(caseSpec, briefText);
+  const detectedPatternScan = collectDetectedPatternHits(caseSpec, briefText, claims);
   const { dimensions, lookForHits } = scoreRubricDimensions(
     caseSpec,
     briefText,
@@ -861,7 +1070,10 @@ export function evaluateBrief(input) {
     materialErrors,
     structuralChecks,
   );
-  const usability = computeUsability(dimensions, materialErrors);
+  const blocksStructuralAcceptance =
+    caseSpec.sourceText.trim().length === 0 &&
+    (!isNoteRequestOnly(claims) || claims.some((claim) => claim.emptySourceFabrication === true));
+  const usability = computeUsability(dimensions, materialErrors, { blocksStructuralAcceptance });
 
   const unsupportedClaims = claims.filter((claim) => claim.verificationKind === 'unsupported');
 
@@ -877,6 +1089,7 @@ export function evaluateBrief(input) {
     claims,
     unsupportedClaims,
     materialErrors,
+    detectedPatternScan,
     rubric: deepFreeze({
       dimensions,
       lookForHits,
@@ -963,10 +1176,17 @@ function readBriefMap(input, label, { allowedCaseIds = null } = {}) {
   return result;
 }
 
-function summarizeMaterialUnsupported(materialErrors) {
-  return materialErrors.filter(
-    (err) => err.code === 'material-unsupported-claim' || err.code === 'semantic-inference-limit' || err.code === 'semantic-pilot-boundary',
-  ).length;
+function summarizeDetectedPatterns(cases) {
+  return {
+    detectedPatternHitCount: cases.reduce(
+      (acc, item) => acc + item.detectedPatternScan.detectedPatternHitCount,
+      0,
+    ),
+    detectedPatternClaimCount: cases.reduce(
+      (acc, item) => acc + item.detectedPatternScan.detectedPatternClaimCount,
+      0,
+    ),
+  };
 }
 
 export function runTrackedSyntheticSuite(briefsByCaseId) {
@@ -984,10 +1204,7 @@ export function runTrackedSyntheticSuite(briefsByCaseId) {
     fail(`Tracked synthetic suite missing explicit case briefs: ${missing.join(', ')}`);
   }
 
-  const materialUnsupportedClaimCount = cases.reduce(
-    (acc, item) => acc + summarizeMaterialUnsupported(item.materialErrors),
-    0,
-  );
+  const detected = summarizeDetectedPatterns(cases);
   const usableCount = cases.filter((item) => item.rubric.usability.usableWithMinorEdits).length;
 
   return deepFreeze({
@@ -997,17 +1214,19 @@ export function runTrackedSyntheticSuite(briefsByCaseId) {
     summary: deepFreeze({
       count: cases.length,
       expectedCount: TRACKED_SYNTHETIC_CASE_IDS.length,
-      materialUnsupportedClaimCount,
+      detectedPatternHitCount: detected.detectedPatternHitCount,
+      detectedPatternClaimCount: detected.detectedPatternClaimCount,
       usableWithMinorEditsCount: usableCount,
-      zeroMaterialUnsupportedClaims: materialUnsupportedClaimCount === 0,
+      provesZeroUnsupportedFacts: false,
       factsProven: false,
       factualVerificationPerformed: false,
     }),
     gates: deepFreeze({
       proposedUsableThreshold: 16,
       usableWithMinorEditsCount: usableCount,
-      meetsProposedUsableGate: usableCount >= 16,
-      zeroMaterialUnsupportedClaimsAcrossTracked: materialUnsupportedClaimCount === 0,
+      meetsProvisionalStructuralThreshold: usableCount >= 16,
+      usableGateLabel: 'provisional-structural-threshold',
+      provesZeroUnsupportedFacts: false,
       factsProven: false,
       factualVerificationPerformed: false,
     }),
@@ -1031,10 +1250,7 @@ export function runHoldoutSyntheticSuite(briefsByCaseId) {
     fail(`Holdout synthetic suite missing explicit case briefs: ${missing.join(', ')}`);
   }
 
-  const materialUnsupportedClaimCount = cases.reduce(
-    (acc, item) => acc + summarizeMaterialUnsupported(item.materialErrors),
-    0,
-  );
+  const detected = summarizeDetectedPatterns(cases);
 
   return deepFreeze({
     suiteKind: 'holdout',
@@ -1044,7 +1260,9 @@ export function runHoldoutSyntheticSuite(briefsByCaseId) {
       count: cases.length,
       expectedCount: SYNTHETIC_HOLDOUT_CASE_IDS.length,
       notDrawnFromTrackedSuite: true,
-      materialUnsupportedClaimCount,
+      detectedPatternHitCount: detected.detectedPatternHitCount,
+      detectedPatternClaimCount: detected.detectedPatternClaimCount,
+      provesZeroUnsupportedFacts: false,
       factsProven: false,
       factualVerificationPerformed: false,
     }),

@@ -1,19 +1,34 @@
 // Representative synthetic briefs for offline structural scoring fixtures.
 
 export const BRIEF_EVALUATION_EXPECTED_TRACKED = Object.freeze({
-  B01: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1 },
-  B13: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1 },
-  B16: { usableWithMinorEdits: true, materialUnsupportedCount: 0, mustOmitOfficeMove: true },
-  B18: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1 },
-  B20: { usableWithMinorEdits: false, materialUnsupportedCount: 0, traceabilityMin: 2, dimensionSumMin: 7 },
+  B01: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1, dimensionSum: 9 },
+  B02: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 10 },
+  B03: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 10 },
+  B04: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 9 },
+  B05: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 8 },
+  B06: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 8 },
+  B07: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 9 },
+  B08: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 10 },
+  B09: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 10 },
+  B10: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 9 },
+  B11: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 10 },
+  B12: { usableWithMinorEdits: false, materialUnsupportedCount: 0, dimensionSum: 7 },
+  B13: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1, dimensionSum: 8 },
+  B14: { usableWithMinorEdits: false, materialUnsupportedCount: 0, dimensionSum: 7 },
+  B15: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 8 },
+  B16: { usableWithMinorEdits: true, materialUnsupportedCount: 0, mustOmitOfficeMove: true, dimensionSum: 10 },
+  B17: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 8 },
+  B18: { usableWithMinorEdits: true, materialUnsupportedCount: 0, traceabilityMin: 1, dimensionSum: 8 },
+  B19: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 8 },
+  B20: { usableWithMinorEdits: false, materialUnsupportedCount: 0, traceabilityMin: 2, dimensionSumMin: 7, dimensionSum: 7 },
 });
 
 export const BRIEF_EVALUATION_EXPECTED_HOLDOUT = Object.freeze({
-  H01: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
-  H02: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
-  H03: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
-  H04: { usableWithMinorEdits: false, materialUnsupportedCount: 0, dimensionSumMin: 7 },
-  H05: { usableWithMinorEdits: true, materialUnsupportedCount: 0 },
+  H01: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 9 },
+  H02: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 9 },
+  H03: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 8 },
+  H04: { usableWithMinorEdits: false, materialUnsupportedCount: 0, dimensionSumMin: 7, dimensionSum: 7 },
+  H05: { usableWithMinorEdits: true, materialUnsupportedCount: 0, dimensionSum: 9 },
 });
 
 export const BRIEF_EVALUATION_GOOD_B01 = [
