@@ -208,7 +208,8 @@ test('failure or abort during record never sends dispatch and stops held namespa
   await assert.rejects(
     adapter.start({
       nonce: NONCE_1,
-      record: () => {
+      record: identity => {
+        identity.init = null;
         throw Error('Disk full while persisting ownership record');
       },
     }),

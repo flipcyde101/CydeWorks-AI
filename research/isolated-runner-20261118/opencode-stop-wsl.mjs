@@ -364,7 +364,7 @@ export function createOpenCodeStopWslAdapter({
         session.identity = heldIdentity;
         signal?.throwIfAborted();
         // Durable persistence happens BEFORE releasing the held namespace.
-        const recordResult = record(heldIdentity);
+        const recordResult = record(structuredClone(heldIdentity));
         if (recordResult !== undefined) {
           Promise.resolve(recordResult).catch(() => {});
           throw Error('Durable identity record must complete synchronously.');
@@ -380,7 +380,7 @@ export function createOpenCodeStopWslAdapter({
         if (dispatched.event !== 'dispatched' || dispatched.nonce !== nonce) {
           throw Error(`Guest dispatch rejected: ${String(dispatched.reason ?? 'unexpected frame')}`);
         }
-        return heldIdentity;
+        return structuredClone(heldIdentity);
       } catch (error) {
         if (heldIdentity) {
           await this.stopAndVerify(heldIdentity, nonce).catch(() => {});
