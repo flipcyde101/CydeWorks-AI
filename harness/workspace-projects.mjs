@@ -1,6 +1,15 @@
 import {createHash,randomUUID} from 'node:crypto';
-import {lstatSync,readdirSync,readFileSync,realpathSync,statSync} from 'node:fs';
-import {isAbsolute,join,parse,relative,resolve} from 'node:path';
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs';
+import {isAbsolute,join,parse,resolve} from 'node:path';
 
 export const DEFAULT_PROJECT_ID='default-workspace';
 export const DEFAULT_PROJECT_LABEL='Default local workspace';
@@ -22,8 +31,85 @@ function isPlainObject(value) {
   return value!==null&&typeof value==='object'&&!Array.isArray(value);
 }
 
-function pathsEqual(a,b) {
-  return process.platform==='win32'?a.toLowerCase()===b.toLowerCase():a===b;
+// Directory identity is the on-disk (dev, ino) pair. Path strings are never case-folded:
+// Windows supports per-directory case sensitivity, so two spellings that differ only by
+// case can name different directories.
+function sameIdentity(a,b) {
+  return a!==null&&b!==null&&a.dev===b.dev&&a.ino===b.ino;
+}
+
+const PROJECT_ROOT_CODES=Object.freeze({
+  syntax:'INVALID_PROJECT_ROOT',
+  label:'local project root path',
+  missing:'PROJECT_ROOT_MISSING',
+  symlink:'PROJECT_ROOT_SYMLINK',
+  notDirectory:'PROJECT_ROOT_NOT_DIRECTORY',
+  filesystemRoot:'PROJECT_ROOT_FILESYSTEM_ROOT',
+});
+
+const APPROVED_ROOT_CODES=Object.freeze({
+  syntax:'INVALID_APPROVED_ROOTS',
+  label:'approved root path',
+  missing:'APPROVED_ROOT_MISSING',
+  symlink:'APPROVED_ROOT_SYMLINK',
+  notDirectory:'APPROVED_ROOT_NOT_DIRECTORY',
+  filesystemRoot:'APPROVED_ROOT_OUTSIDE_PROJECT',
+});
+
+function splitPath(absolutePath) {
+  const root=parse(absolutePath).root;
+  return {root,segments:absolutePath.slice(root.length).split(/[\\/]+/).filter(Boolean)};
+}
+
+// lstat every component from the filesystem root down. Symbolic links, junctions and
+// mount-point reparse points are rejected by their actual on-disk type, not by comparing
+// a resolved path string with the requested one.
+function lstatDirectoryChain(absolutePath,codes,errStatus) {
+  const {root,segments}=splitPath(absolutePath);
+  const chain=[];
+  let cursor=root;
+  for(const segment of segments) {
+    cursor=join(cursor,segment);
+    let st;
+    try {
+      st=lstatSync(cursor,{bigint:true});
+    } catch {
+      fail(errStatus,codes.missing,'The selected '+codes.label+' does not exist.');
+    }
+    if(st.isSymbolicLink()) {
+      fail(errStatus,codes.symlink,'The '+codes.label+' cannot be or traverse a symbolic link or junction.');
+    }
+    if(!st.isDirectory()) {
+      fail(errStatus,codes.notDirectory,'The '+codes.label+' must be a directory.');
+    }
+    chain.push({path:cursor,dev:st.dev,ino:st.ino});
+  }
+  return chain;
+}
+
+function canonicalDirectory(rawPath,codes,errStatus) {
+  validateLocalPathSyntax(rawPath,codes.syntax,codes.label);
+  const resolved=resolve(rawPath);
+  if(parse(resolved).root===resolved) {
+    fail(errStatus,codes.filesystemRoot,'Choose a project directory rather than a filesystem root.');
+  }
+  const requestedChain=lstatDirectoryChain(resolved,codes,errStatus);
+  let canonical;
+  try {
+    // The native call returns the on-disk spelling, including actual letter case on Windows.
+    canonical=realpathSync.native(resolved);
+  } catch {
+    fail(errStatus,codes.missing,'The selected '+codes.label+' could not be resolved.');
+  }
+  validateLocalPathSyntax(canonical,codes.syntax,codes.label);
+  if(parse(canonical).root===canonical) {
+    fail(errStatus,codes.filesystemRoot,'Choose a project directory rather than a filesystem root.');
+  }
+  const chain=lstatDirectoryChain(canonical,codes,errStatus);
+  if(!sameIdentity(requestedChain.at(-1),chain.at(-1))) {
+    fail(errStatus,codes.symlink,'The '+codes.label+' resolves to a different directory than requested.');
+  }
+  return {path:canonical,chain,dev:chain.at(-1).dev,ino:chain.at(-1).ino};
 }
 
 function normalizeLabel(rawLabel) {
@@ -105,103 +191,71 @@ export function validateLocalPathSyntax(rawPath,code='INVALID_PROJECT_ROOT',labe
 }
 
 export function resolveLocalRoot(rawRoot,{useTime=false}={}) {
-  const errStatus=useTime?409:400;
-  const trimmed=validateLocalPathSyntax(rawRoot,'INVALID_PROJECT_ROOT','local project root path');
-  const resolved=resolve(trimmed);
-  if(parse(resolved).root===resolved) {
-    fail(errStatus,'PROJECT_ROOT_FILESYSTEM_ROOT','Choose a project directory rather than a filesystem root.');
-  }
-  let linkStat;
-  try {
-    linkStat=lstatSync(resolved);
-  } catch {
-    fail(errStatus,'PROJECT_ROOT_MISSING','The selected project root does not exist.');
-  }
-  if(linkStat.isSymbolicLink()) {
-    fail(errStatus,'PROJECT_ROOT_SYMLINK','Project root must be a real directory, not a symbolic link.');
-  }
-  if(!linkStat.isDirectory()) {
-    fail(errStatus,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
-  }
-  let canonical;
-  try {
-    canonical=realpathSync(resolved);
-  } catch {
-    fail(errStatus,'PROJECT_ROOT_MISSING','The selected project root could not be resolved.');
-  }
-  validateLocalPathSyntax(canonical,'INVALID_PROJECT_ROOT','local project root path');
-  if(!pathsEqual(canonical,resolved)) {
-    fail(errStatus,'PROJECT_ROOT_SYMLINK','Project root cannot traverse symbolic links or junctions.');
-  }
-  if(!statSync(canonical).isDirectory()) {
-    fail(errStatus,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
-  }
-  if(parse(canonical).root===canonical) {
-    fail(errStatus,'PROJECT_ROOT_FILESYSTEM_ROOT','Choose a project directory rather than a filesystem root.');
-  }
-  return canonical;
+  return canonicalDirectory(rawRoot,PROJECT_ROOT_CODES,useTime?409:400).path;
 }
 
+/**
+ * Containment is decided by directory identity, never by comparing or case-folding path
+ * strings. Both paths are canonicalized to link-free on-disk spellings, then the candidate's
+ * actual ancestor chain must contain the project root's (dev, ino) at exactly the project's
+ * canonical spelling. This stays correct for Windows case-sensitive directories, where
+ * `C:\x\proj` and `C:\x\PROJ` can be different directories.
+ */
 export function verifyContainedRoot(projectRoot,candidateRoot,{useTime=false}={}) {
   const errStatus=useTime?409:400;
-  validateLocalPathSyntax(candidateRoot,'INVALID_APPROVED_ROOTS','approved root path');
+  validateLocalPathSyntax(candidateRoot,APPROVED_ROOT_CODES.syntax,APPROVED_ROOT_CODES.label);
   if(typeof projectRoot!=='string'||!projectRoot) {
     fail(errStatus,'APPROVED_ROOT_OUTSIDE_PROJECT','Project has no registered local root for approved filesystem paths.');
   }
-  const canonicalProject=resolveLocalRoot(projectRoot,{useTime});
-  const candidateResolved=resolve(candidateRoot);
-  const synRel=relative(canonicalProject,candidateResolved);
-  if(synRel.startsWith('..')||isAbsolute(synRel)) {
+  const project=canonicalDirectory(projectRoot,PROJECT_ROOT_CODES,errStatus);
+  const candidate=canonicalDirectory(candidateRoot,APPROVED_ROOT_CODES,errStatus);
+  const ancestor=candidate.chain.find(entry=>sameIdentity(entry,project));
+  if(!ancestor||ancestor.path!==project.path) {
     fail(errStatus,'APPROVED_ROOT_OUTSIDE_PROJECT','Approved root must be inside the registered project root.');
   }
-  if(synRel!=='') {
-    let cursor=canonicalProject;
-    for(const seg of synRel.split(/[\\/]+/)) {
-      if(!seg)continue;
-      cursor=join(cursor,seg);
-      let segStat;
-      try {
-        segStat=lstatSync(cursor);
-      } catch {
-        fail(errStatus,'APPROVED_ROOT_MISSING','Approved root does not exist on disk.');
-      }
-      if(segStat.isSymbolicLink()) {
-        fail(errStatus,'APPROVED_ROOT_SYMLINK','Approved root cannot be or traverse a symbolic link or junction.');
-      }
-      if(!segStat.isDirectory()) {
-        fail(errStatus,'APPROVED_ROOT_NOT_DIRECTORY','Approved root must be a directory.');
-      }
-    }
-  }
-  let canonicalCandidate;
-  try {
-    canonicalCandidate=realpathSync(candidateResolved);
-  } catch {
-    fail(errStatus,'APPROVED_ROOT_MISSING','Approved root could not be resolved.');
-  }
-  const canonRel=relative(canonicalProject,canonicalCandidate);
-  if(canonRel.startsWith('..')||isAbsolute(canonRel)||!pathsEqual(canonRel,synRel)) {
-    fail(errStatus,'APPROVED_ROOT_OUTSIDE_PROJECT','Approved root resolves outside the registered project root.');
-  }
-  return canonicalCandidate;
+  return candidate.path;
 }
 
 export function captureProjectRootIdentity(projectRoot,{useTime=false}={}) {
-  const canonical=resolveLocalRoot(projectRoot,{useTime});
-  let st;
-  try {
-    st=statSync(canonical,{bigint:true});
-  } catch {
-    fail(useTime?409:400,'PROJECT_ROOT_MISSING','The selected project root does not exist.');
-  }
-  if(!st.isDirectory()) {
-    fail(useTime?409:400,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
-  }
+  const canonical=canonicalDirectory(projectRoot,PROJECT_ROOT_CODES,useTime?409:400);
   return Object.freeze({
-    path:canonical,
-    dev:String(st.dev),
-    ino:String(st.ino),
+    path:canonical.path,
+    dev:String(canonical.dev),
+    ino:String(canonical.ino),
   });
+}
+
+function readPinnedFile(fullPath,expected,errStatus) {
+  let fd;
+  try {
+    // O_NOFOLLOW is POSIX-only; Windows has no equivalent flag through node:fs.
+    fd=openSync(fullPath,fsConstants.O_RDONLY|(fsConstants.O_NOFOLLOW??0));
+  } catch {
+    fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root file could not be read for snapshot verification.');
+  }
+  try {
+    let st;
+    try {
+      st=fstatSync(fd,{bigint:true});
+    } catch {
+      fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root file could not be inspected for snapshot verification.');
+    }
+    if(!st.isFile()||st.dev!==expected.dev||st.ino!==expected.ino||st.size!==expected.size) {
+      fail(errStatus,'APPROVED_ROOT_CHANGED','Approved root entry changed while its snapshot was being read.');
+    }
+    let data;
+    try {
+      data=readFileSync(fd);
+    } catch {
+      fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root file could not be read for snapshot verification.');
+    }
+    if(BigInt(data.length)!==expected.size) {
+      fail(errStatus,'APPROVED_ROOT_CHANGED','Approved root entry changed while its snapshot was being read.');
+    }
+    return data;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function captureDirectoryIdentity(
@@ -209,16 +263,8 @@ export function captureDirectoryIdentity(
   {useTime=false,maxEntries=DEFAULT_ROOT_MAX_ENTRIES,maxBytes=DEFAULT_ROOT_MAX_BYTES}={}
 ) {
   const errStatus=useTime?409:400;
-  const canonical=resolveLocalRoot(rawDir,{useTime});
-  let rootStat;
-  try {
-    rootStat=statSync(canonical,{bigint:true});
-  } catch {
-    fail(errStatus,'APPROVED_ROOT_MISSING','Approved root does not exist on disk.');
-  }
-  if(!rootStat.isDirectory()) {
-    fail(errStatus,'APPROVED_ROOT_NOT_DIRECTORY','Approved root must be a directory.');
-  }
+  const rootDir=canonicalDirectory(rawDir,APPROVED_ROOT_CODES,errStatus);
+  const canonical=rootDir.path;
 
   const treeHash=createHash('sha256').update('ROOT_TREE_V1\0');
   let entryCount=0;
@@ -250,11 +296,13 @@ export function captureDirectoryIdentity(
       }
       let realEntry;
       try {
-        realEntry=realpathSync(fullPath);
+        realEntry=realpathSync.native(fullPath);
       } catch {
         fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root entry could not be resolved.');
       }
-      if(!pathsEqual(realEntry,fullPath)) {
+      // fullPath joins the canonical on-disk root with readdir names, so an exact match is
+      // expected; any difference means a reparse point or alias that lstat did not report.
+      if(realEntry!==fullPath) {
         fail(errStatus,'APPROVED_ROOT_SYMLINK','Approved root entry resolves through a symbolic link or junction.');
       }
       if(lst.isDirectory()) {
@@ -266,12 +314,10 @@ export function captureDirectoryIdentity(
           fail(errStatus,'ROOT_SNAPSHOT_LIMIT_EXCEEDED','Approved root exceeds maximum byte size for snapshot verification.');
         }
         totalBytes+=size;
-        let fileDigest;
-        try {
-          fileDigest=createHash('sha256').update(readFileSync(fullPath)).digest('hex');
-        } catch {
-          fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root file could not be read for snapshot verification.');
-        }
+        // Reads through an fd whose identity must match the lstat result. This narrows, but
+        // does not close, the pathname check-to-use window: node:fs has no openat, so an
+        // ancestor directory swapped between checks is not handle-pinned.
+        const fileDigest=createHash('sha256').update(readPinnedFile(fullPath,lst,errStatus)).digest('hex');
         treeHash.update(`F:${relPath}\0${size}\0${fileDigest}\0`);
       } else {
         fail(errStatus,'INVALID_APPROVED_ROOT_ENTRY','Approved root contains an unsupported filesystem entry.');
@@ -282,8 +328,8 @@ export function captureDirectoryIdentity(
   walk(canonical,'');
   return Object.freeze({
     path:canonical,
-    dev:String(rootStat.dev),
-    ino:String(rootStat.ino),
+    dev:String(rootDir.dev),
+    ino:String(rootDir.ino),
     treeDigest:treeHash.digest('hex'),
     entryCount,
     totalBytes,
@@ -314,7 +360,7 @@ export function verifyContainedRootIdentity(
        typeof expectedIdentity.treeDigest!=='string') {
       fail(409,'APPROVED_ROOT_IDENTITY_INVALID','Expected approved root identity is invalid.');
     }
-    if(!pathsEqual(identity.path,expectedIdentity.path)||
+    if(identity.path!==expectedIdentity.path||
        identity.dev!==expectedIdentity.dev||
        identity.ino!==expectedIdentity.ino) {
       fail(409,'APPROVED_ROOT_REPLACED','Approved root directory identity changed on disk after approval.');
@@ -328,6 +374,13 @@ export function verifyContainedRootIdentity(
   return identity;
 }
 
+function rootIdentityState(row) {
+  if(row.root===null)return 'none';
+  return row.root_dev!==null&&row.root_dev!==undefined&&row.root_ino!==null&&row.root_ino!==undefined
+    ?'bound'
+    :'unverified';
+}
+
 function rowToProject(row) {
   return Object.freeze({
     id:row.id,
@@ -335,6 +388,7 @@ function rowToProject(row) {
     root:row.root,
     rootDev:row.root_dev??null,
     rootIno:row.root_ino??null,
+    rootIdentityState:rootIdentityState(row),
     revision:row.revision,
     isDefault:row.is_default===1,
     createdAt:row.created_at,
@@ -431,14 +485,119 @@ export class WorkspaceProjects {
     return project;
   }
 
+  /**
+   * Rows migrated from schemas without root_dev/root_ino never recorded which directory
+   * they named, so the current directory at that path cannot be trusted implicitly. Such
+   * rows fail closed until an owner calls revalidateProjectRoot.
+   */
   verifyProjectRootIdentity(project,{useTime=false}={}) {
     if(!project||project.root===null)return null;
+    if(project.rootDev===null||project.rootIno===null) {
+      fail(
+        409,
+        'PROJECT_ROOT_IDENTITY_UNVERIFIED',
+        'Registered project root has no recorded directory identity. Revalidate the project root before use.'
+      );
+    }
     const current=captureProjectRootIdentity(project.root,{useTime});
-    if(project.rootDev!==null&&project.rootIno!==null&&
-       (current.dev!==project.rootDev||current.ino!==project.rootIno)) {
+    if(current.dev!==project.rootDev||current.ino!==project.rootIno) {
       fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory identity changed on disk.');
     }
+    if(current.path!==project.root) {
+      fail(
+        409,
+        'PROJECT_ROOT_IDENTITY_UNVERIFIED',
+        'Registered project root spelling is not its canonical on-disk path. Revalidate the project root before use.'
+      );
+    }
     return current;
+  }
+
+  #identityConflict(identity,excludeId) {
+    const bound=this.db.prepare(
+      'SELECT id FROM workspace_projects WHERE root_dev=? AND root_ino=? AND id IS NOT ?'
+    ).get(identity.dev,identity.ino,excludeId);
+    if(bound)return bound.id;
+    const unbound=this.db.prepare(
+      'SELECT id,root FROM workspace_projects WHERE root IS NOT NULL AND (root_dev IS NULL OR root_ino IS NULL) AND id IS NOT ?'
+    ).all(excludeId);
+    for(const row of unbound) {
+      let other;
+      try {
+        other=captureProjectRootIdentity(row.root);
+      } catch {
+        continue;
+      }
+      if(other.dev===identity.dev&&other.ino===identity.ino)return row.id;
+    }
+    return null;
+  }
+
+  /**
+   * Explicit owner re-confirmation for a row that lacks a recorded root identity or whose
+   * stored spelling is not canonical. The owner supplies the root path and the revision they
+   * reviewed; both must match the stored record, and the path must resolve link-free to the
+   * same directory the stored root names now. This re-anchors trust at the moment of owner
+   * confirmation. It cannot prove the directory is the one originally registered, because
+   * the legacy row never recorded that identity.
+   */
+  revalidateProjectRoot(id,input) {
+    normalizeProjectId(id);
+    if(!isPlainObject(input)||Object.keys(input).some(key=>key!=='root'&&key!=='revision')||
+       !Object.hasOwn(input,'root')||!Object.hasOwn(input,'revision')) {
+      fail(400,'INVALID_PROJECT_INPUT','Provide only the confirmed root and revision.');
+    }
+    const confirmedRevision=normalizeRevision(input.revision);
+    const confirmed=captureProjectRootIdentity(input.root);
+    return this.transaction(()=>{
+      const existing=this.db.prepare(
+        'SELECT id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at FROM workspace_projects WHERE id=?'
+      ).get(id);
+      if(!existing)fail(404,'PROJECT_NOT_FOUND','Project not found.');
+      if(existing.root===null) {
+        fail(409,'PROJECT_ROOT_CONFLICT','This project has no registered local root to revalidate.');
+      }
+      if(existing.revision!==confirmedRevision) {
+        fail(409,'PROJECT_REVISION_CHANGED','Confirmed revision does not match the registered project revision.');
+      }
+      const state=rootIdentityState(existing);
+      if(state==='bound'&&existing.root===confirmed.path) {
+        if(existing.root_dev!==confirmed.dev||existing.root_ino!==confirmed.ino) {
+          fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory identity changed on disk.');
+        }
+        return Object.freeze({revalidated:false,project:rowToProject(existing)});
+      }
+      let stored;
+      try {
+        stored=captureProjectRootIdentity(existing.root,{useTime:true});
+      } catch(error) {
+        fail(409,'PROJECT_ROOT_REVALIDATION_FAILED','Registered project root could not be safely resolved: '+(error.code??'UNKNOWN')+'.');
+      }
+      if(stored.path!==confirmed.path||stored.dev!==confirmed.dev||stored.ino!==confirmed.ino) {
+        fail(409,'PROJECT_ROOT_CONFLICT','Confirmed root is not the directory named by the registered project root.');
+      }
+      if(state==='bound'&&(existing.root_dev!==confirmed.dev||existing.root_ino!==confirmed.ino)) {
+        fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory identity changed on disk.');
+      }
+      const clash=this.db.prepare('SELECT id FROM workspace_projects WHERE root=? AND id!=?').get(confirmed.path,id);
+      if(clash||this.#identityConflict(confirmed,id)!==null) {
+        fail(409,'PROJECT_ROOT_CONFLICT','This directory is already registered under a different project record.');
+      }
+      const nowIso=this.#nowIso();
+      this.db.prepare(
+        'UPDATE workspace_projects SET root=?,root_dev=?,root_ino=?,updated_at=? WHERE id=?'
+      ).run(confirmed.path,confirmed.dev,confirmed.ino,nowIso,id);
+      return Object.freeze({
+        revalidated:true,
+        project:rowToProject({
+          ...existing,
+          root:confirmed.path,
+          root_dev:confirmed.dev,
+          root_ino:confirmed.ino,
+          updated_at:nowIso,
+        }),
+      });
+    });
   }
 
   registerProject(input) {
@@ -454,14 +613,23 @@ export class WorkspaceProjects {
         'SELECT id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at FROM workspace_projects WHERE root=?'
       ).get(root);
       if(existing) {
-        if(existing.root_dev!==null&&existing.root_ino!==null&&
-           (existing.root_dev!==identity.dev||existing.root_ino!==identity.ino)) {
+        if(rootIdentityState(existing)!=='bound') {
+          fail(
+            409,
+            'PROJECT_ROOT_IDENTITY_UNVERIFIED',
+            'This local root is registered without a recorded directory identity. Revalidate it instead.'
+          );
+        }
+        if(existing.root_dev!==identity.dev||existing.root_ino!==identity.ino) {
           fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory at this path was replaced on disk.');
         }
         if(existing.label===label&&existing.revision===revision) {
           return Object.freeze({created:false,project:rowToProject(existing)});
         }
         fail(409,'PROJECT_ROOT_CONFLICT','This local root is already registered under a different project record.');
+      }
+      if(this.#identityConflict(identity,null)!==null) {
+        fail(409,'PROJECT_ROOT_CONFLICT','This directory is already registered under a different path or project record.');
       }
       const id=this.nonce();
       normalizeProjectId(id);

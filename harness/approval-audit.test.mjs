@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomUUID,createHash} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
-import {mkdirSync,mkdtempSync,renameSync,rmSync,symlinkSync,writeFileSync} from 'node:fs';
+import {existsSync,mkdirSync,mkdtempSync,renameSync,rmSync,symlinkSync,writeFileSync} from 'node:fs';
 import {join,parse,resolve} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {Worker} from 'node:worker_threads';
@@ -43,13 +43,21 @@ function makeScratchDir(t,prefix='pkg02-synthetic-') {
  */
 function makeHostHarness({clock=()=>1_795_000_000_000}={}) {
   const serverTasks=new Map();
+  const serverActions=new Map();
+  const scopeRequests=[];
   const artifacts=new Map([['patch:patch-1',TARGET_PAYLOAD_V1]]);
   const workers=new Map();
   const receipts=new Map();
   const stoppedControllers=new Map();
   const lockedSessions=new Set();
 
-  const scopeResolver=({taskId})=>{
+  const scopeResolver=request=>{
+    scopeRequests.push(request);
+    const {taskId,grantKind,action}=request;
+    if(grantKind==='action') {
+      const pending=serverActions.get(`${taskId}:${action}`);
+      return pending?{...pending}:null;
+    }
     const state=serverTasks.get(taskId);
     if(!state)return null;
     return {
@@ -106,6 +114,15 @@ function makeHostHarness({clock=()=>1_795_000_000_000}={}) {
     if(!prev)throw Error('Missing synthetic server task '+taskId);
     serverTasks.set(taskId,{...prev,...patch});
   };
+  const registerActionScope=(taskId,action,scope)=>{
+    serverActions.set(`${taskId}:${action}`,{taskId,action,...scope});
+  };
+  const updateActionScope=(taskId,action,patch)=>{
+    const key=`${taskId}:${action}`;
+    const prev=serverActions.get(key);
+    if(!prev)throw Error('Missing synthetic server action '+key);
+    serverActions.set(key,{...prev,...patch});
+  };
   const setArtifact=(kind,id,content)=>{
     artifacts.set(`${kind}:${id}`,content);
   };
@@ -126,6 +143,10 @@ function makeHostHarness({clock=()=>1_795_000_000_000}={}) {
 
   return {
     serverTasks,
+    serverActions,
+    scopeRequests,
+    registerActionScope,
+    updateActionScope,
     artifacts,
     workers,
     receipts,
@@ -230,6 +251,24 @@ function validActionInput({projectId,approvedRoots=[],...rest}={}) {
     permissions:['read-only-source','repository-write'],
     ...rest,
   };
+}
+
+// Records the synthetic server's own pending-action state from the inputs shown at approval,
+// independently of the stored grant.
+function registerActionScopeFromInput(host,projects,input) {
+  const project=projects.requireProject(input.projectId);
+  host.registerActionScope(input.taskId,input.action,{
+    taskVersion:input.taskVersion,
+    projectId:input.projectId,
+    projectRevision:project.revision,
+    sourceHash:input.sourceHash,
+    routeRevision:input.routeRevision,
+    target:{kind:input.target.kind,id:input.target.id},
+    destination:input.destination,
+    accountRef:input.accountRef,
+    approvedRoots:input.approvedRoots,
+    permissions:input.permissions,
+  });
 }
 
 function consumeArgsFromGrant(grant,overrides={}) {
@@ -855,8 +894,14 @@ test('5-minute single-use action grants verify actual artifact digest, bind sess
     delete incomplete.target;
     assert.throws(()=>audit.consumeActionGrant(incomplete),{status:400,code:'INVALID_ACTION_TARGET'});
 
+    // Matching caller arguments are not enough: without the server's pending action scope it holds closed.
+    assert.throws(()=>audit.consumeActionGrant(consumeArgs),{status:409,code:'UNVERIFIED_ACTION_SCOPE'});
+    assert.equal(audit.readGrant(grant.grantId).consumedAt,null);
+    registerActionScopeFromInput(host,projects,baseInput);
+
     const consumed=audit.consumeActionGrant(consumeArgs);
     assert.equal(consumed.consumed,true);
+    assert.equal(consumed.sealedHandoff,false);
     assert.throws(()=>audit.consumeActionGrant(consumeArgs),{status:409,code:'GRANT_ALREADY_USED'});
     assert.throws(()=>audit.revokeGrant(grant.grantId),{status:409,code:'GRANT_ALREADY_USED'});
     assert.throws(()=>db.prepare('DELETE FROM approval_action_consumptions WHERE grant_id=?').run(grant.grantId),/cannot be deleted/);
@@ -1656,6 +1701,285 @@ test('llamacpp fingerprint binding, tampered grants/claims, action grant replay/
       claimId:llama.claim.claimId,
       ownership:lease,
     }),{status:409,code:'GRANT_INTEGRITY_ERROR'});
+  } finally {
+    db.close();
+  }
+});
+
+test('action grant consumption requires an independently resolved authoritative scope and rejects server-side drift without consuming',t=>{
+  const scratch=makeScratchDir(t);
+  const projectDir=join(scratch,'repo-action-scope');
+  const srcDir=join(projectDir,'src');
+  const otherDir=join(projectDir,'other');
+  const outsideDir=join(scratch,'outside-action-scope');
+  mkdirSync(srcDir,{recursive:true});
+  mkdirSync(otherDir);
+  mkdirSync(outsideDir);
+  const now=1_795_000_000_000;
+
+  // A trusted target verifier alone is not enough: without a scopeResolver consumption holds closed.
+  const bareDb=new DatabaseSync(':memory:');
+  try {
+    const bareProjects=new WorkspaceProjects(bareDb,{clock:()=>now});
+    const bareAudit=new ApprovalAuditStore(bareDb,{
+      clock:()=>now,
+      projects:bareProjects,
+      hostVerifiers:{resolveTargetDigest:()=>({digest:TARGET_DIGEST})},
+    });
+    const {project:bareProject}=bareProjects.registerProject({label:'BareScope',root:projectDir,revision:GIT_REV});
+    const bareGrant=bareAudit.issueActionGrant(validActionInput({projectId:bareProject.id,approvedRoots:[srcDir]}));
+    assert.throws(()=>bareAudit.consumeActionGrant(consumeArgsFromGrant(bareGrant)),{status:409,code:'UNVERIFIED_ACTION_SCOPE'});
+    assert.equal(bareAudit.readGrant(bareGrant.grantId).consumedAt,null);
+    assert.equal(bareAudit.listAuditLog(bareGrant.grantId).some(entry=>entry.eventType==='action_grant.consumed'),false);
+  } finally {
+    bareDb.close();
+  }
+
+  const {db,projects,audit,host}=makeStores({clock:()=>now});
+  try {
+    const {project}=projects.registerProject({label:'ActionScope',root:projectDir,revision:GIT_REV});
+    const input=validActionInput({projectId:project.id,approvedRoots:[srcDir]});
+    const grant=audit.issueActionGrant(input);
+    const args=consumeArgsFromGrant(grant);
+    const assertNotConsumed=()=>assert.equal(audit.readGrant(grant.grantId).consumedAt,null);
+
+    // No pending server action for this task: unverified, even though caller arguments match the grant.
+    assert.throws(()=>audit.consumeActionGrant(args),{status:409,code:'UNVERIFIED_ACTION_SCOPE'});
+    assertNotConsumed();
+    const request=host.scopeRequests.at(-1);
+    assert.equal(request.grantKind,'action');
+    assert.deepEqual(Object.keys(request).sort(),['action','attemptId','claimId','grantId','grantKind','projectId','taskId']);
+    assert.equal(request.taskId,grant.taskId);
+
+    registerActionScopeFromInput(host,projects,input);
+    const key=`${input.taskId}:${input.action}`;
+    const baseline={...host.serverActions.get(key)};
+
+    // Partial or malformed server scope is unverified, not repaired from caller input.
+    const withoutRoots={...baseline};
+    delete withoutRoots.approvedRoots;
+    for(const broken of [
+      withoutRoots,
+      {...baseline,accountRef:undefined},
+      {...baseline,sourceHash:'not-a-digest'},
+      {...baseline,taskId:'not-a-uuid'},
+      {...baseline,target:{kind:'patch',id:'patch-1',extra:true}},
+      {...baseline,destination:{kind:'remote-endpoint',endpoint:'https://user:pw@example.com/v1'}},
+      {...baseline,permissions:['not-a-scope']},
+    ]) {
+      host.serverActions.set(key,broken);
+      assert.throws(()=>audit.consumeActionGrant(args),{status:409,code:'UNVERIFIED_ACTION_SCOPE'});
+      assertNotConsumed();
+    }
+    host.serverActions.set(key,baseline);
+
+    // Throwing, asynchronous, or non-object resolvers fail closed.
+    for(const resolver of [
+      ()=>{throw Error('host state unavailable');},
+      ()=>Promise.resolve(baseline),
+      ()=>'scope',
+    ]) {
+      const alt=new ApprovalAuditStore(db,{clock:()=>now,projects,scopeResolver:resolver,hostVerifiers:host.hostVerifiers});
+      assert.throws(()=>alt.consumeActionGrant(args),{status:409,code:'UNVERIFIED_ACTION_SCOPE'});
+      assertNotConsumed();
+    }
+
+    // Server-side drift rejects consumption while the caller still presents the original approved values.
+    const driftCases=[
+      [{taskVersion:baseline.taskVersion+1},'SCOPE_CHANGED'],
+      [{projectId:DEFAULT_PROJECT_ID},'SCOPE_CHANGED'],
+      [{projectRevision:GIT_REV_2},'PROJECT_REVISION_CHANGED'],
+      [{action:'export-artifact'},'ACTION_MISMATCH'],
+      [{target:{kind:'patch',id:'patch-2'}},'TARGET_MISMATCH'],
+      [{target:{kind:'patch',id:'patch-1',digest:sha('superseded-patch')}},'TARGET_MISMATCH'],
+      [{sourceHash:sha('source-v2')},'SCOPE_CHANGED'],
+      [{routeRevision:sha('route-v2')},'ROUTE_CHANGED'],
+      [{destination:{kind:'local-loopback',endpoint:'http://127.0.0.1:11434'}},'DESTINATION_CHANGED'],
+      [{accountRef:'other-account'},'SCOPE_CHANGED'],
+      [{accountRef:null},'SCOPE_CHANGED'],
+      [{permissions:['read-only-source']},'SCOPE_CHANGED'],
+      [{approvedRoots:[otherDir]},'SCOPE_CHANGED'],
+      [{approvedRoots:[]},'SCOPE_CHANGED'],
+      [{approvedRoots:[outsideDir]},'APPROVED_ROOT_OUTSIDE_PROJECT'],
+    ];
+    for(const [patch,code] of driftCases) {
+      host.serverActions.set(key,{...baseline,...patch});
+      assert.throws(()=>audit.consumeActionGrant(args),{status:409,code},JSON.stringify(patch));
+      assertNotConsumed();
+    }
+
+    // The server may also report the target digest; a matching digest is accepted.
+    host.serverActions.set(key,{...baseline,target:{kind:'patch',id:'patch-1',digest:TARGET_DIGEST}});
+    const consumed=audit.consumeActionGrant(args);
+    assert.equal(consumed.consumed,true);
+    assert.equal(consumed.sealedHandoff,false);
+    assert.throws(()=>audit.consumeActionGrant(args),{status:409,code:'GRANT_ALREADY_USED'});
+  } finally {
+    db.close();
+  }
+});
+
+test('approved-root containment uses on-disk directory identity rather than case-folded path text',t=>{
+  const scratch=makeScratchDir(t);
+  const projectDir=join(scratch,'proj');
+  mkdirSync(join(projectDir,'src'),{recursive:true});
+  mkdirSync(join(scratch,'case-probe'));
+  const caseSensitive=!existsSync(join(scratch,'CASE-PROBE'));
+  const {db,projects,audit,host}=makeStores();
+  try {
+    const {project}=projects.registerProject({label:'CaseRepo',root:projectDir,revision:GIT_REV});
+    assert.equal(project.rootIdentityState,'bound');
+    if(caseSensitive) {
+      // A sibling whose name differs only by letter case is a different directory, outside the project.
+      const twin=join(scratch,'PROJ');
+      mkdirSync(join(twin,'src'),{recursive:true});
+      assert.throws(()=>verifyContainedRoot(project.root,twin),{status:400,code:'APPROVED_ROOT_OUTSIDE_PROJECT'});
+      assert.throws(()=>verifyContainedRoot(project.root,join(twin,'src')),{status:400,code:'APPROVED_ROOT_OUTSIDE_PROJECT'});
+      assert.throws(()=>verifyContainedRoot(project.root,join(twin,'src'),{useTime:true}),{status:409,code:'APPROVED_ROOT_OUTSIDE_PROJECT'});
+      assert.throws(()=>audit.issueAttemptGrant(validAttemptInput({
+        projectId:project.id,
+        approvedRoots:[join(twin,'src')],
+      })),{status:400,code:'APPROVED_ROOT_OUTSIDE_PROJECT'});
+
+      // Case-variant children inside the project remain distinct approved roots; exact duplicates collapse.
+      mkdirSync(join(projectDir,'SRC'));
+      const input=validAttemptInput({
+        projectId:project.id,
+        approvedRoots:[join(projectDir,'src'),join(projectDir,'SRC'),join(projectDir,'src')],
+      });
+      registerScopeFromInput(host,projects,input);
+      const issued=audit.issueAttemptGrant(input);
+      assert.deepEqual(issued.grant.approvedRoots,[join(projectDir,'SRC'),join(projectDir,'src')]);
+      assert.notEqual(issued.grant.rootIdentities[0].ino,issued.grant.rootIdentities[1].ino);
+
+      // The case-variant twin registers as its own project rather than aliasing the original.
+      const twinReg=projects.registerProject({label:'Twin',root:twin});
+      assert.equal(twinReg.created,true);
+      assert.notEqual(twinReg.project.rootIno,project.rootIno);
+    } else {
+      // Case-insensitive volume: a wrong-case spelling resolves to the on-disk spelling of the same directory.
+      assert.equal(verifyContainedRoot(project.root,join(projectDir,'SRC')),join(project.root,'src'));
+      assert.throws(()=>projects.registerProject({label:'Alias',root:join(scratch,'PROJ')}),{status:409,code:'PROJECT_ROOT_CONFLICT'});
+    }
+
+    // A link anywhere in the candidate chain is rejected by type, even when it points into the project.
+    const alias=join(scratch,'proj-alias');
+    let linked=false;
+    try {
+      symlinkSync(projectDir,alias,'junction');
+      linked=true;
+    } catch {
+      linked=false;
+    }
+    if(linked) {
+      assert.throws(()=>verifyContainedRoot(project.root,join(alias,'src')),{status:400,code:'APPROVED_ROOT_SYMLINK'});
+      assert.throws(()=>verifyContainedRoot(alias,join(projectDir,'src')),{status:400,code:'PROJECT_ROOT_SYMLINK'});
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test('migrated project rows without a recorded root identity fail closed until an owner revalidates them',t=>{
+  const scratch=makeScratchDir(t);
+  const projectDir=join(scratch,'legacy-repo');
+  const otherDir=join(scratch,'other-repo');
+  mkdirSync(join(projectDir,'src'),{recursive:true});
+  mkdirSync(otherDir);
+  const dbPath=join(scratch,'legacy-projects.sqlite');
+  const legacyId='legacy-project-1';
+  const createdIso=new Date(1_795_000_000_000).toISOString();
+  const oldDb=new DatabaseSync(dbPath);
+  try {
+    oldDb.exec(`
+      CREATE TABLE workspace_projects (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        root TEXT UNIQUE,
+        revision TEXT,
+        is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`);
+    oldDb.prepare(
+      'INSERT INTO workspace_projects (id,label,root,revision,is_default,created_at,updated_at) VALUES (?,?,?,?,0,?,?)'
+    ).run(legacyId,'Legacy Repo',resolveLocalRoot(projectDir),GIT_REV,createdIso,createdIso);
+  } finally {
+    oldDb.close();
+  }
+
+  let now=1_795_000_100_000;
+  const {db,projects,audit,host}=makeStores({clock:()=>now,dbPath});
+  try {
+    const legacy=projects.requireProject(legacyId);
+    assert.equal(legacy.rootIdentityState,'unverified');
+    assert.equal(legacy.rootDev,null);
+    assert.throws(()=>projects.verifyProjectRootIdentity(legacy),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
+
+    const attemptInput=validAttemptInput({projectId:legacyId,approvedRoots:[join(projectDir,'src')]});
+    registerScopeFromInput(host,projects,attemptInput);
+    assert.throws(()=>audit.issueAttemptGrant(attemptInput),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
+    assert.throws(()=>audit.issueActionGrant(validActionInput({
+      projectId:legacyId,
+      approvedRoots:[],
+    })),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
+
+    // Re-registering the same path does not silently bind the unverified row.
+    assert.throws(()=>projects.registerProject({label:'Legacy Repo',root:projectDir,revision:GIT_REV}),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
+    assert.equal(projects.requireProject(legacyId).rootIdentityState,'unverified');
+
+    // Revalidation requires exactly the owner-confirmed root and revision for the stored record.
+    assert.throws(()=>projects.revalidateProjectRoot(legacyId,{root:projectDir}),{status:400,code:'INVALID_PROJECT_INPUT'});
+    assert.throws(()=>projects.revalidateProjectRoot(legacyId,{root:projectDir,revision:GIT_REV,label:'x'}),{status:400,code:'INVALID_PROJECT_INPUT'});
+    assert.throws(()=>projects.revalidateProjectRoot(legacyId,{root:projectDir,revision:GIT_REV_2}),{status:409,code:'PROJECT_REVISION_CHANGED'});
+    assert.throws(()=>projects.revalidateProjectRoot(legacyId,{root:otherDir,revision:GIT_REV}),{status:409,code:'PROJECT_ROOT_CONFLICT'});
+    assert.throws(()=>projects.revalidateProjectRoot(legacyId,{root:join(projectDir,'src'),revision:GIT_REV}),{status:409,code:'PROJECT_ROOT_CONFLICT'});
+    assert.throws(()=>projects.revalidateProjectRoot('missing-project',{root:projectDir,revision:GIT_REV}),{status:404,code:'PROJECT_NOT_FOUND'});
+    assert.throws(()=>projects.revalidateProjectRoot(DEFAULT_PROJECT_ID,{root:projectDir,revision:null}),{status:409,code:'PROJECT_ROOT_CONFLICT'});
+    assert.equal(projects.requireProject(legacyId).rootIdentityState,'unverified');
+
+    // A legacy root that now resolves through a link cannot be revalidated and stays unusable.
+    const linkRoot=join(scratch,'legacy-link');
+    let linked=false;
+    try {
+      symlinkSync(otherDir,linkRoot,'junction');
+      linked=true;
+    } catch {
+      linked=false;
+    }
+    if(linked) {
+      db.prepare(
+        'INSERT INTO workspace_projects (id,label,root,revision,is_default,created_at,updated_at) VALUES (?,?,?,?,0,?,?)'
+      ).run('legacy-link-project','Legacy Link',linkRoot,null,createdIso,createdIso);
+      assert.throws(()=>projects.revalidateProjectRoot('legacy-link-project',{root:linkRoot,revision:null}),{status:400,code:'PROJECT_ROOT_SYMLINK'});
+      assert.throws(()=>projects.revalidateProjectRoot('legacy-link-project',{root:otherDir,revision:null}),{status:409,code:'PROJECT_ROOT_REVALIDATION_FAILED'});
+      assert.throws(()=>audit.issueActionGrant(validActionInput({
+        projectId:'legacy-link-project',
+        approvedRoots:[],
+      })),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
+    }
+
+    now+=1000;
+    const revalidated=projects.revalidateProjectRoot(legacyId,{root:projectDir,revision:GIT_REV});
+    assert.equal(revalidated.revalidated,true);
+    assert.equal(revalidated.project.rootIdentityState,'bound');
+    assert.equal(revalidated.project.root,resolveLocalRoot(projectDir));
+    assert.ok(revalidated.project.rootDev&&revalidated.project.rootIno);
+    assert.equal(revalidated.project.updatedAt,new Date(now).toISOString());
+    assert.equal(projects.revalidateProjectRoot(legacyId,{root:projectDir,revision:GIT_REV}).revalidated,false);
+    assert.equal(projects.registerProject({label:'Legacy Repo',root:projectDir,revision:GIT_REV}).project.id,legacyId);
+
+    const issued=audit.issueAttemptGrant(attemptInput);
+    assert.equal(issued.grant.projectRootIdentity.ino,revalidated.project.rootIno);
+
+    // Once bound, same-path replacement is detected again and cannot be re-anchored by revalidation.
+    rmSync(projectDir,{recursive:true,force:true});
+    mkdirSync(join(projectDir,'src'),{recursive:true});
+    assert.throws(()=>audit.issueAttemptGrant(validAttemptInput({
+      projectId:legacyId,
+      approvedRoots:[join(projectDir,'src')],
+    })),{status:409,code:'PROJECT_ROOT_REPLACED'});
+    assert.throws(()=>projects.revalidateProjectRoot(legacyId,{root:projectDir,revision:GIT_REV}),{status:409,code:'PROJECT_ROOT_REPLACED'});
   } finally {
     db.close();
   }
