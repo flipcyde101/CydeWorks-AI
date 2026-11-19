@@ -342,7 +342,7 @@ test('stale data, zero rates, waiting-for-completion, and unavailable inputs beh
   assert.match(rowByKey(staleView,'overallEta').value,/stale/i);
   assert.match(rowByKey(staleView,'completion').value,/stale/i);
 
-  // 5/5 while still running waits for authoritative completion
+  // 5/5 while still running waits for authoritative completion and preserves withheld current-step ETA
   const waitingSettlement=describeProgress({
     status:'running',
     live:{
@@ -356,14 +356,60 @@ test('stale data, zero rates, waiting-for-completion, and unavailable inputs beh
           {at:start,done:0},
           {at:new Date(then+5000).toISOString(),done:5},
         ],
+        currentStep:{
+          index:5,
+          label:'Finalize checks',
+          measured:true,
+          completed:4,
+          total:4,
+          samples:[
+            {at:new Date(then+4000).toISOString(),done:0},
+            {at:new Date(then+5000).toISOString(),done:4},
+          ],
+        },
       },
     },
   },attempt,then+6000);
+  assert.equal(waitingSettlement.currentStepEtaMs,null);
+  assert.equal(waitingSettlement.unavailableReasons.currentStepEta,'Unavailable until the workspace confirms run completion.');
   const settleView=presentProgress(waitingSettlement,{formatLocalTime:fixedClock});
   assert.equal(settleView.phase,'waiting');
   assert.equal(settleView.complete,false);
-  assert.match(rowByKey(settleView,'remaining').value,/0 of 5 steps remaining \(waiting for completion\)/i);
+  assert.equal(rowByKey(settleView,'remaining').value,'0 of 5 steps remaining (waiting for completion)');
+  assert.equal(rowByKey(settleView,'currentStepEta').value,'Unavailable until the workspace confirms run completion.');
+  assert.equal(rowByKey(settleView,'currentStepEta').available,false);
+  assert.doesNotMatch(rowByKey(settleView,'currentStepEta').value,/current step complete|0 ms/i);
   assert.match(rowByKey(settleView,'overallEta').value,/confirm.*completion/i);
+
+  // Explicit unavailable reason or null ETA on completed sub-counters never fabricates a zero ETA
+  const withheldSubEtaView=presentProgress({
+    phase:'active',
+    status:'Running step 3 of 5',
+    totalKnown:true,
+    completedSteps:2,
+    totalSteps:5,
+    remainingSteps:3,
+    stepRate:0.5,
+    overallEtaMs:6000,
+    projectedCompletionMs:then+12000,
+    currentStep:{
+      index:3,
+      label:'Verify step',
+      completed:4,
+      total:4,
+      remaining:0,
+      doneTotal:'4/4',
+      percent:100,
+      etaMs:null,
+    },
+    currentStepEtaMs:null,
+    unavailableReasons:{
+      currentStepEta:'Unavailable until downstream check confirms step end.',
+    },
+  },{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(withheldSubEtaView,'currentStepEta').value,'Unavailable until downstream check confirms step end.');
+  assert.equal(rowByKey(withheldSubEtaView,'currentStepEta').available,false);
+  assert.doesNotMatch(rowByKey(withheldSubEtaView,'currentStepEta').value,/current step complete|0 ms/i);
 
   // Null, undefined, primitive, array, empty object inputs never throw
   for (const bad of [null,undefined,'running',42,['a'],new Date(),{}]) {
@@ -406,7 +452,9 @@ test('failures, premature completion, interruptions and cancellations distinguis
   assert.equal(failedView.stateLabel,'Failed');
   assert.equal(failedView.failed,true);
   assert.equal(failedView.complete,false);
-  assert.equal(failedView.explanation,'Protected check exited with status 1.');
+  assert.equal(failedView.explanation,'Attempt failed (code: E_ATTEMPT_FAILED). Detailed diagnostics are omitted; review recovery status before retrying.');
+  assert.doesNotMatch(failedView.text,/Protected check exited with status 1/);
+  assert.doesNotMatch(failedView.announcement,/Protected check exited with status 1/);
   assert.equal(rowByKey(failedView,'status').value,'Attempt failed');
   assert.equal(rowByKey(failedView,'completed').value,'3 of 5 steps (3/5, 60%)');
   assert.equal(rowByKey(failedView,'remaining').value,'2 of 5 steps remaining');
@@ -414,6 +462,14 @@ test('failures, premature completion, interruptions and cancellations distinguis
   assert.match(rowByKey(failedView,'currentStepEta').value,/failed/i);
   assert.match(rowByKey(failedView,'overallEta').value,/failed/i);
   assert.match(rowByKey(failedView,'completion').value,/failed/i);
+
+  // Generic describeProgress failure without problem/error keeps the static safe message
+  const genericFailedView=presentProgress(describeProgress({
+    status:'failed',
+    live:{heartbeat:new Date(then+3000).toISOString()},
+  },{status:'failed',started:start,execution:{phase:'dispatching',dispatchedAt:start}},then+5000));
+  assert.equal(genericFailedView.phase,'failed');
+  assert.equal(genericFailedView.explanation,'The attempt failed before completion.');
 
   // Contradictory complete input with remaining steps is forced to failed/incomplete
   const contradictoryComplete=presentProgress({
@@ -451,6 +507,41 @@ test('failures, premature completion, interruptions and cancellations distinguis
   assert.equal(cancelled.phase,'cancelled');
   assert.equal(cancelled.stateLabel,'Cancelled');
   assert.match(rowByKey(cancelled,'overallEta').value,/cancelled/i);
+
+  // Authoritative 5/5 failed, cancelled, and interrupted runs never claim waiting for completion
+  const fullSteps={
+    measured:true,
+    completed:5,
+    total:5,
+    samples:[
+      {at:start,done:0},
+      {at:new Date(then+5000).toISOString(),done:5},
+    ],
+  };
+  for (const [taskStatus,expectedPhase,expectedLabel] of [
+    ['failed','failed','Failed'],
+    ['cancelled','cancelled','Cancelled'],
+    ['interrupted','interrupted','Interrupted'],
+  ]) {
+    const terminal5View=presentProgress(describeProgress({
+      status:taskStatus,
+      live:{
+        lastActivity:new Date(then+5000).toISOString(),
+        heartbeat:new Date(then+5000).toISOString(),
+        steps:fullSteps,
+      },
+    },{
+      status:taskStatus==='failed' ? 'failed' : undefined,
+      started:start,
+      ended:new Date(then+6000).toISOString(),
+      execution:{phase:'dispatching',dispatchedAt:start},
+    },then+7000),{formatLocalTime:fixedClock});
+    assert.equal(terminal5View.phase,expectedPhase);
+    assert.equal(terminal5View.stateLabel,expectedLabel);
+    assert.equal(terminal5View.waiting,false);
+    assert.equal(rowByKey(terminal5View,'remaining').value,'0 of 5 steps remaining');
+    assert.doesNotMatch(rowByKey(terminal5View,'remaining').value,/waiting for completion/i);
+  }
 });
 
 test('clock anomalies suppress elapsed, rates, ETAs and completion times cleanly',()=>{
@@ -613,7 +704,7 @@ test('hostile inputs, accessor getters, revoked proxies, arbitrary objects and c
   assert.equal(revokedView.available,false);
   assert.equal(revokedView.phase,'unavailable');
 
-  // Arbitrary objects in string fields and unknown secret fields are never serialized or leaked
+  // Arbitrary objects in string fields, unknown secret fields, and failure diagnostics are omitted
   const leaky=presentProgress({
     phase:'failed',
     failed:true,
@@ -629,8 +720,74 @@ test('hostile inputs, accessor getters, revoked proxies, arbitrary objects and c
     source:'private source code',
   });
   assert.doesNotMatch(leaky.text,/\[object Object\]/);
-  assert.doesNotMatch(leaky.text,/do-not-leak|supersecretToken123|mysecretkey|sk-1234567890|top-secret-token|private user prompt|private source code|runner\.mjs/);
-  assert.match(leaky.explanation,/\[redacted\]/);
+  assert.doesNotMatch(leaky.text,/do-not-leak|supersecretToken123|mysecretkey|sk-1234567890|top-secret-token|private user prompt|private source code|runner\.mjs|Failed with/);
+  assert.doesNotMatch(leaky.announcement,/supersecretToken123|mysecretkey|Failed with/);
+  assert.equal(leaky.explanation,'Attempt failed (code: E_ATTEMPT_FAILED). Detailed diagnostics are omitted; review recovery status before retrying.');
+
+  // Real describeProgress failure diagnostics (JSON, non-JSON, unknown-secret) never print in presentation output
+  const diagnosticCases=[
+    {
+      name:'quoted JSON secret in attempt.problem',
+      task:{status:'failed',live:{heartbeat:new Date(then+3000).toISOString()}},
+      attempt:{
+        status:'failed',
+        started:start,
+        ended:new Date(then+4000).toISOString(),
+        problem:'{"token": "SENSITIVE_VALUE", "x_internal": "JSON_PRIVATE_42"}',
+        execution:{phase:'dispatching',dispatchedAt:start},
+      },
+      forbidden:/SENSITIVE_VALUE|JSON_PRIVATE_42|x_internal|"token"/,
+    },
+    {
+      name:'non-JSON diagnostic in live.error',
+      task:{
+        status:'running',
+        live:{
+          error:'Process exited 137 against internal-db.corp.local during checkout step',
+          heartbeat:new Date(then+3000).toISOString(),
+        },
+      },
+      attempt:{started:start,execution:{phase:'dispatching',dispatchedAt:start}},
+      forbidden:/137|internal-db\.corp\.local|checkout step/,
+    },
+    {
+      name:'unknown-secret key/value diagnostic in attempt.problem',
+      task:{status:'failed',live:{heartbeat:new Date(then+3000).toISOString()}},
+      attempt:{
+        status:'failed',
+        started:start,
+        ended:new Date(then+4000).toISOString(),
+        problem:'UNLISTED_CREDENTIAL_KEY=OPAQUE_SECRET_999',
+        execution:{phase:'dispatching',dispatchedAt:start},
+      },
+      forbidden:/UNLISTED_CREDENTIAL_KEY|OPAQUE_SECRET_999/,
+    },
+  ];
+  for (const item of diagnosticCases) {
+    const view=presentProgress(describeProgress(item.task,item.attempt,then+5000));
+    assert.equal(view.phase,'failed',item.name);
+    assert.equal(view.explanation,'Attempt failed (code: E_ATTEMPT_FAILED). Detailed diagnostics are omitted; review recovery status before retrying.',item.name);
+    assert.match(view.announcement,/E_ATTEMPT_FAILED/,item.name);
+    assert.doesNotMatch(view.explanation,item.forbidden,item.name);
+    assert.doesNotMatch(view.announcement,item.forbidden,item.name);
+    assert.doesNotMatch(view.text,item.forbidden,item.name);
+    for (const entry of view.rows) {
+      assert.doesNotMatch(entry.value,item.forbidden,item.name);
+      if (entry.reason!==null) assert.doesNotMatch(entry.reason,item.forbidden,item.name);
+    }
+  }
+
+  // Non-failure metadata containing quoted JSON keys still redacts secret values cleanly
+  const quotedJsonLabel=presentProgress({
+    phase:'active',
+    status:'Running',
+    currentStep:{
+      index:1,
+      label:'Inspect {"token": "SENSITIVE_VALUE", "api_key": "ANOTHER_SECRET"}',
+    },
+  });
+  assert.doesNotMatch(quotedJsonLabel.text,/SENSITIVE_VALUE|ANOTHER_SECRET/);
+  assert.match(rowByKey(quotedJsonLabel,'currentStep').value,/"token":\[redacted\]/);
 
   // Throwing custom formatLocalTime option falls back safely without leaking error message
   const fallbackClockView=presentProgress({
