@@ -54,7 +54,7 @@ Later session work must keep those properties.
 
 ## Personal use and conditional regulated requirements
 
-Personal-app improvements are useful while CydeWorks remains a single-operator local workspace. They still need the owner's implementation approval. They are:
+The owner has authorized local design, implementation, and testing of these personal-app improvements in the project worktrees:
 
 - An inactivity deadline for the workspace session, with passive polling unable to extend it.
 - A working Lock control and an explicit termination message on every UI that the release still ships, including legacy if legacy remains.
@@ -71,11 +71,11 @@ Host file permissions, the existing `0o600` create mode, and loopback binding ar
 
 The following stay owner-approved one action at a time: credential or access-file changes, connected-service changes, paid usage, public push, merge to the default branch, deployment, cutover of the live preview, and migration of an existing workspace database. This plan authorizes none of those actions.
 
-Runner qualification stays inside the roadmap order. Windows-initiated Stop of the actual worker tree, restart recovery without duplicate execution, protected verifier evidence, and binding of the checked candidate to the patch come before any browser connection. Uncertain execution or inference outcomes stay unresolved. The throw at `pilot.mjs` line 176 stays until those gates pass and the owner approves a later change that removes it.
+Runner qualification stays inside the roadmap order. Windows-initiated Stop of the actual worker tree, restart recovery without duplicate execution, protected verifier evidence, and binding of the checked candidate to the patch come before any browser connection. Uncertain execution or inference outcomes stay unresolved. The throw at `pilot.mjs` line 176 stays until those gates pass independent review. The owner has authorized the subsequent disposable browser staging; live cutover remains separately approval-gated.
 
 ## Work order
 
-Design precedes code. Evidence collection can proceed as documents. Code, fixtures that execute the product, and regulated controls wait for the decisions named in each item.
+Design precedes code. Authorized personal-app work and isolated synthetic tests may proceed. Regulated controls and action-specific changes wait for the decisions named in each item.
 
 ### RP-01. Record the deployment and applicability decision
 
@@ -110,17 +110,17 @@ Acceptance criteria:
 
 - `run()` in `pilot.mjs` still throws the existing disabled error before any guest, model, or patch work.
 - No application route starts that pilot.
-- `BFE_STAGING_RUNNER` is not added, and no browser staging path is wired, until roadmap gates 1 through 4 pass independent review and the owner approves integration.
+- `BFE_STAGING_RUNNER` is not added, and no browser staging path is wired, until roadmap gates 1 through 4 pass independent review.
 - `verifyAndBindPatch` is not described as a completed independent verifier. A later gate must show that the approved check set is bound to the claim and that the candidate cannot write the check result.
 - Stop and recovery evidence must cover the actual worker tree. The roadmap's inert-fixture narrative remains historical evidence for that fixture only. This plan does not re-verify it.
 
-Proposed checks, not run and not authorized here:
+Proposed checks, not run:
 
 - A source-contract test that the disable throw remains the first statement of `run()`.
-- The later roadmap checks named in `docs/RELEASE-BACKLOG.md` for Stop, replay, the sealed result channel, and patch binding, only in an owner-approved isolated environment.
+- The later roadmap checks named in `docs/RELEASE-BACKLOG.md` for Stop, replay, the sealed result channel, and patch binding, only in a verified isolated environment.
 - Do not run `pilot.mjs`, WSL guests, Bubblewrap, or a browser rehearsal as part of this plan.
 
-Owner decision: when, if ever, to remove the disable throw. Default remains keep it.
+The disable throw remains until the listed safety gates and independent review pass. Live preview cutover remains an owner decision.
 
 ### RP-03. Design the local session lifecycle
 
@@ -157,7 +157,7 @@ Proposed tests, not run:
 - Add a disposable-workspace attempt-limit test only after the owner selects that policy.
 - Re-run `harness/terminal-control.test.mjs` when session code changes so the 15-second terminal lease is not reused as the workspace idle timer.
 
-Owner decisions: whether legacy ships; whether the 15-minute idle rule is adopted for the personal app; whether the three-attempt lockout is in scope, and how the single operator recovers.
+The personal 15-minute idle rule and Lock on the shipped legacy UI are authorized. A three-attempt lockout and its recovery path require the credential classification and any applicable owner action approval.
 
 ### RP-04. Decide and, only if required, redesign the credential
 
@@ -309,7 +309,7 @@ Owner decision: whether the DoW IPv6 profile applies.
 
 ### RP-09. Gather input-handling and fail-secure evidence
 
-Depends on: none for a static inventory. Executable tests need owner approval and disposable fixtures.
+Depends on: none for a static inventory. Executable tests use disposable fixtures and a verified isolated environment.
 
 This package is evidence, not a claim that a vulnerability was found or ruled out. The pinned reads show prepared SQLite statements on the task, removal, and draft-copy paths that were opened, and origin checks before mutation (`harness/server.mjs` lines 57-66 and 231-247). Those reads are not a SQL, XSS, CSRF, command, XML, overflow, or race assessment.
 
@@ -323,13 +323,13 @@ Acceptance criteria:
 - Any later test uses synthetic data and the existing isolated test style. It does not target the live preview.
 - Results are recorded as evidence. A missing scan stays an evidence gap.
 
-Proposed tests, not run: the smallest disposable checks the owner later approves for command boundaries, SQL parameters, and XSS rendering. No network scan.
+Proposed tests, not run: the smallest disposable checks for command boundaries, SQL parameters, and XSS rendering. No network scan.
 
-Owner decision: which checks are worth a later isolated test, and who may run them.
+Use the authorized project scope and report the checks and evidence actually obtained.
 
 ### RP-10. Assemble release and operations evidence
 
-Depends on: RP-01 for which regulated artifacts are required. Document collection can start immediately. Signing, backup drills, and cutover cannot.
+Depends on: RP-01 for which regulated artifacts are required. Document collection and disposable backup drills can start immediately. New signing identities and live cutover retain their approval gates.
 
 The summary's release gaps are evidence needs: deployment architecture, validated cryptographic modules, protected log collection and retention, threat model, incident response, a signed Windows package, and a tested backup and restore. They are not proof that no external document exists, and they are not deployment findings.
 
@@ -337,7 +337,7 @@ Personal-app acceptance criteria:
 
 - A threat-model note covers the local operator, the access file, loopback HTTP, the disabled runner, task data, and exports. It names untrusted model output as data.
 - A software list covers Node, Electron, SQLite, and the model tools the release expects to find. Support dates are recorded when the owner has them (V-222658, V-222659).
-- Backup and restore steps for a disposable workspace are written and, when the owner approves a drill, rehearsed without using the live preview (V-222592, V-222594, V-222636, V-222637, V-222638, V-222639, V-222640, V-222667, V-222668, plus V-222586).
+- Backup and restore steps for a disposable workspace are written and rehearsed without using the live preview (V-222592, V-222594, V-222636, V-222637, V-222638, V-222639, V-222640, V-222667, V-222668, plus V-222586).
 - Known source gaps in this plan are tracked as open work (V-222652). Tracking them does not close that check.
 - Signing identity, public release, and cutover remain separate approvals.
 
@@ -348,7 +348,7 @@ Conditional acceptance criteria:
 
 Proposed checks, not run: inventory diff against `harness/package.json` and `harness/desktop/package.json`; a later disposable backup drill. No signing and no publish.
 
-Owner decisions: whether a signed Windows release is in scope; where backups go; whether regulated governance documents are required.
+The owner requires signed Windows previews and releases using an existing approved identity. A new identity, backup destination, and regulated governance scope remain separate decisions where needed.
 
 ### RP-11. Keep the applicability register
 

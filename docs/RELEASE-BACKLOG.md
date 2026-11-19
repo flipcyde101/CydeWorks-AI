@@ -57,18 +57,19 @@ No live runner, WSL worker, or tool-capable OpenCode instance may be wired into 
 
 ## 3. T3 Provider and Effort Routing Rules
 
-All waves follow strict role and model routing:
+Independent review uses the exact route below. Builder routes are preferences, subject to current included-plan availability:
 
 | Role | Provider & Model | Effort / Configuration | Permitted Scope |
 | --- | --- | --- | --- |
-| **Independent Review & Safety Gatekeeper** | **Codex GPT-6.2 Sol** | `High` reasoning effort | Mandatory independent reviewer for every wave merge and sole sign-off authority for the Browser Connection Safety Gates (`RB-G01-R`) and release readiness (`RB-P12-R`). Read-only defect-first review. |
-| **Difficult Architecture & Isolation Design** | **Antigravity Gemini 4 Neon** | High / architectural design mode | Complex security boundaries, cross-OS process tree lifecycle, sealed verifier IPC, multi-store transaction design, and PTY ownership protocol design. |
-| **Alternate Planning & Matrix Reconciliation** | **Antigravity Gemini 4 Argon** | Planning / analytical mode | Backlog orchestration, regression matrix updates, router evaluation analysis, brief scoring audit, and multi-worktree dependency reconciliation. |
-| **Bounded Implementation & Unit Tests** | **Antigravity Gemini 4 Hydrogen** | Bounded execution mode | Scoped feature implementation, synthetic fixtures, adapter wiring, and unit/integration test authoring within a single worktree's file scope. |
+| **Independent Review & Safety Gatekeeper** | **Codex GPT-6.2 Sol** | `High` reasoning effort | Independent, read-only review of the requested scope and safety gates. Owner approvals for publication, deployment, and cutover remain separate. |
+| **Difficult Architecture & Isolation Design** | Prefer **Antigravity Gemini 4 Neon** | High where available | Complex security boundaries, cross-OS process lifecycle, verifier IPC, and transaction design. |
+| **Planning & Matrix Reconciliation** | Prefer **Antigravity Gemini 4 Argon** | Suitable planning effort | Backlog, regression matrix, router evaluation, and worktree dependency reconciliation. |
+| **Bounded Implementation & Unit Tests** | Prefer **Antigravity Gemini 4 Hydrogen** | Suitable implementation effort | Scoped implementation, synthetic fixtures, adapter wiring, and tests within one worktree's file scope. |
 
 **Routing invariants:**
 - Always specify exact provider, model, and effort.
-- If a model or quota is unavailable, halt and report the exact limit; never fall back to paid API billing, spend paid credits, or silently substitute a non-approved reviewer.
+- Grok, Cursor, Claude, and other connected included-plan models may build or plan when suited to the task and currently available. Provider names in the wave tables are original route preferences, not reservations of capacity.
+- Follow [T3 dispatch rules](T3-DISPATCH.md) for quota holds and reassignment. Do not use a paid fallback or substitute another independent reviewer.
 - Preserve all owner approvals and existing worktrees. Never run destructive git commands or revert peer worktree commits.
 
 ---
