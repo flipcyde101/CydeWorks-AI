@@ -39,6 +39,8 @@ Grok's read-only T3 design handoff, run 25 of thread `mcp:d610e0a2-8bf6-441f-b94
 
 This is unreviewed design input, not an implementation or a finding that the earlier security review is closed. The proposal explicitly leaves authenticated initial content and intended service identity unresolved until a suitable protected transport is designed and approved. It also acknowledges that a copied bearer cookie can be used in another profile or device until revocation or expiry. The owner has not approved unauthorized cross-profile or cross-device access, so that limitation must be addressed or separately presented to the owner as a concrete residual risk before adoption. It does not resolve desktop save recovery, launcher-claim lifecycle or the Windows runner gates.
 
+Antigravity Claude Opus run 1 in thread `mcp:f9ec2401-7e41-4b76-942d-0746e8bcea32` later proposed checking the listener in a desktop launcher and placing a one-time launch code in a URL fragment. This is unreviewed and does not establish authenticated initial browser content: the listener can change after the desktop check, and page script at the subsequently loaded address can read the fragment. The launch code is also a credential in a URL, contrary to these requirements. Its alternative desktop approval explicitly does not authenticate the initial page. Neither option closes the held service-identity finding.
+
 ## Evidence required before use
 
 1. A reviewed state machine for admission, reload, same-profile duplicate tabs, Lock across all session tabs, idle expiry, service restart and download authorization, including browser restart and a replaced local service.
