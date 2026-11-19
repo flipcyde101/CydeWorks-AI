@@ -260,8 +260,12 @@ export function createOpenCodeStopWslAdapter({
         }
       });
 
-      const nextFrame = (predicate, timeoutMs, timeoutMessage) =>
+      const nextFrame = (predicate, timeoutMs, timeoutMessage, transmit) =>
         new Promise((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(signal.reason);
+            return;
+          }
           if (stoppedFrame && predicate(stoppedFrame, null)) {
             resolve(stoppedFrame);
             return;
@@ -298,6 +302,14 @@ export function createOpenCodeStopWslAdapter({
             reject,
           };
           waiters.push(entry);
+          try {
+            transmit?.();
+          } catch (error) {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
+            removeWaiter(entry);
+            reject(error);
+          }
         });
 
       const sendFrame = payload => {
@@ -321,12 +333,11 @@ export function createOpenCodeStopWslAdapter({
       try {
         const startFrame = {op: 'start', nonce, profile};
         if (bwrapPath) startFrame.bwrap = toWslPath(bwrapPath);
-        sendFrame(startFrame);
-
         const held = await nextFrame(
           f => f?.event === 'held' || f?.event === 'blocked',
           holdTimeoutMs,
           'Held identity deadline exceeded.',
+          () => sendFrame(startFrame),
         );
         if (held.event === 'blocked') {
           throw Error(`Guest supervisor blocked: ${String(held.reason)}`);
@@ -353,24 +364,28 @@ export function createOpenCodeStopWslAdapter({
         session.identity = heldIdentity;
         signal?.throwIfAborted();
         // Durable persistence happens BEFORE releasing the held namespace.
-        record(heldIdentity);
+        const recordResult = record(heldIdentity);
+        if (recordResult !== undefined) {
+          Promise.resolve(recordResult).catch(() => {});
+          throw Error('Durable identity record must complete synchronously.');
+        }
         signal?.throwIfAborted();
 
-        sendFrame({op: 'dispatch', nonce, digest: computedDigest});
         const dispatched = await nextFrame(
           f => f?.event === 'dispatched' || f?.event === 'blocked',
           holdTimeoutMs,
           'Dispatch confirmation deadline exceeded.',
+          () => sendFrame({op: 'dispatch', nonce, digest: computedDigest}),
         );
         if (dispatched.event !== 'dispatched' || dispatched.nonce !== nonce) {
           throw Error(`Guest dispatch rejected: ${String(dispatched.reason ?? 'unexpected frame')}`);
         }
         return heldIdentity;
       } catch (error) {
-        try { child.stdin.end(); } catch {}
         if (heldIdentity) {
           await this.stopAndVerify(heldIdentity, nonce).catch(() => {});
         } else {
+          try { child.stdin.end(); } catch {}
           let timer;
           try {
             await Promise.race([
