@@ -1,0 +1,2651 @@
+diff --git a/research/isolated-runner-20261118/opencode-stop-guest.py b/research/isolated-runner-20261118/opencode-stop-guest.py
+new file mode 100644
+index 0000000..166e22b
+--- /dev/null
++++ b/research/isolated-runner-20261118/opencode-stop-guest.py
+@@ -0,0 +1,870 @@
++"""WSL-side ownership supervisor for the disconnected OpenCode Stop adapter.
++
++Research only. Not wired into pilot.mjs. The actual OpenCode profile is
++refused by a constant gate; only the inert fixture profile can dispatch.
++
++The supervisor runs as the unprivileged WSL launcher user and owns exactly one
++bubblewrap PID namespace per process lifetime:
++
++1. bwrap starts with --info-fd and --block-fd, so the namespace exists but the
++   workload command is held before exec.
++2. The supervisor opens a pidfd on the namespace init, verifies its identity
++   (boot id, PID, start time, PID namespace) and emits a "held" frame.
++3. The workload is released only after the Windows controller returns the
++   exact identity digest, which it sends only after its durable record fsyncs.
++4. Stop signals the namespace init through the verified pidfd. The kernel then
++   terminates every process in that PID namespace. Cleanup is "verified" only
++   when the pidfd reports exit and a scan finds no remaining member.
++
++Control frames come only from this supervisor. Workload stdout is JSON-encoded
++inside "workload" frames, so workload bytes can never be read as control.
++Any ambiguity yields cleanup "unknown". Nothing here retries a dispatch.
++"""
++
++from collections import deque
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++import re
++import select
++import signal
++import subprocess
++import sys
++import time
++
++
++ROOT = Path(__file__).resolve().parent
++SCHEMA = "cydeworks.opencode-stop.v1"
++FRAME_MAX = 8192
++WORKLOAD_LINE_MAX = 4096
++WORKLOAD_FRAMES_MAX = 512
++PROFILES = ("inert-fixture", "actual-opencode")
++# Real OpenCode dispatch stays disabled until the Stop and verifier gates pass
++# independent review. Changing this constant is out of scope for this change.
++ACTUAL_OPENCODE_DISPATCH_ENABLED = False
++HOLD_SECONDS = 10.0
++LIFETIME_SECONDS = {"inert-fixture": 30.0, "actual-opencode": 110.0}
++EXIT_WAIT_SECONDS = 3.0
++SETTLE_SECONDS = 2.0
++NONCE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
++PID_NS_RE = re.compile(r"^pid:\[\d+\]$")
++BOOT_ID_RE = re.compile(r"^[0-9A-Za-z._-]{1,128}$")
++PAYLOAD = "opencode-stop-payload.py"
++
++
++class Ambiguous(Exception):
++    """Process state could not be classified. Callers must report unknown."""
++
++
++def canonical(value):
++    return json.dumps(value, sort_keys=True, separators=(",", ":"))
++
++
++def digest(value):
++    return hashlib.sha256(canonical(value).encode()).hexdigest()
++
++
++class Proc:
++    """Minimal /proc reader. The root is injectable for fixture tests."""
++
++    def __init__(self, root="/proc"):
++        self.root = Path(root)
++
++    def stat(self, pid):
++        raw = (self.root / str(pid) / "stat").read_text()
++        end = raw.rfind(")")
++        if end < 0 or raw[end:end + 2] != ") ":
++            raise ValueError("malformed stat")
++        rest = raw[end + 2:].split()
++        if len(rest) <= 19 or not rest[19].isdigit():
++            raise ValueError("malformed stat fields")
++        return {"state": rest[0], "ppid": int(rest[1]), "start": rest[19]}
++
++    def pid_ns(self, pid):
++        return os.readlink(self.root / str(pid) / "ns" / "pid")
++
++    def status(self, pid):
++        fields = {}
++        for line in (self.root / str(pid) / "status").read_text().splitlines():
++            key, _, value = line.partition(":")
++            fields[key] = value.split()
++        return fields
++
++    def boot_id(self):
++        return (self.root / "sys" / "kernel" / "random" / "boot_id").read_text().strip()
++
++    def pids(self):
++        return [int(name) for name in os.listdir(self.root) if name.isdigit()]
++
++
++class Ops:
++    """Kernel operations. Replaced by recording fakes in unit tests."""
++
++    pidfd_open = staticmethod(os.pidfd_open)
++    close = staticmethod(os.close)
++
++    @staticmethod
++    def kill(fd):
++        signal.pidfd_send_signal(fd, signal.SIGKILL)
++
++    @staticmethod
++    def exited(fd, seconds):
++        return bool(select.select([fd], [], [], max(0.0, seconds))[0])
++
++
++def identify(proc, pid):
++    """Return the live identity of pid, or None if it is gone or a zombie."""
++    try:
++        state = proc.stat(pid)
++        if state["state"] in ("Z", "X"):
++            return None
++        return {"pid": pid, "start": state["start"], "pidNs": proc.pid_ns(pid)}
++    except (FileNotFoundError, ProcessLookupError):
++        return None
++    except (OSError, ValueError, IndexError) as error:
++        raise Ambiguous(f"identity unreadable for {pid}: {type(error).__name__}") from error
++
++
++def same(current, expected):
++    return current is not None and all(current[key] == expected[key] for key in ("pid", "start", "pidNs"))
++
++
++def matches_expected(proc, expected, uid=None):
++    """Return True if expected['pid'] is still the exact recorded process, False if absent or reused.
++
++    Checks /proc/<pid>/stat before /proc/<pid>/ns/pid so a PID reused by another
++    UID with a different start time is proven absent rather than failing with
++    PermissionError on ns/pid. Any inconclusive read raises Ambiguous.
++    """
++    pid = expected["pid"]
++    try:
++        state = proc.stat(pid)
++    except (FileNotFoundError, ProcessLookupError):
++        return False
++    except (OSError, ValueError, IndexError) as error:
++        raise Ambiguous(f"stat unreadable for {pid}: {type(error).__name__}") from error
++    if state["state"] in ("Z", "X"):
++        return False
++    if state["start"] != expected["start"]:
++        return False
++    try:
++        current_ns = proc.pid_ns(pid)
++    except (FileNotFoundError, ProcessLookupError):
++        return False
++    except PermissionError as error:
++        if uid is not None:
++            try:
++                status = proc.status(pid)
++                uids = status.get("Uid")
++                if not uids:
++                    raise Ambiguous(f"uid unreadable for {pid}") from error
++                if str(uid) not in uids:
++                    return False
++            except (FileNotFoundError, ProcessLookupError):
++                return False
++            except (OSError, ValueError, IndexError) as status_error:
++                raise Ambiguous(f"status unreadable for {pid}: {type(status_error).__name__}") from status_error
++        raise Ambiguous(f"namespace unreadable for {pid}: PermissionError") from error
++    except (OSError, ValueError) as error:
++        raise Ambiguous(f"namespace unreadable for {pid}: {type(error).__name__}") from error
++    return current_ns == expected["pidNs"]
++
++
++def open_verified(proc, expected, ops, uid=None):
++    """Open a pidfd, then verify identity. Returns (fd, state).
++
++    state is "owned" (fd refers to the expected process), or "absent" (the
++    expected process no longer exists; any process now holding that PID is a
++    different process and is never signalled). Verifying after pidfd_open
++    closes the PID reuse window: a pidfd never follows a reused PID.
++    """
++    try:
++        fd = ops.pidfd_open(expected["pid"])
++    except ProcessLookupError:
++        return None, "absent"
++    except OSError as error:
++        raise Ambiguous(f"pidfd_open failed: {type(error).__name__}") from error
++    try:
++        if matches_expected(proc, expected, uid=uid):
++            return fd, "owned"
++    except Ambiguous:
++        ops.close(fd)
++        raise
++    ops.close(fd)
++    return None, "absent"
++
++
++def namespace_members(proc, pid_ns, uid, depth):
++    """List live processes in pid_ns. Sound for processes owned by uid.
++
++    Every sandbox member runs as the single mapped launcher uid, so other
++    uids cannot be members. Any unreadable uid-owned process, missing Uid/NSpid
++    field, or uid-owned process deeper than a direct sandbox member is reported
++    as ambiguous.
++    """
++    members, ambiguous = [], []
++    for pid in proc.pids():
++        try:
++            status = proc.status(pid)
++            uids = status.get("Uid")
++            if not uids:
++                ambiguous.append(pid)
++                continue
++            if str(uid) not in uids:
++                continue
++            if status.get("State", ["?"])[0] in ("Z", "X"):
++                continue
++            nspid = status.get("NSpid")
++            if not nspid:
++                ambiguous.append(pid)
++                continue
++            if proc.pid_ns(pid) == pid_ns:
++                members.append(pid)
++            elif len(nspid) > depth + 1:
++                ambiguous.append(pid)
++        except (FileNotFoundError, ProcessLookupError):
++            continue
++        except (OSError, ValueError, IndexError):
++            ambiguous.append(pid)
++    return sorted(members), sorted(ambiguous)
++
++
++def validate_identity(identity):
++    """Shape check for identities read back from a controller journal."""
++    if not isinstance(identity, dict) or identity.get("schema") != SCHEMA:
++        raise ValueError("identity schema")
++    nonce = identity.get("nonce")
++    if not isinstance(nonce, str) or not NONCE.match(nonce):
++        raise ValueError("identity nonce")
++    if identity.get("profile") not in PROFILES:
++        raise ValueError("identity profile")
++    for name in ("init", "bwrap"):
++        item = identity.get(name)
++        if not isinstance(item, dict) or type(item.get("pid")) is not int or item["pid"] <= 1:
++            raise ValueError(f"identity {name}")
++        if not isinstance(item.get("start"), str) or not item["start"].isdigit():
++            raise ValueError(f"identity {name}")
++        if not isinstance(item.get("pidNs"), str) or not PID_NS_RE.match(item["pidNs"]):
++            raise ValueError(f"identity {name}")
++    if identity["init"]["pid"] == identity["bwrap"]["pid"]:
++        raise ValueError("identity init and bwrap pids collide")
++    if identity["init"]["pidNs"] == identity["bwrap"]["pidNs"]:
++        raise ValueError("identity namespace is not private")
++    if type(identity.get("uid")) is not int or identity["uid"] < 0:
++        raise ValueError("identity uid")
++    if type(identity.get("depth")) is not int or identity["depth"] < 1:
++        raise ValueError("identity depth")
++    boot_id = identity.get("bootId")
++    if not isinstance(boot_id, str) or not BOOT_ID_RE.match(boot_id):
++        raise ValueError("identity boot")
++    expected = f"{boot_id}:{identity['init']['pid']}:{identity['init']['start']}:{identity['init']['pidNs']}"
++    if identity.get("birthIdentity") != expected:
++        raise ValueError("identity birth")
++    return identity
++
++
++def stop_identity(proc, identity, ops, init_fd=None, expected_nonce=None, wait=EXIT_WAIT_SECONDS, settle=SETTLE_SECONDS):
++    """Stop the namespace named by identity and report evidence.
++
++    Never signals a process whose identity cannot be proven. Repeated or
++    stale calls are harmless: a stale expected_nonce returns unknown without
++    signalling, a stopped namespace verifies as absent, and a reused PID never
++    matches the recorded start time and namespace.
++    """
++    evidence = {"signalled": [], "bootChanged": False}
++    try:
++        validate_identity(identity)
++        if expected_nonce is not None and identity["nonce"] != expected_nonce:
++            evidence["reason"] = "stale-nonce"
++            return {"cleanup": "unknown", "evidence": evidence}
++        if proc.boot_id() != identity["bootId"]:
++            # A different kernel boot cannot host the recorded processes.
++            evidence["bootChanged"] = True
++            return {"cleanup": "verified", "evidence": evidence}
++        handles = []
++        try:
++            if init_fd is not None:
++                evidence["init"] = "owned-fd"
++                handles.append(("init", init_fd, False))
++            for name in ("init", "bwrap"):
++                if name == "init" and init_fd is not None:
++                    continue
++                fd, state = open_verified(proc, identity[name], ops, uid=identity["uid"])
++                evidence[name] = state
++                if fd is not None:
++                    handles.append((name, fd, True))
++            # Every identity is validated before any signal is delivered.
++            for name, fd, _ in handles:
++                try:
++                    ops.kill(fd)
++                    evidence["signalled"].append(name)
++                except ProcessLookupError:
++                    pass
++            deadline = time.monotonic() + wait
++            for name, fd, _ in handles:
++                if not ops.exited(fd, deadline - time.monotonic()):
++                    evidence["exitTimeout"] = name
++                    return {"cleanup": "unknown", "evidence": evidence}
++        finally:
++            for _, fd, owned in handles:
++                if owned:
++                    ops.close(fd)
++        deadline = time.monotonic() + settle
++        while True:
++            members, ambiguous = namespace_members(proc, identity["init"]["pidNs"], identity["uid"], identity["depth"])
++            if not members and not ambiguous:
++                break
++            if time.monotonic() >= deadline:
++                evidence["remaining"] = members
++                evidence["ambiguous"] = ambiguous
++                return {"cleanup": "unknown", "evidence": evidence}
++            time.sleep(0.02)
++        for name in ("init", "bwrap"):
++            if matches_expected(proc, identity[name], uid=identity["uid"]):
++                evidence["survivor"] = name
++                return {"cleanup": "unknown", "evidence": evidence}
++        return {"cleanup": "verified", "evidence": evidence}
++    except (Ambiguous, ValueError, OSError, KeyError, TypeError) as error:
++        evidence["error"] = type(error).__name__
++        return {"cleanup": "unknown", "evidence": evidence}
++
++
++def confirm_identity(proc, identity, expected_nonce=None):
++    """Read-only check that the recorded namespace no longer exists."""
++    try:
++        validate_identity(identity)
++        if expected_nonce is not None and identity["nonce"] != expected_nonce:
++            return {"absent": False, "reason": "stale-nonce"}
++        if proc.boot_id() != identity["bootId"]:
++            return {"absent": True, "bootChanged": True}
++        for name in ("init", "bwrap"):
++            if matches_expected(proc, identity[name], uid=identity["uid"]):
++                return {"absent": False, "survivor": name}
++        members, ambiguous = namespace_members(proc, identity["init"]["pidNs"], identity["uid"], identity["depth"])
++        return {"absent": not members and not ambiguous, "remaining": members, "ambiguous": ambiguous}
++    except (Ambiguous, ValueError, OSError, KeyError, TypeError) as error:
++        return {"absent": False, "error": type(error).__name__}
++
++
++def load_sandbox():
++    spec = importlib.util.spec_from_file_location("cydeworks_pilot_sandbox", ROOT / "sandbox.py")
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def pinned_bwrap(sandbox, path):
++    """Reject any bwrap other than the binary pinned in sandbox.py."""
++    path = Path(path)
++    if not path.is_file() or path.is_symlink():
++        raise RuntimeError("BLOCKED: pinned runner-bwrap unavailable")
++    with path.open("rb") as source:
++        if hashlib.file_digest(source, "sha256").hexdigest() != sandbox.PINNED["runner-bwrap"]:
++            raise RuntimeError("BLOCKED: runner-bwrap digest differs from sandbox.py")
++    return str(path)
++
++
++def build_command(profile, sandbox, bwrap, info_fd, block_fd, payload=None):
++    """Build the bwrap argv for a profile with the hold and identity fds.
++
++    Reuses sandbox.command() so the namespace flags, mounts and pinned
++    dependency checks stay identical to the pilot. The pilot's outer
++    `timeout` wrapper is replaced by the supervisor's own hold and lifetime
++    bounds, because the supervisor must be the direct parent of bwrap.
++    """
++    original = sandbox.pinned
++    sandbox.pinned = lambda name: bwrap if name == "runner-bwrap" else original(name)
++    try:
++        if profile == "actual-opencode":
++            if not ACTUAL_OPENCODE_DISPATCH_ENABLED:
++                raise RuntimeError("BLOCKED: actual OpenCode dispatch disabled pending qualification")
++            args = sandbox.command("generate", ROOT / "fixture-repo")
++        elif profile == "inert-fixture":
++            args = sandbox.command("linger")
++            split = args.index("--")
++            payload = Path(payload or ROOT / PAYLOAD)
++            if not payload.is_file() or payload.is_symlink():
++                raise RuntimeError("BLOCKED: inert payload unavailable")
++            args = args[:split] + ["--ro-bind", str(payload), "/stop-payload.py", "--",
++                                   sandbox.PYTHON, "-I", "-B", "/stop-payload.py"]
++        else:
++            raise RuntimeError("BLOCKED: unknown profile")
++    finally:
++        sandbox.pinned = original
++    if args[0] != bwrap or "--unshare-all" not in args or "--die-with-parent" not in args:
++        raise RuntimeError("BLOCKED: unexpected sandbox launcher")
++    return [bwrap, "--info-fd", str(info_fd), "--block-fd", str(block_fd), *args[1:]]
++
++
++def read_info(fd, seconds):
++    """Read bwrap's --info-fd JSON object, bounded in size and time.
++
++    Parses as soon as a complete object arrives, so it does not depend on
++    every inheritor closing the descriptor.
++    """
++    data, deadline = b"", time.monotonic() + seconds
++    while True:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
++            raise RuntimeError("BLOCKED: bwrap identity timeout")
++        chunk = os.read(fd, FRAME_MAX)
++        if not chunk:
++            raise RuntimeError("BLOCKED: bwrap identity truncated")
++        data += chunk
++        if len(data) > FRAME_MAX:
++            raise RuntimeError("BLOCKED: bwrap identity oversized")
++        try:
++            info = json.loads(data)
++            break
++        except ValueError:
++            continue
++    pid = info.get("child-pid") if isinstance(info, dict) else None
++    if type(pid) is not int or pid <= 1:
++        raise RuntimeError("BLOCKED: bwrap child identity invalid")
++    namespace = info.get("pid-namespace")
++    if namespace is not None and type(namespace) is not int:
++        raise RuntimeError("BLOCKED: bwrap namespace identity invalid")
++    return pid, namespace
++
++
++class Supervisor:
++    """One supervisor instance owns at most one namespace, then exits."""
++
++    def __init__(self, emit, proc=None, ops=Ops, bwrap=None, payload=None, sandbox=None,
++                 hold=HOLD_SECONDS, lifetime=None):
++        self.emit = emit
++        self.proc = proc or Proc()
++        self.ops = ops
++        self.sandbox = sandbox or load_sandbox()
++        self.bwrap_path = bwrap
++        self.bwrap = None
++        self.payload = payload
++        self.hold = hold
++        self.lifetime = lifetime
++        self.process = None
++        self.init_fd = None
++        self.identity = None
++        self.release_fd = None
++        self.dispatched = False
++        self.used = False
++
++    def start(self, nonce, profile, bwrap=None):
++        if self.used:
++            raise RuntimeError("BLOCKED: supervisor already used")
++        self.used = True
++        if not NONCE.match(str(nonce)) or profile not in PROFILES:
++            raise RuntimeError("BLOCKED: invalid start request")
++        if profile == "actual-opencode" and not ACTUAL_OPENCODE_DISPATCH_ENABLED:
++            raise RuntimeError("BLOCKED: actual OpenCode dispatch disabled pending qualification")
++        self.bwrap = pinned_bwrap(self.sandbox, bwrap or self.bwrap_path or ROOT / "runner-bwrap")
++        self.profile = profile
++        self.lifetime = self.lifetime or LIFETIME_SECONDS[profile]
++        info_read, info_write = os.pipe()
++        try:
++            block_read, block_write = os.pipe()
++        except Exception:
++            os.close(info_read)
++            os.close(info_write)
++            raise
++        try:
++            try:
++                argv = build_command(profile, self.sandbox, self.bwrap, info_write, block_read, self.payload)
++                self.process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                                                stderr=subprocess.DEVNULL, pass_fds=(info_write, block_read),
++                                                close_fds=True, bufsize=0)
++            finally:
++                os.close(info_write)
++                os.close(block_read)
++            self.release_fd = block_write
++        except Exception:
++            os.close(info_read)
++            if self.release_fd is None:
++                os.close(block_write)
++            raise
++        try:
++            pid, reported_ns = read_info(info_read, self.hold)
++        finally:
++            os.close(info_read)
++        # The init is an unreaped child of our bwrap child, so its PID cannot be
++        # reused yet. Open the pidfd first, then verify parentage and namespace.
++        self.init_fd = self.ops.pidfd_open(pid)
++        state = self.proc.stat(pid)
++        if state["ppid"] != self.process.pid or state["state"] in ("Z", "X"):
++            raise RuntimeError("BLOCKED: namespace init parentage mismatch")
++        init = identify(self.proc, pid)
++        bwrap = identify(self.proc, self.process.pid)
++        own_ns = self.proc.pid_ns(os.getpid())
++        if init is None or bwrap is None or init["pidNs"] == bwrap["pidNs"] or bwrap["pidNs"] != own_ns:
++            raise RuntimeError("BLOCKED: namespace identity unavailable or not private")
++        if reported_ns is not None and init["pidNs"] != f"pid:[{reported_ns}]":
++            raise RuntimeError("BLOCKED: bwrap and /proc disagree on the namespace")
++        boot = self.proc.boot_id()
++        depth = len(self.proc.status(os.getpid()).get("NSpid", []))
++        if depth < 1:
++            raise RuntimeError("BLOCKED: namespace depth unavailable")
++        self.identity = {"schema": SCHEMA, "nonce": nonce, "profile": profile, "bootId": boot,
++                         "uid": os.getuid(), "depth": depth,
++                         "supervisor": identify(self.proc, os.getpid()), "bwrap": bwrap, "init": init,
++                         "birthIdentity": f"{boot}:{init['pid']}:{init['start']}:{init['pidNs']}"}
++        validate_identity(self.identity)
++        self.emit({"event": "held", "nonce": nonce, "identity": self.identity, "digest": digest(self.identity)})
++
++    def dispatch(self, nonce, identity_digest):
++        if self.identity is None or self.dispatched or nonce != self.identity["nonce"]:
++            raise RuntimeError("BLOCKED: dispatch without held identity")
++        if identity_digest != digest(self.identity):
++            raise RuntimeError("BLOCKED: controller did not record this identity")
++        if not same(identify(self.proc, self.identity["init"]["pid"]), self.identity["init"]):
++            raise RuntimeError("BLOCKED: namespace changed before dispatch")
++        os.write(self.release_fd, b"1")
++        os.close(self.release_fd)
++        self.release_fd = None
++        self.dispatched = True
++        self.emit({"event": "dispatched", "nonce": nonce})
++
++    def stop(self, reason):
++        if self.release_fd is not None:
++            os.close(self.release_fd)
++            self.release_fd = None
++        try:
++            if self.identity is None:
++                # No complete identity: kill only our own bwrap child and any
++                # opened init pidfd by handle, and report unknown because
++                # namespace members were never fully identified.
++                if self.init_fd is not None:
++                    try:
++                        self.ops.kill(self.init_fd)
++                    except (ProcessLookupError, OSError):
++                        pass
++                if self.process and self.process.poll() is None:
++                    self.process.kill()
++                result = {"cleanup": "unknown", "evidence": {"reason": "identity-incomplete"}}
++            else:
++                result = stop_identity(self.proc, self.identity, self.ops, init_fd=self.init_fd)
++            if self.process:
++                try:
++                    self.process.wait(timeout=EXIT_WAIT_SECONDS)
++                except subprocess.TimeoutExpired:
++                    result = {"cleanup": "unknown", "evidence": {**result.get("evidence", {}), "bwrapWait": "timeout"}}
++        finally:
++            if self.process and self.process.stdout and not self.process.stdout.closed:
++                self.process.stdout.close()
++            if self.init_fd is not None:
++                self.ops.close(self.init_fd)
++                self.init_fd = None
++        result["evidence"]["reason"] = reason
++        self.emit({"event": "stopped", "nonce": self.identity and self.identity["nonce"], **result})
++        return result
++
++
++_TIMEOUT = object()
++
++
++class LineReader:
++    """Incremental non-blocking line reader for select()-driven streams."""
++
++    def __init__(self, stream, max_bytes, strict=True, max_lines=None):
++        self.stream = stream
++        self.fd = None
++        if hasattr(stream, "fileno"):
++            try:
++                self.fd = stream.fileno()
++            except (OSError, ValueError):
++                self.fd = None
++        self.max_bytes = max_bytes
++        self.strict = strict
++        self.max_lines = max_lines
++        self.lines = deque()
++        self.buf = bytearray()
++        self.eof = False
++        self.total_lines = 0
++        self._discarding = False
++        if self.fd is not None:
++            os.set_blocking(self.fd, False)
++
++    def read_available(self):
++        """Read currently available bytes without blocking on incomplete lines."""
++        if self.eof:
++            return
++        if self.fd is None:
++            chunk = self.stream.read(self.max_bytes + 1)
++        else:
++            try:
++                chunk = os.read(self.fd, self.max_bytes + 1)
++            except BlockingIOError:
++                return
++        if not chunk:
++            self.eof = True
++            return
++        if self.strict:
++            pos = 0
++            while pos < len(chunk):
++                nl = chunk.find(b"\n", pos)
++                if nl == -1:
++                    self.buf.extend(chunk[pos:])
++                    if len(self.buf) >= self.max_bytes:
++                        raise RuntimeError("BLOCKED: control frame invalid")
++                    break
++                part = bytes(self.buf) + chunk[pos:nl + 1]
++                self.buf.clear()
++                if len(part) > self.max_bytes:
++                    raise RuntimeError("BLOCKED: control frame invalid")
++                self.lines.append(part)
++                pos = nl + 1
++        else:
++            if self.max_lines is not None and self.total_lines >= self.max_lines:
++                return
++            pos = 0
++            while pos < len(chunk) and (self.max_lines is None or self.total_lines < self.max_lines):
++                nl = chunk.find(b"\n", pos)
++                if nl == -1:
++                    part = chunk[pos:]
++                    if not self._discarding:
++                        space = self.max_bytes - len(self.buf)
++                        if len(part) <= space:
++                            self.buf.extend(part)
++                        else:
++                            if space > 0:
++                                self.buf.extend(part[:space])
++                            self._discarding = True
++                    break
++                part = chunk[pos:nl + 1]
++                if not self._discarding:
++                    space = self.max_bytes - len(self.buf)
++                    if len(part) <= space:
++                        self.buf.extend(part)
++                    elif space > 0:
++                        self.buf.extend(part[:space])
++                self.lines.append(bytes(self.buf))
++                self.buf.clear()
++                self._discarding = False
++                self.total_lines += 1
++                pos = nl + 1
++
++    def pop_line(self):
++        """Return complete bytes line, None on clean EOF, or False if incomplete."""
++        if self.lines:
++            return self.lines.popleft()
++        if self.eof:
++            if self.buf:
++                if self.strict:
++                    raise RuntimeError("BLOCKED: control frame invalid")
++                if self.max_lines is None or self.total_lines < self.max_lines:
++                    line = bytes(self.buf)
++                    self.buf.clear()
++                    self._discarding = False
++                    self.total_lines += 1
++                    return line
++                self.buf.clear()
++                self._discarding = False
++            return None
++        return False
++
++
++def parse_control_frame(line):
++    if not line or len(line) > FRAME_MAX or not line.endswith(b"\n"):
++        raise RuntimeError("BLOCKED: control frame invalid")
++    frame = json.loads(line)
++    if not isinstance(frame, dict) or not isinstance(frame.get("op"), str):
++        raise RuntimeError("BLOCKED: control frame invalid")
++    return frame
++
++
++def read_frame(stream):
++    line = stream.readline(FRAME_MAX + 1)
++    if not line:
++        return None
++    return parse_control_frame(line)
++
++
++def next_line_bounded(reader, deadline):
++    while True:
++        item = reader.pop_line()
++        if item is not False:
++            return item
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            return _TIMEOUT
++        if reader.fd is None:
++            reader.read_available()
++            if not reader.lines and not reader.eof:
++                return _TIMEOUT
++            continue
++        if not select.select([reader.fd], [], [], remaining)[0]:
++            return _TIMEOUT
++        reader.read_available()
++
++
++def write_frame(frame):
++    data = canonical(frame).encode() + b"\n"
++    if len(data) > FRAME_MAX:
++        data = canonical({"event": "blocked", "reason": "frame too large"}).encode() + b"\n"
++    sys.stdout.buffer.write(data)
++    sys.stdout.buffer.flush()
++
++
++def serve(stdin=None, emit=write_frame, **options):
++    """Serve one ownership session over NDJSON stdin and stdout.
++
++    Stdin EOF, an invalid frame, hold expiry, or lifetime expiry all Stop.
++    A stale-nonce stop frame is rejected without disturbing the live namespace.
++    """
++    stdin = stdin or sys.stdin.buffer
++    supervisor_factory = options.pop("supervisor_factory", Supervisor)
++    start_hold = options.get("hold", HOLD_SECONDS)
++    supervisor = None
++    reason = "eof"
++    try:
++        stdin_reader = LineReader(stdin, FRAME_MAX, strict=True)
++        first = next_line_bounded(stdin_reader, time.monotonic() + start_hold)
++        if first is _TIMEOUT:
++            raise RuntimeError("BLOCKED: start frame timeout")
++        if first is None:
++            raise RuntimeError("BLOCKED: start frame required")
++        frame = parse_control_frame(first)
++        if frame["op"] != "start":
++            raise RuntimeError("BLOCKED: start frame required")
++        supervisor = supervisor_factory(emit, **options)
++        supervisor.start(frame.get("nonce"), frame.get("profile"), frame.get("bwrap"))
++        started = time.monotonic()
++        workload_stream = supervisor.process.stdout if supervisor.process else None
++        workload_reader = (
++            LineReader(workload_stream, WORKLOAD_LINE_MAX, strict=False, max_lines=WORKLOAD_FRAMES_MAX)
++            if workload_stream is not None
++            else None
++        )
++        while True:
++            limit = supervisor.hold if not supervisor.dispatched else supervisor.lifetime
++            remaining = started + limit - time.monotonic()
++            if remaining <= 0:
++                reason = "hold-expired" if not supervisor.dispatched else "lifetime-expired"
++                break
++
++            if supervisor.dispatched and workload_reader is not None:
++                while True:
++                    wline = workload_reader.pop_line()
++                    if wline is None:
++                        workload_reader = None
++                        break
++                    if wline is False:
++                        break
++                    emit({"event": "workload", "data": wline[:WORKLOAD_LINE_MAX].decode("utf-8", "replace")})
++
++            cline = stdin_reader.pop_line()
++            if cline is None:
++                reason = "eof"
++                break
++            if cline is not False:
++                frame = parse_control_frame(cline)
++                if frame["op"] == "dispatch":
++                    supervisor.dispatch(frame.get("nonce"), frame.get("digest"))
++                    started = time.monotonic()
++                elif frame["op"] == "stop":
++                    if frame.get("nonce") == supervisor.identity["nonce"]:
++                        reason = "stop"
++                        break
++                    stale_nonce = frame.get("nonce")
++                    emit({
++                        "event": "ignored",
++                        "op": "stop",
++                        "nonce": stale_nonce[:64] if isinstance(stale_nonce, str) else None,
++                        "cleanup": "unknown",
++                        "reason": "stale-nonce",
++                    })
++                else:
++                    reason = "invalid-frame"
++                    break
++                continue
++
++            fds = []
++            if stdin_reader.fd is not None:
++                fds.append(stdin_reader.fd)
++            elif not stdin_reader.eof:
++                stdin_reader.read_available()
++                continue
++            if supervisor.dispatched and workload_reader is not None:
++                if workload_reader.fd is not None:
++                    fds.append(workload_reader.fd)
++                elif not workload_reader.eof:
++                    workload_reader.read_available()
++                    continue
++            if not fds:
++                reason = "eof"
++                break
++            ready = select.select(fds, [], [], remaining)[0]
++            if not ready:
++                continue
++            if workload_reader is not None and workload_reader.fd in ready:
++                workload_reader.read_available()
++            if stdin_reader.fd in ready:
++                stdin_reader.read_available()
++    except Exception as error:  # Any failure stops the owned namespace.
++        reason = "blocked"
++        emit({"event": "blocked", "reason": str(error)[:500]})
++    finally:
++        if supervisor is not None:
++            if supervisor.process is not None:
++                supervisor.stop(reason)
++            elif supervisor.release_fd is not None:
++                os.close(supervisor.release_fd)
++                supervisor.release_fd = None
++    return 0
++
++
++def parse_oneshot_payload(line):
++    if not line or len(line) > FRAME_MAX or not line.endswith(b"\n"):
++        raise RuntimeError("BLOCKED: oneshot frame invalid")
++    payload = json.loads(line)
++    if not isinstance(payload, dict):
++        raise RuntimeError("BLOCKED: oneshot frame invalid")
++    if "identity" in payload:
++        if not set(payload.keys()).issubset({"identity", "expectedNonce"}):
++            raise RuntimeError("BLOCKED: oneshot envelope invalid")
++        identity = payload["identity"]
++        if "expectedNonce" in payload:
++            expected_nonce = payload["expectedNonce"]
++            if not isinstance(expected_nonce, str) or not NONCE.match(expected_nonce):
++                raise RuntimeError("BLOCKED: oneshot expectedNonce invalid")
++        else:
++            expected_nonce = None
++        return identity, expected_nonce
++    return payload, None
++
++
++def oneshot(op, stdin=None, emit=write_frame, proc=None, ops=Ops, timeout=HOLD_SECONDS):
++    """Out-of-band confirm or stop for a fresh controller. Identity or envelope on stdin."""
++    if op not in ("confirm", "stop"):
++        emit({"event": "blocked", "reason": "unknown mode"})
++        return 2
++    stdin = stdin or sys.stdin.buffer
++    proc = proc or Proc()
++    try:
++        reader = LineReader(stdin, FRAME_MAX, strict=True)
++        deadline = time.monotonic() + timeout
++        line = next_line_bounded(reader, deadline)
++        if line is _TIMEOUT:
++            raise RuntimeError("BLOCKED: oneshot frame timeout")
++        if line is None:
++            raise RuntimeError("BLOCKED: oneshot frame empty")
++        if next_line_bounded(reader, deadline) is not None:
++            raise RuntimeError("BLOCKED: oneshot trailing data")
++        identity, expected_nonce = parse_oneshot_payload(line)
++        if op == "confirm":
++            emit({"event": "confirmed", **confirm_identity(proc, identity, expected_nonce=expected_nonce)})
++        else:
++            emit({"event": "stopped", **stop_identity(proc, identity, ops, expected_nonce=expected_nonce)})
++    except Exception as error:
++        emit({"event": "blocked", "reason": type(error).__name__})
++    return 0
++
++
++if __name__ == "__main__":
++    mode = sys.argv[1:] or ["serve"]
++    if mode == ["serve"]:
++        sys.exit(serve())
++    if mode in (["confirm"], ["stop"]):
++        sys.exit(oneshot(mode[0]))
++    write_frame({"event": "blocked", "reason": "unknown mode"})
++    sys.exit(2)
+diff --git a/research/isolated-runner-20261118/opencode-stop-payload.py b/research/isolated-runner-20261118/opencode-stop-payload.py
+new file mode 100644
+index 0000000..ce2d821
+--- /dev/null
++++ b/research/isolated-runner-20261118/opencode-stop-payload.py
+@@ -0,0 +1,38 @@
++"""Inert multi-process payload for disconnected OpenCode Stop verification.
++
++Runs only inside the bubblewrap PID namespace after the Windows controller
++records durable ownership identity and sends the matching release digest.
++Spawns a child process inside the private PID namespace so Stop must terminate
++the full namespace process tree, not just a single process.
++"""
++
++import json
++import os
++import subprocess
++import sys
++import time
++
++
++def main():
++    child = subprocess.Popen(
++        [sys.executable, "-I", "-B", "-c", "import time; time.sleep(25)"],
++        stdin=subprocess.DEVNULL,
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++    )
++    try:
++        frame = {
++            "payload": "inert-fixture",
++            "nsInitPid": os.getpid(),
++            "nsChildPid": child.pid,
++        }
++        print(json.dumps(frame, sort_keys=True, separators=(",", ":")), flush=True)
++        time.sleep(25)
++    finally:
++        if child.poll() is None:
++            child.kill()
++        child.wait(timeout=2)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/research/isolated-runner-20261118/opencode-stop-wsl.mjs b/research/isolated-runner-20261118/opencode-stop-wsl.mjs
+new file mode 100644
+index 0000000..a6a56cb
+--- /dev/null
++++ b/research/isolated-runner-20261118/opencode-stop-wsl.mjs
+@@ -0,0 +1,530 @@
++/**
++ * Disconnected Windows-to-WSL OpenCode process ownership and Stop adapter.
++ *
++ * Research only. This file is not imported by pilot.mjs or harness/.
++ * Real OpenCode dispatch is disabled by constant gate; only the inert
++ * multi-process namespace fixture profile can execute, and all evidence is
++ * tagged with qualificationScope: 'inert-fixture-only'.
++ */
++
++import {spawn} from 'node:child_process';
++import {createHash, randomUUID} from 'node:crypto';
++import {fileURLToPath} from 'node:url';
++
++export const SCHEMA = 'cydeworks.opencode-stop.v1';
++export const ACTUAL_OPENCODE_DISPATCH_ENABLED = false;
++export const QUALIFICATION_SCOPE = 'inert-fixture-only';
++
++const PROFILES = new Set(['inert-fixture', 'actual-opencode']);
++const NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++const PID_NS_RE = /^pid:\[\d+\]$/;
++const BOOT_ID_RE = /^[0-9A-Za-z._-]{1,128}$/;
++const DIGITS_RE = /^\d+$/;
++const FRAME_MAX = 8192;
++const GUEST_WIN_PATH = fileURLToPath(new URL('./opencode-stop-guest.py', import.meta.url));
++
++export function toWslPath(windowsPath) {
++  if (windowsPath.startsWith('/')) return windowsPath;
++  const drive = windowsPath[0].toLowerCase();
++  return `/mnt/${drive}${windowsPath.slice(2).replaceAll('\\', '/')}`;
++}
++
++export function canonicalJson(value) {
++  if (value === null || typeof value !== 'object') return JSON.stringify(value);
++  if (Array.isArray(value)) return '[' + value.map(v => (v === undefined ? 'null' : canonicalJson(v))).join(',') + ']';
++  const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
++  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(value[k])).join(',') + '}';
++}
++
++export function digestIdentity(identity) {
++  const core = {
++    birthIdentity: identity.birthIdentity,
++    bootId: identity.bootId,
++    bwrap: identity.bwrap,
++    depth: identity.depth,
++    init: identity.init,
++    nonce: identity.nonce,
++    profile: identity.profile,
++    schema: identity.schema,
++    supervisor: identity.supervisor,
++    uid: identity.uid,
++  };
++  return createHash('sha256').update(canonicalJson(core)).digest('hex');
++}
++
++export function validateOwnedIdentity(identity, expectedNonce) {
++  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return false;
++  if (identity.schema !== SCHEMA) return false;
++  if (typeof identity.nonce !== 'string' || !NONCE_RE.test(identity.nonce)) return false;
++  if (expectedNonce !== undefined && identity.nonce !== expectedNonce) return false;
++  if (typeof identity.profile !== 'string' || !PROFILES.has(identity.profile)) return false;
++  if (typeof identity.bootId !== 'string' || !BOOT_ID_RE.test(identity.bootId)) return false;
++  if (!Number.isInteger(identity.uid) || identity.uid < 0) return false;
++  if (!Number.isInteger(identity.depth) || identity.depth < 1) return false;
++  for (const role of ['init', 'bwrap']) {
++    const proc = identity[role];
++    if (!proc || typeof proc !== 'object' || Array.isArray(proc)) return false;
++    if (!Number.isInteger(proc.pid) || proc.pid <= 1) return false;
++    if (typeof proc.start !== 'string' || !DIGITS_RE.test(proc.start)) return false;
++    if (typeof proc.pidNs !== 'string' || !PID_NS_RE.test(proc.pidNs)) return false;
++  }
++  if (identity.init.pid === identity.bwrap.pid) return false;
++  if (identity.init.pidNs === identity.bwrap.pidNs) return false;
++  const expectedBirth = `${identity.bootId}:${identity.init.pid}:${identity.init.start}:${identity.init.pidNs}`;
++  if (identity.birthIdentity !== expectedBirth) return false;
++  return true;
++}
++
++function defaultSpawnGuest(mode, {distribution = 'Ubuntu-24.04', user = 'nobody', guestPath = GUEST_WIN_PATH} = {}) {
++  if (process.platform === 'win32') {
++    const linuxGuest = toWslPath(guestPath);
++    return spawn(
++      'wsl.exe',
++      ['--distribution', distribution, '--user', user, '--exec', '/usr/bin/python3', '-I', '-B', linuxGuest, mode],
++      {windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']},
++    );
++  }
++  return spawn('/usr/bin/python3', ['-I', '-B', guestPath, mode], {
++    stdio: ['pipe', 'pipe', 'pipe'],
++  });
++}
++
++function runOneshot(spawnGuest, mode, payload, timeoutMs) {
++  return new Promise(resolve => {
++    let child;
++    try {
++      child = spawnGuest(mode);
++    } catch {
++      resolve(null);
++      return;
++    }
++    let stdout = '';
++    let stdoutBytes = 0;
++    let settled = false;
++    const finish = value => {
++      if (settled) return;
++      settled = true;
++      clearTimeout(timer);
++      resolve(value);
++    };
++    const timer = setTimeout(() => {
++      try { child.kill(); } catch {}
++      finish(null);
++    }, timeoutMs);
++    child.stdin.on('error', () => {});
++    child.on('error', () => finish(null));
++    child.stdout.on('data', chunk => {
++      if (settled) return;
++      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
++      stdoutBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : chunk.length;
++      stdout += text;
++      if (stdoutBytes > FRAME_MAX) {
++        try { child.kill(); } catch {}
++        finish(null);
++      }
++    });
++    child.on('close', code => {
++      if (code !== 0) {
++        finish(null);
++        return;
++      }
++      if (
++        !stdout ||
++        Buffer.byteLength(stdout, 'utf8') > FRAME_MAX ||
++        !stdout.endsWith('\n') ||
++        stdout.indexOf('\n') !== stdout.length - 1
++      ) {
++        finish(null);
++        return;
++      }
++      try {
++        finish(JSON.parse(stdout));
++      } catch {
++        finish(null);
++      }
++    });
++    try {
++      const encoded = JSON.stringify(payload) + '\n';
++      if (Buffer.byteLength(encoded, 'utf8') > FRAME_MAX) {
++        try { child.kill(); } catch {}
++        finish(null);
++        return;
++      }
++      child.stdin.end(encoded);
++    } catch {
++      finish(null);
++    }
++  });
++}
++
++export function createOpenCodeStopWslAdapter({
++  profile = 'inert-fixture',
++  bwrapPath = null,
++  distribution = 'Ubuntu-24.04',
++  user = 'nobody',
++  guestPath = GUEST_WIN_PATH,
++  holdTimeoutMs = 6000,
++  stopTimeoutMs = 5000,
++  spawnGuest = mode => defaultSpawnGuest(mode, {distribution, user, guestPath}),
++} = {}) {
++  const activeSessions = new Map();
++  const inFlightStops = new Map();
++
++  return {
++    profile,
++    qualificationScope: QUALIFICATION_SCOPE,
++    actualOpenCodeEnabled: ACTUAL_OPENCODE_DISPATCH_ENABLED,
++
++    async start({record, signal, nonce = randomUUID()} = {}) {
++      signal?.throwIfAborted();
++      if (typeof record !== 'function') {
++        throw Error('Durable identity record callback is required before dispatch.');
++      }
++      if (typeof nonce !== 'string' || !NONCE_RE.test(nonce)) {
++        throw Error('Invalid dispatch nonce.');
++      }
++      if (profile === 'actual-opencode' && !ACTUAL_OPENCODE_DISPATCH_ENABLED) {
++        throw Error('BLOCKED: actual OpenCode dispatch disabled pending qualification.');
++      }
++      if (profile !== 'inert-fixture') {
++        throw Error(`Unsupported profile: ${String(profile)}`);
++      }
++      if (activeSessions.has(nonce)) {
++        throw Error('Duplicate active session nonce.');
++      }
++
++      const child = spawnGuest('serve');
++      child.stdin.on('error', () => {});
++      let buffer = '';
++      let stoppedFrame = null;
++      const workloadFrames = [];
++      const waiters = [];
++
++      const notify = (frame, error) => {
++        for (let i = 0; i < waiters.length; i++) {
++          const waiter = waiters[i];
++          if (waiter.predicate(frame, error)) {
++            waiters.splice(i, 1);
++            clearTimeout(waiter.timer);
++            if (error) waiter.reject(error);
++            else waiter.resolve(frame);
++            return;
++          }
++        }
++      };
++
++      let exitError = null;
++      const closedPromise = new Promise(resolve => {
++        child.once('error', error => {
++          exitError = error;
++          notify(null, error);
++          resolve();
++        });
++        child.once('close', code => {
++          if (!exitError) exitError = Error(`Guest supervisor exited (${String(code)})`);
++          notify(null, exitError);
++          resolve();
++        });
++      });
++
++      child.stdout.on('data', chunk => {
++        buffer += chunk.toString('utf8');
++        if (Buffer.byteLength(buffer, 'utf8') > FRAME_MAX * 4) {
++          try { child.stdin.end(); child.kill(); } catch {}
++          notify(null, Error('Oversized supervisor frame buffer.'));
++          return;
++        }
++        while (buffer.includes('\n')) {
++          const idx = buffer.indexOf('\n');
++          const rawLine = buffer.slice(0, idx);
++          buffer = buffer.slice(idx + 1);
++          if (Buffer.byteLength(rawLine, 'utf8') + 1 > FRAME_MAX) {
++            try { child.stdin.end(); child.kill(); } catch {}
++            notify(null, Error('Oversized supervisor frame.'));
++            return;
++          }
++          let frame;
++          try {
++            frame = JSON.parse(rawLine);
++          } catch (error) {
++            try { child.stdin.end(); child.kill(); } catch {}
++            notify(null, error);
++            return;
++          }
++          if (frame.event === 'workload') {
++            if (workloadFrames.length < 64) workloadFrames.push(frame.data);
++          } else if (frame.event === 'stopped') {
++            stoppedFrame = frame;
++          }
++          notify(frame, null);
++        }
++      });
++
++      const nextFrame = (predicate, timeoutMs, timeoutMessage) =>
++        new Promise((resolve, reject) => {
++          if (stoppedFrame && predicate(stoppedFrame, null)) {
++            resolve(stoppedFrame);
++            return;
++          }
++          if (exitError) {
++            reject(exitError);
++            return;
++          }
++          const removeWaiter = entry => {
++            const idx = waiters.indexOf(entry);
++            if (idx >= 0) waiters.splice(idx, 1);
++          };
++          const onAbort = () => {
++            clearTimeout(timer);
++            removeWaiter(entry);
++            reject(signal?.reason ?? Error('Startup aborted.'));
++          };
++          signal?.addEventListener('abort', onAbort, {once: true});
++          const timer = setTimeout(() => {
++            signal?.removeEventListener('abort', onAbort);
++            removeWaiter(entry);
++            reject(Error(timeoutMessage));
++          }, timeoutMs);
++          const entry = {
++            predicate: (frame, err) => {
++              if (err || predicate(frame, null)) {
++                signal?.removeEventListener('abort', onAbort);
++                return true;
++              }
++              return false;
++            },
++            timer,
++            resolve,
++            reject,
++          };
++          waiters.push(entry);
++        });
++
++      const sendFrame = payload => {
++        child.stdin.write(JSON.stringify(payload) + '\n');
++      };
++
++      const session = {
++        nonce,
++        child,
++        closedPromise,
++        getStoppedFrame: () => stoppedFrame,
++        workloadFrames,
++        waitForWorkload: timeoutMs => {
++          if (workloadFrames.length > 0) return Promise.resolve(workloadFrames[0]);
++          return nextFrame(f => f?.event === 'workload', timeoutMs, 'Workload frame timeout.').then(f => f.data);
++        },
++      };
++      activeSessions.set(nonce, session);
++
++      let heldIdentity = null;
++      try {
++        const startFrame = {op: 'start', nonce, profile};
++        if (bwrapPath) startFrame.bwrap = toWslPath(bwrapPath);
++        sendFrame(startFrame);
++
++        const held = await nextFrame(
++          f => f?.event === 'held' || f?.event === 'blocked',
++          holdTimeoutMs,
++          'Held identity deadline exceeded.',
++        );
++        if (held.event === 'blocked') {
++          throw Error(`Guest supervisor blocked: ${String(held.reason)}`);
++        }
++        const candidate = held.identity;
++        if (
++          held.nonce !== nonce ||
++          !validateOwnedIdentity(candidate, nonce) ||
++          candidate.profile !== profile
++        ) {
++          throw Error('Guest supervisor returned an invalid ownership identity.');
++        }
++        const computedDigest = digestIdentity(candidate);
++        if (held.digest !== computedDigest) {
++          throw Error('Guest supervisor returned an invalid ownership identity.');
++        }
++        heldIdentity = {
++          ...candidate,
++          identityDigest: computedDigest,
++          qualificationScope: QUALIFICATION_SCOPE,
++          synthetic: true,
++        };
++
++        session.identity = heldIdentity;
++        signal?.throwIfAborted();
++        // Durable persistence happens BEFORE releasing the held namespace.
++        record(heldIdentity);
++        signal?.throwIfAborted();
++
++        sendFrame({op: 'dispatch', nonce, digest: computedDigest});
++        const dispatched = await nextFrame(
++          f => f?.event === 'dispatched' || f?.event === 'blocked',
++          holdTimeoutMs,
++          'Dispatch confirmation deadline exceeded.',
++        );
++        if (dispatched.event !== 'dispatched' || dispatched.nonce !== nonce) {
++          throw Error(`Guest dispatch rejected: ${String(dispatched.reason ?? 'unexpected frame')}`);
++        }
++        return heldIdentity;
++      } catch (error) {
++        try { child.stdin.end(); } catch {}
++        if (heldIdentity) {
++          await this.stopAndVerify(heldIdentity, nonce).catch(() => {});
++        } else {
++          let timer;
++          try {
++            await Promise.race([
++              closedPromise,
++              new Promise((_, reject) => {
++                timer = setTimeout(() => reject(Error('Startup abort cleanup timeout')), stopTimeoutMs);
++              }),
++            ]);
++          } catch {
++            try { child.kill(); } catch {}
++          } finally {
++            clearTimeout(timer);
++          }
++        }
++        if (activeSessions.get(nonce) === session) activeSessions.delete(nonce);
++        throw error;
++      }
++    },
++
++    async stopAndVerify(identity, nonce = identity?.nonce) {
++      if (!validateOwnedIdentity(identity, nonce)) {
++        return {
++          cleanup: 'unknown',
++          reason: 'stale-or-invalid-identity',
++          qualificationScope: QUALIFICATION_SCOPE,
++        };
++      }
++      const expectedDigest = digestIdentity(identity);
++      if (identity.identityDigest && identity.identityDigest !== expectedDigest) {
++        return {
++          cleanup: 'unknown',
++          reason: 'identity-digest-mismatch',
++          qualificationScope: QUALIFICATION_SCOPE,
++        };
++      }
++
++      const session = activeSessions.get(nonce);
++      if (session && session.identity?.identityDigest !== expectedDigest) {
++        return {cleanup: 'unknown', reason: 'session-identity-mismatch', qualificationScope: QUALIFICATION_SCOPE};
++      }
++
++      const flightKey = `${nonce}:${expectedDigest}`;
++      const existing = inFlightStops.get(flightKey);
++      if (existing) {
++        return existing;
++      }
++
++      const runStop = (async () => {
++        let sessionStopped = null;
++        if (session) {
++          try {
++            session.child.stdin.write(JSON.stringify({op: 'stop', nonce}) + '\n');
++            session.child.stdin.end();
++          } catch {}
++          let timer;
++          try {
++            await Promise.race([
++              session.closedPromise,
++              new Promise((_, reject) => {
++                timer = setTimeout(() => reject(Error('Session stop timeout')), stopTimeoutMs);
++              }),
++            ]);
++            sessionStopped = session.getStoppedFrame();
++          } catch {
++            try { session.child.kill(); } catch {}
++            sessionStopped = null;
++          } finally {
++            clearTimeout(timer);
++          }
++        }
++
++        const outOfBand = await runOneshot(
++          spawnGuest,
++          'stop',
++          {identity, expectedNonce: nonce},
++          stopTimeoutMs,
++        );
++        if (!outOfBand || outOfBand.event !== 'stopped' || outOfBand.cleanup !== 'verified') {
++          return {
++            cleanup: 'unknown',
++            reason: outOfBand?.reason ?? outOfBand?.evidence?.reason ?? 'unverified-out-of-band-stop',
++            evidence: outOfBand?.evidence ?? null,
++            qualificationScope: QUALIFICATION_SCOPE,
++          };
++        }
++        if (session && sessionStopped && sessionStopped.cleanup !== 'verified') {
++          return {
++            cleanup: 'unknown',
++            reason: 'supervisor-stop-unverified',
++            evidence: sessionStopped.evidence ?? null,
++            qualificationScope: QUALIFICATION_SCOPE,
++          };
++        }
++
++        const confirmed = await this.confirmAbsent(identity, nonce);
++        if (!confirmed.absent) {
++          return {
++            cleanup: 'unknown',
++            reason: confirmed.reason ?? 'confirm-absent-failed',
++            evidence: {
++              outOfBand: outOfBand.evidence ?? null,
++              confirm: confirmed.frame ?? null,
++            },
++            qualificationScope: QUALIFICATION_SCOPE,
++          };
++        }
++
++        return {
++          cleanup: 'verified',
++          evidence: {
++            ...(outOfBand.evidence ?? sessionStopped?.evidence ?? {}),
++            confirmedAbsent: true,
++          },
++          qualificationScope: QUALIFICATION_SCOPE,
++        };
++      })();
++
++      inFlightStops.set(flightKey, runStop);
++      try {
++        return await runStop;
++      } finally {
++        if (inFlightStops.get(flightKey) === runStop) {
++          inFlightStops.delete(flightKey);
++          if (session && activeSessions.get(nonce) === session) activeSessions.delete(nonce);
++        }
++      }
++    },
++
++    async confirmAbsent(identity, nonce = identity?.nonce) {
++      if (!validateOwnedIdentity(identity, nonce)) {
++        return {absent: false, reason: 'stale-or-invalid-identity'};
++      }
++      const expectedDigest = digestIdentity(identity);
++      if (identity.identityDigest && identity.identityDigest !== expectedDigest) {
++        return {absent: false, reason: 'identity-digest-mismatch'};
++      }
++      const frame = await runOneshot(
++        spawnGuest,
++        'confirm',
++        {identity, expectedNonce: nonce},
++        stopTimeoutMs,
++      );
++      if (!frame || frame.event !== 'confirmed') {
++        return {absent: false, reason: frame?.reason ?? 'confirm-failed', frame: frame ?? null};
++      }
++      return {
++        absent: frame.absent === true,
++        ...(frame.reason ? {reason: frame.reason} : {}),
++        frame,
++      };
++    },
++
++    getSession(nonce) {
++      return activeSessions.get(nonce) ?? null;
++    },
++  };
++}
+diff --git a/research/isolated-runner-20261118/opencode-stop-wsl.test.mjs b/research/isolated-runner-20261118/opencode-stop-wsl.test.mjs
+new file mode 100644
+index 0000000..7b11160
+--- /dev/null
++++ b/research/isolated-runner-20261118/opencode-stop-wsl.test.mjs
+@@ -0,0 +1,435 @@
++/**
++ * Disconnected unit and integration test suite for opencode-stop-wsl.mjs.
++ *
++ * Security test limit note:
++ * Execute only inside an OS-enforced sandbox with no external network,
++ * empty allowlisted environment, read-only target and toolchain mounts,
++ * scratch-only writes, and strict resource and time limits. Do not run on
++ * an unsandboxed Windows host.
++ */
++
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {EventEmitter} from 'node:events';
++import {mkdtempSync, rmSync} from 'node:fs';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++import {PassThrough} from 'node:stream';
++import {claimRun, reconcileClaim, runOwned} from './runner-lifecycle.mjs';
++import {
++  ACTUAL_OPENCODE_DISPATCH_ENABLED,
++  QUALIFICATION_SCOPE,
++  SCHEMA,
++  canonicalJson,
++  createOpenCodeStopWslAdapter,
++  digestIdentity,
++  validateOwnedIdentity,
++} from './opencode-stop-wsl.mjs';
++
++const NONCE_1 = '11111111-2222-4333-8444-555555555555';
++const NONCE_2 = '66666666-7777-4888-9999-aaaaaaaaaaaa';
++const BOOT_ID = '01234567-89ab-cdef-0123-456789abcdef';
++
++function makeIdentity(nonce = NONCE_1, overrides = {}) {
++  const base = {
++    schema: SCHEMA,
++    nonce,
++    profile: 'inert-fixture',
++    bootId: BOOT_ID,
++    uid: 65534,
++    depth: 1,
++    supervisor: {pid: 300, start: '88000', pidNs: 'pid:[4026531836]'},
++    bwrap: {pid: 301, start: '88001', pidNs: 'pid:[4026531836]'},
++    init: {pid: 302, start: '88002', pidNs: 'pid:[4026532500]'},
++    birthIdentity: `${BOOT_ID}:302:88002:pid:[4026532500]`,
++    ...overrides,
++  };
++  return {...base, digest: digestIdentity(base)};
++}
++
++function createFakeSpawn({
++  onServeFrame,
++  onOneshot,
++} = {}) {
++  const log = {
++    serveFrames: [],
++    oneshotCalls: [],
++  };
++
++  const spawnGuest = mode => {
++    const child = new EventEmitter();
++    child.stdin = new PassThrough();
++    child.stdout = new PassThrough();
++    child.stderr = new PassThrough();
++    child.killed = false;
++    child.kill = () => {
++      child.killed = true;
++      child.stdout.end();
++      queueMicrotask(() => child.emit('close', 1));
++    };
++
++    let inBuf = '';
++    child.stdin.on('data', chunk => {
++      inBuf += chunk.toString('utf8');
++      while (inBuf.includes('\n')) {
++        const idx = inBuf.indexOf('\n');
++        const line = inBuf.slice(0, idx);
++        inBuf = inBuf.slice(idx + 1);
++        if (!line.trim()) continue;
++        const parsed = JSON.parse(line);
++        if (mode === 'serve') {
++          log.serveFrames.push(parsed);
++          onServeFrame?.(parsed, child, log);
++        } else {
++          log.oneshotCalls.push({mode, payload: parsed});
++          onOneshot?.(mode, parsed, child, log);
++        }
++      }
++    });
++    return child;
++  };
++
++  return {spawnGuest, log};
++}
++
++test('real OpenCode profile is disabled and tagged inert-fixture-only', async () => {
++  assert.equal(ACTUAL_OPENCODE_DISPATCH_ENABLED, false);
++  assert.equal(QUALIFICATION_SCOPE, 'inert-fixture-only');
++  const adapter = createOpenCodeStopWslAdapter({
++    profile: 'actual-opencode',
++    spawnGuest: () => assert.fail('must not spawn when actual-opencode is disabled'),
++  });
++  await assert.rejects(
++    adapter.start({nonce: NONCE_1, record: () => {}}),
++    /actual OpenCode dispatch disabled/,
++  );
++});
++
++test('durable identity is persisted before dispatch releases the held namespace', async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'opencode-stop-test-'));
++  const claimPath = join(dir, 'claim.jsonl');
++  const claim = claimRun(claimPath, {fixture: 'opencode-stop'});
++  const events = [];
++
++  const {spawnGuest, log} = createFakeSpawn({
++    onServeFrame(frame, child) {
++      if (frame.op === 'start') {
++        events.push('guest-held');
++        const id = makeIdentity(frame.nonce);
++        const {digest, ...identity} = id;
++        child.stdout.write(JSON.stringify({event: 'held', nonce: frame.nonce, identity, digest}) + '\n');
++      } else if (frame.op === 'dispatch') {
++        events.push('guest-dispatched');
++        child.stdout.write(JSON.stringify({event: 'dispatched', nonce: frame.nonce}) + '\n');
++      } else if (frame.op === 'stop') {
++        events.push('guest-stopped');
++        child.stdout.write(
++          JSON.stringify({event: 'stopped', nonce: frame.nonce, cleanup: 'verified', evidence: {signalled: ['init']}}) + '\n',
++        );
++        child.stdout.end();
++        queueMicrotask(() => child.emit('close', 0));
++      }
++    },
++    onOneshot(mode, _payload, child) {
++      events.push(`oneshot-${mode}`);
++      const reply = mode === 'stop'
++        ? {event: 'stopped', cleanup: 'verified', evidence: {signalled: []}}
++        : {event: 'confirmed', absent: true};
++      child.stdout.write(JSON.stringify(reply) + '\n');
++      child.stdout.end();
++      queueMicrotask(() => child.emit('close', 0));
++    },
++  });
++
++  const adapter = createOpenCodeStopWslAdapter({spawnGuest});
++  try {
++    const out = await runOwned({
++      claim,
++      adapter,
++      confirmInferenceSettled: async () => true,
++      execute: async worker => {
++        events.push('execute-ran');
++        const rows = reconcileClaim(claimPath).rows;
++        assert.equal(rows.at(-1).state, 'owned');
++        assert.equal(rows.at(-1).identity.birthIdentity, worker.birthIdentity);
++        assert.equal(worker.qualificationScope, 'inert-fixture-only');
++        return 'ok';
++      },
++    });
++    assert.equal(out, 'ok');
++    assert.deepEqual(events, [
++      'guest-held',
++      'guest-dispatched',
++      'execute-ran',
++      'guest-stopped',
++      'oneshot-stop',
++      'oneshot-confirm',
++    ]);
++    assert.equal(log.serveFrames[0].op, 'start');
++    assert.equal(log.serveFrames[1].op, 'dispatch');
++    assert.equal(log.oneshotCalls.length, 2);
++    assert.equal(log.oneshotCalls[0].mode, 'stop');
++    assert.equal(log.oneshotCalls[0].payload.expectedNonce, log.serveFrames[0].nonce);
++    assert.equal(log.oneshotCalls[1].mode, 'confirm');
++    assert.equal(log.oneshotCalls[1].payload.expectedNonce, log.serveFrames[0].nonce);
++    assert.equal(reconcileClaim(claimPath).state, 'complete');
++  } finally {
++    claim.close();
++    rmSync(dir, {recursive: true, force: true});
++  }
++});
++
++test('failure or abort during record never sends dispatch and stops held namespace', async () => {
++  const {spawnGuest, log} = createFakeSpawn({
++    onServeFrame(frame, child) {
++      if (frame.op === 'start') {
++        const id = makeIdentity(frame.nonce);
++        const {digest, ...identity} = id;
++        child.stdout.write(JSON.stringify({event: 'held', nonce: frame.nonce, identity, digest}) + '\n');
++      } else if (frame.op === 'dispatch') {
++        assert.fail('dispatch must never be sent when durable record fails');
++      } else if (frame.op === 'stop') {
++        child.stdout.write(JSON.stringify({event: 'stopped', nonce: frame.nonce, cleanup: 'verified'}) + '\n');
++        child.stdout.end();
++        queueMicrotask(() => child.emit('close', 0));
++      }
++    },
++    onOneshot(mode, _payload, child) {
++      const reply = mode === 'stop'
++        ? {event: 'stopped', cleanup: 'verified'}
++        : {event: 'confirmed', absent: true};
++      child.stdout.write(JSON.stringify(reply) + '\n');
++      child.stdout.end();
++      queueMicrotask(() => child.emit('close', 0));
++    },
++  });
++
++  const adapter = createOpenCodeStopWslAdapter({spawnGuest});
++  await assert.rejects(
++    adapter.start({
++      nonce: NONCE_1,
++      record: () => {
++        throw Error('Disk full while persisting ownership record');
++      },
++    }),
++    /Disk full/,
++  );
++  assert.equal(log.serveFrames.some(f => f.op === 'dispatch'), false);
++  assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm']);
++  assert.equal(log.oneshotCalls[0].payload.expectedNonce, NONCE_1);
++  assert.equal(log.oneshotCalls[1].payload.expectedNonce, NONCE_1);
++});
++
++test('stale nonce, forged birthIdentity, and strict identity violations return unknown without Guest call', async () => {
++  const {spawnGuest, log} = createFakeSpawn();
++  const adapter = createOpenCodeStopWslAdapter({spawnGuest});
++  const {digest, ...valid} = makeIdentity(NONCE_1);
++  const owned = {...valid, identityDigest: digest};
++
++  // Stale nonce
++  const stale = await adapter.stopAndVerify(owned, NONCE_2);
++  assert.equal(stale.cleanup, 'unknown');
++
++  // Forged birthIdentity (PID reuse simulation)
++  const forged = structuredClone(owned);
++  forged.init.start = '99999';
++  assert.equal(validateOwnedIdentity(forged, NONCE_1), false);
++  const forgedRes = await adapter.stopAndVerify(forged, NONCE_1);
++  assert.equal(forgedRes.cleanup, 'unknown');
++
++  // Non-private PID namespace
++  const sharedNs = structuredClone(owned);
++  sharedNs.init.pidNs = sharedNs.bwrap.pidNs;
++  sharedNs.birthIdentity = `${BOOT_ID}:302:88002:${sharedNs.init.pidNs}`;
++  assert.equal(validateOwnedIdentity(sharedNs, NONCE_1), false);
++  const sharedRes = await adapter.stopAndVerify(sharedNs, NONCE_1);
++  assert.equal(sharedRes.cleanup, 'unknown');
++
++  // Strict Windows validation checks: malformed pidNs, colliding pid, non-numeric start, negative uid, bad profile/bootId
++  const badPidNs = structuredClone(owned);
++  badPidNs.init.pidNs = 'pid:[not-a-number';
++  badPidNs.birthIdentity = `${BOOT_ID}:302:88002:${badPidNs.init.pidNs}`;
++  assert.equal(validateOwnedIdentity(badPidNs, NONCE_1), false);
++
++  const collidingPid = structuredClone(owned);
++  collidingPid.init.pid = collidingPid.bwrap.pid;
++  collidingPid.birthIdentity = `${BOOT_ID}:${collidingPid.init.pid}:88002:${collidingPid.init.pidNs}`;
++  assert.equal(validateOwnedIdentity(collidingPid, NONCE_1), false);
++
++  const nonNumericStart = structuredClone(owned);
++  nonNumericStart.init.start = '88002abc';
++  nonNumericStart.birthIdentity = `${BOOT_ID}:302:88002abc:${nonNumericStart.init.pidNs}`;
++  assert.equal(validateOwnedIdentity(nonNumericStart, NONCE_1), false);
++
++  const negativeUid = structuredClone(owned);
++  negativeUid.uid = -1;
++  assert.equal(validateOwnedIdentity(negativeUid, NONCE_1), false);
++
++  const badProfile = structuredClone(owned);
++  badProfile.profile = 'untrusted-profile';
++  assert.equal(validateOwnedIdentity(badProfile, NONCE_1), false);
++
++  const badBoot = structuredClone(owned);
++  badBoot.bootId = 'bad boot id!';
++  badBoot.birthIdentity = `${badBoot.bootId}:302:88002:${badBoot.init.pidNs}`;
++  assert.equal(validateOwnedIdentity(badBoot, NONCE_1), false);
++
++  // Tampered identityDigest
++  const tampered = {...owned, identityDigest: '0'.repeat(64)};
++  const tamperedRes = await adapter.stopAndVerify(tampered, NONCE_1);
++  assert.equal(tamperedRes.cleanup, 'unknown');
++  const tamperedConfirm = await adapter.confirmAbsent(tampered, NONCE_1);
++  assert.equal(tamperedConfirm.absent, false);
++  assert.equal(tamperedConfirm.reason, 'identity-digest-mismatch');
++
++  assert.equal(log.oneshotCalls.length, 0);
++});
++
++test('repeated Stop is idempotent and ambiguous cleanup leaves claim unresolved', async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'opencode-stop-test-'));
++  try {
++    let stopResult = {event: 'stopped', cleanup: 'verified', evidence: {signalled: []}};
++    const {spawnGuest} = createFakeSpawn({
++      onServeFrame(frame, child) {
++        if (frame.op === 'start') {
++          const {digest, ...identity} = makeIdentity(frame.nonce);
++          child.stdout.write(JSON.stringify({event: 'held', nonce: frame.nonce, identity, digest}) + '\n');
++        } else if (frame.op === 'dispatch') {
++          child.stdout.write(JSON.stringify({event: 'dispatched', nonce: frame.nonce}) + '\n');
++        } else if (frame.op === 'stop') {
++          child.stdout.write(JSON.stringify({...stopResult, nonce: frame.nonce}) + '\n');
++          child.stdout.end();
++          queueMicrotask(() => child.emit('close', 0));
++        }
++      },
++      onOneshot(mode, _payload, child) {
++        const reply = mode === 'stop'
++          ? stopResult
++          : {event: 'confirmed', absent: stopResult.cleanup === 'verified'};
++        child.stdout.write(JSON.stringify(reply) + '\n');
++        child.stdout.end();
++        queueMicrotask(() => child.emit('close', 0));
++      },
++    });
++
++    const adapter = createOpenCodeStopWslAdapter({spawnGuest});
++    let savedIdentity;
++    await adapter.start({
++      nonce: NONCE_1,
++      record: id => {
++        savedIdentity = id;
++      },
++    });
++
++    const firstStop = await adapter.stopAndVerify(savedIdentity, NONCE_1);
++    assert.equal(firstStop.cleanup, 'verified');
++    assert.equal(firstStop.evidence.confirmedAbsent, true);
++    const secondStop = await adapter.stopAndVerify(savedIdentity, NONCE_1);
++    assert.equal(secondStop.cleanup, 'verified');
++
++    // Now test ambiguous cleanup inside runOwned
++    stopResult = {event: 'stopped', cleanup: 'unknown', evidence: {remaining: [302]}};
++    const claimPath = join(dir, 'ambiguous.jsonl');
++    const claim = claimRun(claimPath, {fixture: 'ambiguous'});
++    try {
++      await assert.rejects(
++        runOwned({
++          claim,
++          adapter,
++          confirmInferenceSettled: async () => true,
++          execute: async () => 'done',
++        }),
++        /unresolved/,
++      );
++      const reconciled = reconcileClaim(claimPath);
++      assert.equal(reconciled.state, 'unresolved');
++      assert.equal(reconciled.rows.at(-1).cleanup, 'unknown');
++    } finally {
++      claim.close();
++    }
++  } finally {
++    rmSync(dir, {recursive: true, force: true});
++  }
++});
++
++test('concurrent stopAndVerify calls coalesce single-flight and independent confirm failure returns unknown', async () => {
++  let confirmAbsentResult = true;
++  let releaseSessionStop = null;
++  const {spawnGuest, log} = createFakeSpawn({
++    onServeFrame(frame, child) {
++      if (frame.op === 'start') {
++        const {digest, ...identity} = makeIdentity(frame.nonce);
++        child.stdout.write(JSON.stringify({event: 'held', nonce: frame.nonce, identity, digest}) + '\n');
++      } else if (frame.op === 'dispatch') {
++        child.stdout.write(JSON.stringify({event: 'dispatched', nonce: frame.nonce}) + '\n');
++      } else if (frame.op === 'stop') {
++        releaseSessionStop = () => {
++          child.stdout.write(
++            JSON.stringify({event: 'stopped', nonce: frame.nonce, cleanup: 'verified', evidence: {signalled: ['init']}}) + '\n',
++          );
++          child.stdout.end();
++          queueMicrotask(() => child.emit('close', 0));
++        };
++      }
++    },
++    onOneshot(mode, payload, child) {
++      assert.equal(payload.expectedNonce, NONCE_1);
++      const reply = mode === 'stop'
++        ? {event: 'stopped', cleanup: 'verified', evidence: {signalled: []}}
++        : confirmAbsentResult
++          ? {event: 'confirmed', absent: true}
++          : {event: 'confirmed', absent: false, remaining: [302]};
++      child.stdout.write(JSON.stringify(reply) + '\n');
++      child.stdout.end();
++      queueMicrotask(() => child.emit('close', 0));
++    },
++  });
++
++  const adapter = createOpenCodeStopWslAdapter({spawnGuest});
++  let savedIdentity;
++  await adapter.start({
++    nonce: NONCE_1,
++    record: id => {
++      savedIdentity = id;
++    },
++  });
++
++  const differentBirth = {
++    ...savedIdentity,
++    identityDigest: undefined,
++    init: {...savedIdentity.init, start: '999999'},
++  };
++  differentBirth.birthIdentity = `${differentBirth.bootId}:${differentBirth.init.pid}:${differentBirth.init.start}:${differentBirth.init.pidNs}`;
++  assert.equal((await adapter.stopAndVerify(differentBirth)).reason, 'session-identity-mismatch');
++  assert.equal(log.serveFrames.filter(f => f.op === 'stop').length, 0);
++  assert.equal(log.oneshotCalls.length, 0);
++
++  // Launch two concurrent Stop calls while the in-session Stop is still pending.
++  const p1 = adapter.stopAndVerify(savedIdentity, NONCE_1);
++  const p2 = adapter.stopAndVerify(savedIdentity, NONCE_1);
++  // A stale concurrent call must return unknown immediately without joining the valid flight.
++  const staleRes = await adapter.stopAndVerify(savedIdentity, NONCE_2);
++  assert.equal(staleRes.cleanup, 'unknown');
++
++  assert.equal(typeof releaseSessionStop, 'function');
++  releaseSessionStop();
++
++  const [r1, r2] = await Promise.all([p1, p2]);
++  assert.equal(r1.cleanup, 'verified');
++  assert.equal(r2.cleanup, 'verified');
++  assert.equal(r1.evidence.confirmedAbsent, true);
++  assert.equal(log.serveFrames.filter(f => f.op === 'stop').length, 1);
++  assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm']);
++
++  // If out-of-band stop reports verified but independent confirm reports a survivor, result must be unknown.
++  confirmAbsentResult = false;
++  const failConfirm = await adapter.stopAndVerify(savedIdentity, NONCE_1);
++  assert.equal(failConfirm.cleanup, 'unknown');
++  assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm', 'stop', 'confirm']);
++});
++
++test('canonicalJson and digestIdentity match Python canonical sha256', () => {
++  const {digest, ...identity} = makeIdentity(NONCE_1);
++  const parsed = JSON.parse(canonicalJson(identity));
++  assert.equal(digestIdentity(parsed), digest);
++});
+diff --git a/research/isolated-runner-20261118/test_opencode_stop_guest.py b/research/isolated-runner-20261118/test_opencode_stop_guest.py
+new file mode 100644
+index 0000000..62c595d
+--- /dev/null
++++ b/research/isolated-runner-20261118/test_opencode_stop_guest.py
+@@ -0,0 +1,748 @@
++"""Tests for opencode-stop-guest.py.
++
++Designed to run inside an OS-enforced Bubblewrap sandbox with no external
++network, empty allowlisted environment, read-only target and toolchain mounts,
++scratch-only /tmp and /work writes, and strict CPU/memory/process/time limits.
++"""
++
++import importlib.util
++import io
++import json
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import threading
++import time
++import unittest
++from unittest import mock
++
++
++ROOT = Path(__file__).resolve().parent
++SPEC = importlib.util.spec_from_file_location("opencode_stop_guest", ROOT / "opencode-stop-guest.py")
++GUEST = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(GUEST)
++
++NONCE_A = "11111111-2222-4333-8444-555555555555"
++NONCE_B = "66666666-7777-4888-9999-aaaaaaaaaaaa"
++BOOT_ID = "01234567-89ab-cdef-0123-456789abcdef"
++
++
++class FakeProc:
++    """In-memory /proc model for deterministic PID-reuse and ambiguity tests."""
++
++    def __init__(self, boot=BOOT_ID, uid=65534):
++        self.boot = boot
++        self.uid = uid
++        self.table = {}
++        self.unreadable = set()
++
++    def add(self, pid, start, pid_ns, ppid=1, state="S", uid=None, nspid=(1,)):
++        self.table[pid] = {
++            "start": str(start),
++            "pidNs": pid_ns,
++            "ppid": ppid,
++            "state": state,
++            "uid": self.uid if uid is None else uid,
++            "nspid": [str(x) for x in nspid],
++        }
++
++    def remove(self, pid):
++        self.table.pop(pid, None)
++
++    def stat(self, pid):
++        if pid in self.unreadable:
++            raise PermissionError("simulated unreadable stat")
++        if pid not in self.table:
++            raise FileNotFoundError(pid)
++        row = self.table[pid]
++        return {"state": row["state"], "ppid": row["ppid"], "start": row["start"]}
++
++    def pid_ns(self, pid):
++        if pid in self.unreadable:
++            raise PermissionError("simulated unreadable ns")
++        if pid not in self.table:
++            raise FileNotFoundError(pid)
++        return self.table[pid]["pidNs"]
++
++    def status(self, pid):
++        if pid in self.unreadable:
++            raise PermissionError("simulated unreadable status")
++        if pid not in self.table:
++            raise FileNotFoundError(pid)
++        row = self.table[pid]
++        return {
++            "Uid": [str(row["uid"])] * 4,
++            "State": [row["state"]],
++            "NSpid": row["nspid"],
++        }
++
++    def boot_id(self):
++        return self.boot
++
++    def pids(self):
++        return sorted(self.table.keys())
++
++
++class FakeOps:
++    """Recording pidfd operations backed by FakeProc."""
++
++    def __init__(self, proc, auto_reap=True, on_open=None, fail_wait=False):
++        self.proc = proc
++        self.auto_reap = auto_reap
++        self.on_open = on_open
++        self.fail_wait = fail_wait
++        self.next_fd = 100
++        self.open_fds = {}
++        self.closed_fds = []
++        self.signalled_pids = []
++
++    def pidfd_open(self, pid):
++        if self.on_open:
++            self.on_open(pid)
++        if pid not in self.proc.table:
++            raise ProcessLookupError(pid)
++        fd = self.next_fd
++        self.next_fd += 1
++        self.open_fds[fd] = pid
++        return fd
++
++    def close(self, fd):
++        self.open_fds.pop(fd, None)
++        self.closed_fds.append(fd)
++
++    def kill(self, fd):
++        pid = self.open_fds[fd]
++        self.signalled_pids.append(pid)
++        if self.auto_reap:
++            for member_pid, row in list(self.proc.table.items()):
++                if member_pid == pid or row["pidNs"] == "pid:[4026532500]":
++                    self.proc.remove(member_pid)
++
++    def exited(self, fd, _seconds):
++        if self.fail_wait:
++            return False
++        pid = self.open_fds.get(fd)
++        return pid not in self.proc.table
++
++
++def sample_identity(nonce=NONCE_A):
++    init = {"pid": 420, "start": "99002", "pidNs": "pid:[4026532500]"}
++    bwrap = {"pid": 419, "start": "99001", "pidNs": "pid:[4026531836]"}
++    sup = {"pid": 418, "start": "99000", "pidNs": "pid:[4026531836]"}
++    return {
++        "schema": GUEST.SCHEMA,
++        "nonce": nonce,
++        "profile": "inert-fixture",
++        "bootId": BOOT_ID,
++        "uid": 65534,
++        "depth": 1,
++        "supervisor": sup,
++        "bwrap": bwrap,
++        "init": init,
++        "birthIdentity": f"{BOOT_ID}:420:99002:pid:[4026532500]",
++    }
++
++
++class OpenCodeStopGuestUnitTests(unittest.TestCase):
++    def test_actual_opencode_profile_is_disabled_by_constant_gate(self):
++        self.assertFalse(GUEST.ACTUAL_OPENCODE_DISPATCH_ENABLED)
++        frames = []
++        sup = GUEST.Supervisor(frames.append, proc=FakeProc(), ops=FakeOps(FakeProc()), sandbox=object())
++        with self.assertRaisesRegex(RuntimeError, "actual OpenCode dispatch disabled"):
++            sup.start(NONCE_A, "actual-opencode")
++
++    def test_stop_verifies_and_kills_owned_namespace_tree(self):
++        proc = FakeProc()
++        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
++        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
++        proc.add(421, "99003", "pid:[4026532500]", ppid=420, nspid=(421, 2))
++        ops = FakeOps(proc)
++        identity = sample_identity()
++
++        result = GUEST.stop_identity(proc, identity, ops, wait=0.2, settle=0.2)
++        self.assertEqual(result["cleanup"], "verified")
++        self.assertEqual(ops.signalled_pids, [420, 419])
++        self.assertEqual(ops.open_fds, {})
++
++        # Repeated Stop after confirmed exit is idempotent and sends zero signals.
++        ops2 = FakeOps(proc)
++        repeat = GUEST.stop_identity(proc, identity, ops2, wait=0.2, settle=0.2)
++        self.assertEqual(repeat["cleanup"], "verified")
++        self.assertEqual(ops2.signalled_pids, [])
++
++    def test_pid_reuse_is_never_signalled(self):
++        proc = FakeProc()
++        # PID 420 and 419 were reused by unrelated processes with newer start times.
++        proc.add(419, "105000", "pid:[4026531836]", nspid=(419,))
++        proc.add(420, "105001", "pid:[4026531836]", nspid=(420,))
++        ops = FakeOps(proc)
++        identity = sample_identity()
++
++        result = GUEST.stop_identity(proc, identity, ops, wait=0.2, settle=0.2)
++        self.assertEqual(result["cleanup"], "verified")
++        self.assertEqual(ops.signalled_pids, [])
++        self.assertIn(419, proc.table)
++        self.assertIn(420, proc.table)
++
++    def test_pid_reuse_race_during_pidfd_open_closes_fd_without_signal(self):
++        proc = FakeProc()
++        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
++        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
++
++        def mutate_on_open(pid):
++            if pid == 420:
++                # Simulate PID 420 exiting and being reused right as pidfd_open runs.
++                proc.add(420, "199999", "pid:[4026531836]", nspid=(420,))
++
++        ops = FakeOps(proc, on_open=mutate_on_open)
++        result = GUEST.stop_identity(proc, sample_identity(), ops, wait=0.2, settle=0.2)
++        self.assertEqual(result["cleanup"], "verified")
++        self.assertNotIn(420, ops.signalled_pids)
++        self.assertEqual(ops.open_fds, {})
++
++    def test_ambiguous_proc_or_surviving_member_returns_unknown(self):
++        proc = FakeProc()
++        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
++        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
++        proc.add(421, "99003", "pid:[4026532500]", ppid=420, nspid=(421, 2))
++        # auto_reap=False leaves processes alive so cleanup must report unknown.
++        ops = FakeOps(proc, auto_reap=False, fail_wait=True)
++        result = GUEST.stop_identity(proc, sample_identity(), ops, wait=0.05, settle=0.05)
++        self.assertEqual(result["cleanup"], "unknown")
++        self.assertEqual(ops.open_fds, {})
++
++        # Unreadable /proc entry during verification also yields unknown without signal.
++        proc2 = FakeProc()
++        proc2.add(419, "99001", "pid:[4026531836]", nspid=(419,))
++        proc2.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
++        proc2.unreadable.add(420)
++        ops2 = FakeOps(proc2)
++        result2 = GUEST.stop_identity(proc2, sample_identity(), ops2, wait=0.05, settle=0.05)
++        self.assertEqual(result2["cleanup"], "unknown")
++        self.assertEqual(ops2.signalled_pids, [])
++
++    def test_invalid_or_forged_identity_returns_unknown(self):
++        proc = FakeProc()
++        ops = FakeOps(proc)
++        forged = sample_identity()
++        forged["birthIdentity"] += "0"
++        self.assertEqual(GUEST.stop_identity(proc, forged, ops)["cleanup"], "unknown")
++        self.assertEqual(GUEST.confirm_identity(proc, forged)["absent"], False)
++        self.assertEqual(ops.signalled_pids, [])
++
++    def test_stale_nonce_and_boot_id_change_handling(self):
++        proc = FakeProc()
++        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
++        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
++        ops = FakeOps(proc)
++        identity = sample_identity(NONCE_A)
++
++        stale = GUEST.stop_identity(proc, identity, ops, expected_nonce=NONCE_B)
++        self.assertEqual(stale["cleanup"], "unknown")
++        self.assertEqual(stale["evidence"].get("reason"), "stale-nonce")
++        self.assertEqual(ops.signalled_pids, [])
++        self.assertFalse(GUEST.confirm_identity(proc, identity, expected_nonce=NONCE_B)["absent"])
++
++        rebooted = FakeProc(boot="ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb")
++        rebooted.add(419, "99001", "pid:[4026531836]", nspid=(419,))
++        rebooted.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
++        ops_reboot = FakeOps(rebooted)
++        after_boot = GUEST.stop_identity(rebooted, identity, ops_reboot, expected_nonce=NONCE_A)
++        self.assertEqual(after_boot["cleanup"], "verified")
++        self.assertTrue(after_boot["evidence"]["bootChanged"])
++        self.assertEqual(ops_reboot.signalled_pids, [])
++        self.assertTrue(GUEST.confirm_identity(rebooted, identity, expected_nonce=NONCE_A)["absent"])
++
++    def _make_pipe_supervisor_factory(self, workload_read_file, nonce=NONCE_A):
++        identity = sample_identity(nonce)
++        expected_digest = GUEST.digest(identity)
++        records = {"stop_reasons": [], "dispatched": False}
++
++        class FakeProcess:
++            def __init__(self, stdout):
++                self.stdout = stdout
++
++        class FakeSupervisor:
++            def __init__(self, emit, hold=5.0, lifetime=5.0, **_kwargs):
++                self.emit = emit
++                self.hold = hold
++                self.lifetime = lifetime
++                self.process = FakeProcess(workload_read_file)
++                self.identity = None
++                self.dispatched = False
++                self.release_fd = None
++
++            def start(self, req_nonce, _profile, _bwrap=None):
++                self.identity = sample_identity(req_nonce)
++                self.emit({"event": "held", "nonce": req_nonce, "identity": self.identity, "digest": expected_digest})
++
++            def dispatch(self, req_nonce, identity_digest):
++                if req_nonce != self.identity["nonce"] or identity_digest != expected_digest:
++                    raise RuntimeError("BLOCKED: invalid dispatch")
++                self.dispatched = True
++                records["dispatched"] = True
++                self.emit({"event": "dispatched", "nonce": req_nonce})
++
++            def stop(self, reason):
++                records["stop_reasons"].append(reason)
++                if self.process.stdout and not self.process.stdout.closed:
++                    self.process.stdout.close()
++                result = {"cleanup": "verified", "evidence": {"reason": reason}}
++                self.emit({"event": "stopped", "nonce": self.identity and self.identity["nonce"], **result})
++                return result
++
++        return FakeSupervisor, expected_digest, records
++
++    def test_serve_partial_workload_line_does_not_block_stop_or_lifetime(self):
++        # Case A: workload emits a partial line without newline, then valid stop arrives.
++        in_r, in_w = os.pipe()
++        wl_r, wl_w = os.pipe()
++        in_read = os.fdopen(in_r, "rb", buffering=0)
++        wl_read = os.fdopen(wl_r, "rb", buffering=0)
++        frames = []
++        factory, expected_digest, records = self._make_pipe_supervisor_factory(wl_read, NONCE_A)
++        try:
++            def driver():
++                os.write(in_w, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
++                os.write(in_w, (json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": expected_digest}) + "\n").encode())
++                time.sleep(0.03)
++                os.write(wl_w, b"partial-without-newline")
++                time.sleep(0.03)
++                os.write(in_w, (json.dumps({"op": "stop", "nonce": NONCE_A}) + "\n").encode())
++
++            t = threading.Thread(target=driver, daemon=True)
++            t.start()
++            t0 = time.monotonic()
++            GUEST.serve(stdin=in_read, emit=frames.append, supervisor_factory=factory, hold=2.0, lifetime=5.0)
++            elapsed = time.monotonic() - t0
++            t.join(timeout=2.0)
++            self.assertLess(elapsed, 1.5)
++            self.assertEqual(records["stop_reasons"], ["stop"])
++            self.assertTrue(any(f.get("event") == "stopped" and f["evidence"]["reason"] == "stop" for f in frames))
++        finally:
++            for fd in (in_w, wl_w):
++                try:
++                    os.close(fd)
++                except OSError:
++                    pass
++            for stream in (in_read, wl_read):
++                if not stream.closed:
++                    stream.close()
++
++        # Case B: workload emits a partial line without newline and never sends stop; lifetime must expire.
++        in_r2, in_w2 = os.pipe()
++        wl_r2, wl_w2 = os.pipe()
++        in_read2 = os.fdopen(in_r2, "rb", buffering=0)
++        wl_read2 = os.fdopen(wl_r2, "rb", buffering=0)
++        frames2 = []
++        factory2, expected_digest2, records2 = self._make_pipe_supervisor_factory(wl_read2, NONCE_A)
++        try:
++            os.write(in_w2, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
++            os.write(in_w2, (json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": expected_digest2}) + "\n").encode())
++            os.write(wl_w2, b"stalled-partial-line")
++            t0 = time.monotonic()
++            GUEST.serve(stdin=in_read2, emit=frames2.append, supervisor_factory=factory2, hold=1.0, lifetime=0.15)
++            elapsed = time.monotonic() - t0
++            self.assertLess(elapsed, 1.5)
++            self.assertEqual(records2["stop_reasons"], ["lifetime-expired"])
++        finally:
++            for fd in (in_w2, wl_w2):
++                try:
++                    os.close(fd)
++                except OSError:
++                    pass
++            for stream in (in_read2, wl_read2):
++                if not stream.closed:
++                    stream.close()
++
++    def test_serve_partial_stdin_line_does_not_block_hold_or_start_timeout(self):
++        # Partial control frame after start must still hit hold-expired without wedging.
++        in_r, in_w = os.pipe()
++        wl_r, wl_w = os.pipe()
++        in_read = os.fdopen(in_r, "rb", buffering=0)
++        wl_read = os.fdopen(wl_r, "rb", buffering=0)
++        frames = []
++        factory, _, records = self._make_pipe_supervisor_factory(wl_read, NONCE_A)
++        try:
++            os.write(in_w, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
++            os.write(in_w, b'{"op":"dispatch","partial')
++            t0 = time.monotonic()
++            GUEST.serve(stdin=in_read, emit=frames.append, supervisor_factory=factory, hold=0.15, lifetime=1.0)
++            elapsed = time.monotonic() - t0
++            self.assertLess(elapsed, 1.5)
++            self.assertEqual(records["stop_reasons"], ["hold-expired"])
++        finally:
++            for fd in (in_w, wl_w):
++                try:
++                    os.close(fd)
++                except OSError:
++                    pass
++            for stream in (in_read, wl_read):
++                if not stream.closed:
++                    stream.close()
++
++        # Partial initial start frame must time out instead of blocking indefinitely.
++        in_r2, in_w2 = os.pipe()
++        in_read2 = os.fdopen(in_r2, "rb", buffering=0)
++        frames2 = []
++        try:
++            os.write(in_w2, b'{"op":"sta')
++            t0 = time.monotonic()
++            GUEST.serve(stdin=in_read2, emit=frames2.append, hold=0.15, lifetime=1.0)
++            elapsed = time.monotonic() - t0
++            self.assertLess(elapsed, 1.5)
++            self.assertTrue(any(f.get("event") == "blocked" and "timeout" in f.get("reason", "") for f in frames2))
++        finally:
++            try:
++                os.close(in_w2)
++            except OSError:
++                pass
++            if not in_read2.closed:
++                in_read2.close()
++
++    def test_serve_stale_nonce_stop_does_not_kill_active_namespace(self):
++        in_r, in_w = os.pipe()
++        wl_r, wl_w = os.pipe()
++        in_read = os.fdopen(in_r, "rb", buffering=0)
++        wl_read = os.fdopen(wl_r, "rb", buffering=0)
++        frames = []
++        factory, expected_digest, records = self._make_pipe_supervisor_factory(wl_read, NONCE_A)
++        try:
++            def driver():
++                os.write(in_w, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
++                os.write(in_w, (json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": expected_digest}) + "\n").encode())
++                time.sleep(0.03)
++                # Stale stop must be ignored without stopping the live namespace.
++                os.write(in_w, (json.dumps({"op": "stop", "nonce": NONCE_B}) + "\n").encode())
++                time.sleep(0.03)
++                os.write(wl_w, b"still-alive-after-stale-stop\n")
++                time.sleep(0.03)
++                os.write(in_w, (json.dumps({"op": "stop", "nonce": NONCE_A}) + "\n").encode())
++
++            t = threading.Thread(target=driver, daemon=True)
++            t.start()
++            GUEST.serve(stdin=in_read, emit=frames.append, supervisor_factory=factory, hold=2.0, lifetime=2.0)
++            t.join(timeout=2.0)
++            ignored = [f for f in frames if f.get("event") == "ignored"]
++            self.assertEqual(len(ignored), 1)
++            self.assertEqual(ignored[0]["reason"], "stale-nonce")
++            self.assertEqual(ignored[0]["cleanup"], "unknown")
++            workloads = [f["data"] for f in frames if f.get("event") == "workload"]
++            self.assertEqual(workloads, ["still-alive-after-stale-stop\n"])
++            self.assertEqual(records["stop_reasons"], ["stop"])
++        finally:
++            for fd in (in_w, wl_w):
++                try:
++                    os.close(fd)
++                except OSError:
++                    pass
++            for stream in (in_read, wl_read):
++                if not stream.closed:
++                    stream.close()
++
++    def test_start_failure_in_build_command_or_popen_leaks_no_fds(self):
++        proc = FakeProc()
++        ops = FakeOps(proc)
++
++        class DummySandbox:
++            PINNED = {"runner-bwrap": "0" * 64}
++            PYTHON = "/usr/bin/python3"
++
++            @staticmethod
++            def pinned(name):
++                return f"/{name}"
++
++            @staticmethod
++            def command(_mode):
++                return ["/fake-bwrap", "--unshare-all", "--die-with-parent", "--", "/usr/bin/python3"]
++
++        # Case A: build_command raises (missing payload file).
++        before_a = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
++        sup_a = GUEST.Supervisor(lambda _f: None, proc=proc, ops=ops, sandbox=DummySandbox(),
++                                 payload="/nonexistent-payload-file.py")
++        with mock.patch.object(GUEST, "pinned_bwrap", return_value="/fake-bwrap"):
++            with self.assertRaisesRegex(RuntimeError, "inert payload unavailable"):
++                sup_a.start(NONCE_A, "inert-fixture")
++        self.assertIsNone(sup_a.process)
++        self.assertIsNone(sup_a.release_fd)
++        if before_a is not None:
++            after_a = set(os.listdir("/proc/self/fd"))
++            self.assertEqual(after_a, before_a)
++
++        # Case B: subprocess.Popen raises OSError.
++        before_b = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
++        sup_b = GUEST.Supervisor(lambda _f: None, proc=proc, ops=ops, sandbox=DummySandbox(),
++                                 payload=str(ROOT / "opencode-stop-payload.py"))
++        with mock.patch.object(GUEST, "pinned_bwrap", return_value="/fake-bwrap"), \
++             mock.patch.object(GUEST.subprocess, "Popen", side_effect=OSError("simulated Popen error")):
++            with self.assertRaises(OSError):
++                sup_b.start(NONCE_A, "inert-fixture")
++        self.assertIsNone(sup_b.process)
++        self.assertIsNone(sup_b.release_fd)
++        if before_b is not None:
++            after_b = set(os.listdir("/proc/self/fd"))
++            self.assertEqual(after_b, before_b)
++
++    def test_oneshot_bounds_newline_trailing_data_and_expected_nonce(self):
++        proc = FakeProc()
++        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
++        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
++        identity = sample_identity(NONCE_A)
++
++        def run_one(op, raw_bytes, local_proc=proc, local_ops=None):
++            out = []
++            local_ops = local_ops or FakeOps(local_proc)
++            GUEST.oneshot(op, stdin=io.BytesIO(raw_bytes), emit=out.append, proc=local_proc, ops=local_ops, timeout=0.2)
++            self.assertEqual(len(out), 1)
++            return out[0], local_ops
++
++        # Missing trailing newline rejected without signalling.
++        reply, ops = run_one("stop", json.dumps(identity).encode())
++        self.assertEqual(reply["event"], "blocked")
++        self.assertEqual(ops.signalled_pids, [])
++
++        # Oversized frame (> FRAME_MAX) rejected without signalling.
++        oversized = (json.dumps({"identity": identity, "expectedNonce": NONCE_A}) + (" " * GUEST.FRAME_MAX) + "\n").encode()
++        reply, ops = run_one("stop", oversized)
++        self.assertEqual(reply["event"], "blocked")
++        self.assertEqual(ops.signalled_pids, [])
++
++        # Trailing data after newline rejected without signalling.
++        trailing = (json.dumps(identity) + "\n" + "{}\n").encode()
++        reply, ops = run_one("stop", trailing)
++        self.assertEqual(reply["event"], "blocked")
++        self.assertEqual(ops.signalled_pids, [])
++
++        # Empty input rejected without signalling.
++        reply, ops = run_one("confirm", b"")
++        self.assertEqual(reply["event"], "blocked")
++        self.assertEqual(ops.signalled_pids, [])
++
++        # Unknown envelope keys and malformed expectedNonce rejected without signalling.
++        bad_env = (json.dumps({"identity": identity, "expectedNonce": NONCE_A, "extra": 1}) + "\n").encode()
++        reply, ops = run_one("stop", bad_env)
++        self.assertEqual(reply["event"], "blocked")
++        self.assertEqual(ops.signalled_pids, [])
++
++        for bad_nonce in (None, "", "not-a-uuid", 123):
++            bad_nonce_env = (json.dumps({"identity": identity, "expectedNonce": bad_nonce}) + "\n").encode()
++            reply, ops = run_one("stop", bad_nonce_env)
++            self.assertEqual(reply["event"], "blocked")
++            self.assertEqual(ops.signalled_pids, [])
++
++        # Stale expectedNonce returns unknown / absent: False with zero signals.
++        stale_env = (json.dumps({"identity": identity, "expectedNonce": NONCE_B}) + "\n").encode()
++        reply, ops = run_one("stop", stale_env)
++        self.assertEqual(reply["event"], "stopped")
++        self.assertEqual(reply["cleanup"], "unknown")
++        self.assertEqual(reply["evidence"].get("reason"), "stale-nonce")
++        self.assertEqual(ops.signalled_pids, [])
++
++        reply_c, _ = run_one("confirm", stale_env)
++        self.assertEqual(reply_c["event"], "confirmed")
++        self.assertFalse(reply_c["absent"])
++        self.assertEqual(reply_c.get("reason"), "stale-nonce")
++
++        # Partial line on a pipe times out cleanly instead of blocking forever.
++        p_r, p_w = os.pipe()
++        p_read = os.fdopen(p_r, "rb", buffering=0)
++        out_timeout = []
++        try:
++            os.write(p_w, b'{"identity":')
++            t0 = time.monotonic()
++            GUEST.oneshot("confirm", stdin=p_read, emit=out_timeout.append, proc=proc, ops=FakeOps(proc), timeout=0.1)
++            self.assertLess(time.monotonic() - t0, 1.0)
++            self.assertEqual(out_timeout[0]["event"], "blocked")
++        finally:
++            os.close(p_w)
++            if not p_read.closed:
++                p_read.close()
++
++        # Matching expectedNonce stops and then confirms absent cleanly.
++        valid_env = (json.dumps({"identity": identity, "expectedNonce": NONCE_A}) + "\n").encode()
++        reply_ok, ops_ok = run_one("stop", valid_env)
++        self.assertEqual(reply_ok["event"], "stopped")
++        self.assertEqual(reply_ok["cleanup"], "verified")
++        self.assertEqual(ops_ok.signalled_pids, [420, 419])
++
++        reply_ok_c, _ = run_one("confirm", valid_env)
++        self.assertEqual(reply_ok_c["event"], "confirmed")
++        self.assertTrue(reply_ok_c["absent"])
++
++
++@unittest.skipUnless(
++    os.environ.get("CYDEWORKS_PINNED_BWRAP") and Path(os.environ["CYDEWORKS_PINNED_BWRAP"]).is_file(),
++    "Live inner-bwrap supervisor tests require CYDEWORKS_PINNED_BWRAP inside the sandbox",
++)
++class OpenCodeStopGuestSandboxLiveTests(unittest.TestCase):
++    def setUp(self):
++        self.bwrap = os.environ["CYDEWORKS_PINNED_BWRAP"]
++
++    def test_mismatched_dispatch_digest_blocks_release_and_stops_held_namespace(self):
++        proc = subprocess.Popen(
++            ["/usr/bin/python3", "-I", "-B", str(ROOT / "opencode-stop-guest.py"), "serve"],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            bufsize=0,
++        )
++        try:
++            start_cmd = json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture", "bwrap": self.bwrap}) + "\n"
++            proc.stdin.write(start_cmd.encode())
++            held = json.loads(proc.stdout.readline().decode())
++            self.assertEqual(held["event"], "held")
++            identity = held["identity"]
++
++            bad_dispatch = json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": "0" * 64}) + "\n"
++            proc.stdin.write(bad_dispatch.encode())
++            frames = [json.loads(line.decode()) for line in proc.stdout]
++            proc.wait(timeout=5)
++            self.assertFalse(any(f.get("event") == "workload" for f in frames))
++            self.assertTrue(any(f.get("event") == "blocked" for f in frames))
++            stopped = [f for f in frames if f.get("event") == "stopped"]
++            self.assertEqual(len(stopped), 1)
++            self.assertEqual(stopped[0]["cleanup"], "verified")
++            self.assertTrue(GUEST.confirm_identity(GUEST.Proc(), identity)["absent"])
++        finally:
++            for stream in (proc.stdin, proc.stdout, proc.stderr):
++                if stream and not stream.closed:
++                    stream.close()
++            if proc.poll() is None:
++                proc.kill()
++                proc.wait(timeout=3)
++
++    def test_held_namespace_does_not_execute_workload_when_aborted_before_dispatch(self):
++        proc = subprocess.Popen(
++            ["/usr/bin/python3", "-I", "-B", str(ROOT / "opencode-stop-guest.py"), "serve"],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            bufsize=0,
++        )
++        try:
++            start_cmd = json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture", "bwrap": self.bwrap}) + "\n"
++            proc.stdin.write(start_cmd.encode())
++            held = json.loads(proc.stdout.readline().decode())
++            self.assertEqual(held["event"], "held")
++            self.assertEqual(held["nonce"], NONCE_A)
++            identity = held["identity"]
++
++            # Close stdin without sending dispatch: workload must never run.
++            proc.stdin.close()
++            frames = [json.loads(line.decode()) for line in proc.stdout]
++            proc.wait(timeout=5)
++            self.assertFalse(any(f.get("event") == "workload" for f in frames))
++            stopped = [f for f in frames if f.get("event") == "stopped"]
++            self.assertEqual(len(stopped), 1)
++            self.assertEqual(stopped[0]["cleanup"], "verified")
++            self.assertTrue(GUEST.confirm_identity(GUEST.Proc(), identity)["absent"])
++        finally:
++            for stream in (proc.stdin, proc.stdout, proc.stderr):
++                if stream and not stream.closed:
++                    stream.close()
++            if proc.poll() is None:
++                proc.kill()
++                proc.wait(timeout=3)
++
++    def test_dispatched_multi_process_namespace_stops_and_verifies_cleanly(self):
++        proc = subprocess.Popen(
++            ["/usr/bin/python3", "-I", "-B", str(ROOT / "opencode-stop-guest.py"), "serve"],
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            bufsize=0,
++        )
++        try:
++            start_cmd = json.dumps({"op": "start", "nonce": NONCE_B, "profile": "inert-fixture", "bwrap": self.bwrap}) + "\n"
++            proc.stdin.write(start_cmd.encode())
++            held = json.loads(proc.stdout.readline().decode())
++            self.assertEqual(held["event"], "held")
++            identity = held["identity"]
++
++            dispatch_cmd = json.dumps({"op": "dispatch", "nonce": NONCE_B, "digest": held["digest"]}) + "\n"
++            proc.stdin.write(dispatch_cmd.encode())
++            dispatched = json.loads(proc.stdout.readline().decode())
++            self.assertEqual(dispatched["event"], "dispatched")
++
++            workload = json.loads(proc.stdout.readline().decode())
++            self.assertEqual(workload["event"], "workload")
++            payload_info = json.loads(workload["data"])
++            self.assertEqual(payload_info["payload"], "inert-fixture")
++            self.assertGreaterEqual(payload_info["nsInitPid"], 1)
++            self.assertGreater(payload_info["nsChildPid"], payload_info["nsInitPid"])
++
++            # Verify live namespace members (init reaper + payload + child) exist before Stop.
++            members, ambiguous = GUEST.namespace_members(
++                GUEST.Proc(), identity["init"]["pidNs"], identity["uid"], identity["depth"]
++            )
++            self.assertGreaterEqual(len(members), 3)
++            self.assertEqual(ambiguous, [])
++
++            # Stale nonce stop must not kill the live namespace.
++            stale_stop = json.dumps({"op": "stop", "nonce": NONCE_A}) + "\n"
++            proc.stdin.write(stale_stop.encode())
++            ignored = json.loads(proc.stdout.readline().decode())
++            self.assertEqual(ignored["event"], "ignored")
++            self.assertEqual(ignored["reason"], "stale-nonce")
++            self.assertEqual(ignored["cleanup"], "unknown")
++            still_members, still_ambiguous = GUEST.namespace_members(
++                GUEST.Proc(), identity["init"]["pidNs"], identity["uid"], identity["depth"]
++            )
++            self.assertGreaterEqual(len(still_members), 3)
++            self.assertEqual(still_ambiguous, [])
++
++            # Issue matching Stop and confirm every process in the namespace exits.
++            stop_cmd = json.dumps({"op": "stop", "nonce": NONCE_B}) + "\n"
++            proc.stdin.write(stop_cmd.encode())
++            proc.stdin.close()
++            stopped = json.loads(proc.stdout.readline().decode())
++            proc.wait(timeout=5)
++            self.assertEqual(stopped["event"], "stopped")
++            self.assertEqual(stopped["cleanup"], "verified")
++            self.assertTrue(GUEST.confirm_identity(GUEST.Proc(), identity)["absent"])
++
++            # Out-of-band oneshot stop and confirm with expectedNonce envelope.
++            for mode, expected_event in (("stop", "stopped"), ("confirm", "confirmed")):
++                stale_oneshot = subprocess.run(
++                    ["/usr/bin/python3", "-I", "-B", str(ROOT / "opencode-stop-guest.py"), mode],
++                    input=(json.dumps({"identity": identity, "expectedNonce": NONCE_A}) + "\n").encode(),
++                    stdout=subprocess.PIPE,
++                    stderr=subprocess.PIPE,
++                    check=True,
++                    timeout=5,
++                )
++                stale_reply = json.loads(stale_oneshot.stdout.decode())
++                self.assertEqual(stale_reply["event"], expected_event)
++                if mode == "stop":
++                    self.assertEqual(stale_reply["cleanup"], "unknown")
++                    self.assertEqual(stale_reply["evidence"].get("reason"), "stale-nonce")
++                else:
++                    self.assertFalse(stale_reply["absent"])
++                    self.assertEqual(stale_reply.get("reason"), "stale-nonce")
++
++                oneshot = subprocess.run(
++                    ["/usr/bin/python3", "-I", "-B", str(ROOT / "opencode-stop-guest.py"), mode],
++                    input=(json.dumps({"identity": identity, "expectedNonce": NONCE_B}) + "\n").encode(),
++                    stdout=subprocess.PIPE,
++                    stderr=subprocess.PIPE,
++                    check=True,
++                    timeout=5,
++                )
++                reply = json.loads(oneshot.stdout.decode())
++                self.assertEqual(reply["event"], expected_event)
++                if mode == "stop":
++                    self.assertEqual(reply["cleanup"], "verified")
++                else:
++                    self.assertTrue(reply["absent"])
++        finally:
++            for stream in (proc.stdin, proc.stdout, proc.stderr):
++                if stream and not stream.closed:
++                    stream.close()
++            if proc.poll() is None:
++                proc.kill()
++                proc.wait(timeout=3)
++
++
++if __name__ == "__main__":
++    unittest.main()
