@@ -178,9 +178,9 @@ test('synthetic current, projected legacy, and unavailable receipts keep separat
   assert.equal(rows[2].note,UNAVAILABLE_REASONS['approved-input-mismatch']+' Its usage figures are unknown, not zero.');
   const counts=receiptCoverage(entries);
   assert.deepEqual(counts,{listed:3,current:1,projectedLegacy:1,unavailable:1,measuredWindows:2,unknownWindows:0,
-    establishedTotals:1,recordedCharges:1,unknownCharges:1});
+    establishedTotals:1,availableChargeTotals:1,unknownChargeTotals:1});
   const summary=coverageSummary(counts);
-  assert.equal(summary,'Receipts in this list: 3. Current version 2: 1. Projected legacy: 1. Unavailable: 1. Measured execution windows: 2. Unknown execution windows: 0. Established execution totals: 1. Recorded charges: 1. Unknown charges: 1. Unavailable receipts are left out of the window and charge counts. An unknown charge or window is not zero.');
+  assert.equal(summary,'Receipts in this list: 3. Current version 2: 1. Projected legacy: 1. Unavailable: 1. Measured execution windows: 2. Unknown execution windows: 0. Established execution totals: 1. Available receipt charge totals: 1. Unknown receipt charge totals: 1. Unavailable receipts are left out of the window and charge counts. An unknown charge or window is not zero.');
   assert.equal(JSON.stringify(current),currentExport);
   assert.equal(JSON.stringify(projected),projectedExport);
   assert.equal(JSON.stringify(rows).includes('synthetic-legacy-model'),false);
@@ -196,5 +196,5 @@ test('a draft unavailable receipt states its plain reason and stays out of charg
   assert.equal(row.text,'No attempts');
   assert.equal(row.note,UNAVAILABLE_REASONS['no-attempts-recorded']+' Its usage figures are unknown, not zero.');
   assert.deepEqual(receiptCoverage([entry]),{listed:1,current:0,projectedLegacy:0,unavailable:1,
-    measuredWindows:0,unknownWindows:0,establishedTotals:0,recordedCharges:0,unknownCharges:0});
+    measuredWindows:0,unknownWindows:0,establishedTotals:0,availableChargeTotals:0,unknownChargeTotals:0});
 });

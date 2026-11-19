@@ -69,7 +69,7 @@
   },
   {
     "file": "logic/usage-rows.js",
-    "sha256": "80705742b6e21a3e97e31c388b722aa5934eb468798360d241a5b7b63102d78c"
+    "sha256": "805ce56cd77576331c45e21f447c252c486e708828d4c006c4f665da69760935"
   },
   {
     "file": "styles/app.css",
@@ -145,7 +145,7 @@
   },
   {
     "file": "views/usage.js",
-    "sha256": "a54587f701c0ce83f3a919f068ef67fc0f9982ad32b98de7a4207040c66c792b"
+    "sha256": "1834561c2be4dc1aa678ee14a5d97176718be897d90105d930f210c18fbec7f7"
   },
   {
     "file": "views/work.js",

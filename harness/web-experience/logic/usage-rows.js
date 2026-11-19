@@ -99,7 +99,7 @@ function projectedNote(facts) {
   const parts = ['Route and completion evidence were not recorded.'];
   if (!facts.windowText) parts.push('No execution window was recorded. That unknown is not zero.');
   else if (!facts.totalText) parts.push('The measured window is not an established total.');
-  if (!facts.charge) parts.push('The charge is unknown, not zero.');
+  if (!facts.charge) parts.push('A complete charge total is unavailable. The total is unknown, not zero.');
   return parts.join(' ');
 }
 
@@ -107,7 +107,7 @@ function currentNote(facts) {
   const parts = [];
   if (!facts.totalText && !facts.windowText) parts.push('No execution window was recorded. That unknown is not zero.');
   else if (!facts.totalText) parts.push('The measured window is not an established total.');
-  if (!facts.charge) parts.push('No charge was recorded. Unknown is not zero.');
+  if (!facts.charge) parts.push('A complete charge total is unavailable. The total is unknown, not zero.');
   return parts.length ? parts.join(' ') : undefined;
 }
 
@@ -154,7 +154,7 @@ export function usageRow(task, entry, missing = null, summary = undefined) {
 // Counts receipts that were actually read. Unavailable receipts stay out of window and charge totals.
 export function receiptCoverage(entries) {
   const counts = {listed: 0, current: 0, projectedLegacy: 0, unavailable: 0,
-    measuredWindows: 0, unknownWindows: 0, establishedTotals: 0, recordedCharges: 0, unknownCharges: 0};
+    measuredWindows: 0, unknownWindows: 0, establishedTotals: 0, availableChargeTotals: 0, unknownChargeTotals: 0};
   for (const entry of Array.isArray(entries) ? entries : []) {
     if (!entry || typeof entry !== 'object') continue;
     counts.listed += 1;
@@ -167,8 +167,8 @@ export function receiptCoverage(entries) {
     if (facts.windowText || facts.totalText) counts.measuredWindows += 1;
     else counts.unknownWindows += 1;
     if (facts.totalText) counts.establishedTotals += 1;
-    if (facts.charge) counts.recordedCharges += 1;
-    else counts.unknownCharges += 1;
+    if (chargeView(facts.charge).state !== 'unknown') counts.availableChargeTotals += 1;
+    else counts.unknownChargeTotals += 1;
   }
   return counts;
 }
@@ -184,8 +184,8 @@ export function coverageSummary(counts) {
     'Measured execution windows: ' + counts.measuredWindows + '.',
     'Unknown execution windows: ' + counts.unknownWindows + '.',
     'Established execution totals: ' + counts.establishedTotals + '.',
-    'Recorded charges: ' + counts.recordedCharges + '.',
-    'Unknown charges: ' + counts.unknownCharges + '.',
+    'Available receipt charge totals: ' + counts.availableChargeTotals + '.',
+    'Unknown receipt charge totals: ' + counts.unknownChargeTotals + '.',
     'Unavailable receipts are left out of the window and charge counts.',
     'An unknown charge or window is not zero.',
   ].join(' ');
