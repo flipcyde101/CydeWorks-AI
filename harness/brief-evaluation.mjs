@@ -2,7 +2,10 @@
 // Pure in-memory scoring against the tracked synthetic suite and holdout set.
 // A resolved citation is structural only. Token overlap, a bare citation, and a
 // caller assertion do not verify a factual claim. Human semantic review is required.
-// A detected-pattern scan does not prove that fabrication is absent.
+// A detected-pattern scan reports configured pattern hits only. It does not
+// prove that fabrication is absent. A note-request phrase match does not
+// describe the rest of a sentence. Empty source stays outside the usable
+// gate until human review.
 
 import { deepFreeze } from './portable-manifest-contract.mjs';
 import {
@@ -308,6 +311,7 @@ function looksLikeFactualClaim(text) {
     return false;
   }
   if (NOTE_REQUEST_PATTERN.test(text)) {
+    // Phrase presence skips the verb heuristic. It does not classify the sentence.
     return false;
   }
   return /\b(is|are|was|were|will|has|have|confirmed|approved|booked|owns|costs?|exceeds|holds|fits|totals?|shipped|delivered)\b/i.test(
@@ -363,7 +367,8 @@ function matchesFlagLiteral(normalizedText, flag, rawText = '') {
   return flagOccursWithoutNegation(source, flag) ? flag : null;
 }
 
-function isNoteRequestOnly(claims) {
+function everyClaimMatchesNoteRequestPhrase(claims) {
+  // Substring hits are a rubric signal. They do not prove a sentence has no other content.
   return claims.length > 0 && claims.every((claim) => NOTE_REQUEST_PATTERN.test(claim.text));
 }
 
@@ -466,7 +471,7 @@ function computeUsability(dimensions, materialErrors, options = {}) {
   const blocksStructuralAcceptance = options.blocksStructuralAcceptance === true;
   const usableWithMinorEdits =
     sum >= 8 && !hasZero && materialErrors.length === 0 && !blocksStructuralAcceptance;
-  return deepFreeze({
+  const usability = {
     dimensionSum: sum,
     usableWithMinorEdits,
     usableGateProvesFactualAcceptance: false,
@@ -478,7 +483,11 @@ function computeUsability(dimensions, materialErrors, options = {}) {
     requiresHumanSemanticReview: true,
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
     humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
-  });
+  };
+  if (typeof options.usableGateReason === 'string' && options.usableGateReason.length > 0) {
+    usability.usableGateReason = options.usableGateReason;
+  }
+  return deepFreeze(usability);
 }
 
 function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCount, claims }) {
@@ -501,23 +510,29 @@ function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCo
   const hasCitation = [...briefText.matchAll(CITATION_PATTERN)].length > 0;
   const emptySource = sourceText.trim().length === 0;
   if (emptySource) {
+    const phraseHit = looksLikeNoteRequestBrief(briefText);
     push(
-      'Empty source requests context instead of inventing notes',
-      looksLikeNoteRequestBrief(briefText),
-      'B20 empty-source handling',
+      'Empty source matches a configured note-request phrase',
+      phraseHit,
+      phraseHit
+        ? 'A configured note-request phrase matched. The match does not describe the rest of the brief.'
+        : 'No configured note-request phrase matched.',
     );
     const patternedClaims = claims.filter((claim) => claim.emptySourceFabrication === true);
-    const scanClean = isNoteRequestOnly(claims) && patternedClaims.length === 0;
+    const patternClaimCount = patternedClaims.length;
     push(
       'Empty-source detected-pattern scan',
-      scanClean,
-      scanClean
-        ? 'Detected-pattern scan found no configured patterns in note-request text. This does not prove that fabrication is absent.'
-        : 'Detected-pattern scan found non-note-request text or configured patterns. Fabrication judgment remains pending human review.',
+      false,
+      patternClaimCount === 0
+        ? 'Detected-pattern scan found 0 configured fabrication patterns. The scan reports those patterns only and does not accept the brief.'
+        : `Detected-pattern scan found ${patternClaimCount} configured fabrication pattern claims. The scan reports those patterns only and does not accept the brief.`,
       {
         scanKind: 'detected-pattern',
         provesAbsenceOfFabrication: false,
+        provesNoteRequestPurity: false,
+        detectedConfiguredPatternClaimCount: patternClaimCount,
         fabricationJudgment: 'pending-human-review',
+        participatesInStructuralPass: false,
       },
     );
   } else {
@@ -765,6 +780,7 @@ function collectDetectedPatternHits(caseSpec, briefText, claims) {
   return deepFreeze({
     scanKind: 'detected-pattern',
     provesAbsenceOfFabrication: false,
+    provesNoteRequestPurity: false,
     provesZeroUnsupportedFacts: false,
     fabricationJudgment: 'pending-human-review',
     detectedPatternHitCount: hits.length,
@@ -784,7 +800,9 @@ function scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, stru
   const uncitedFactualCount = claims.filter(
     (claim) => claim.citedNoteIds.length === 0 && claim.verificationKind === 'missing-evidence',
   ).length;
-  const structuralPass = structuralChecks.every((check) => check.pass);
+  const structuralPass = structuralChecks.every(
+    (check) => check.participatesInStructuralPass === false || check.pass,
+  );
   const emptySource = caseSpec.sourceText.trim().length === 0;
   const citedRatio = anchorCitedClaims.length / Math.max(claims.length, 1);
 
@@ -800,7 +818,7 @@ function scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, stru
     (anchorCitedClaims.length >= 3 && uncitedFactualCount === 0);
   if (
     emptySource &&
-    isNoteRequestOnly(claims) &&
+    everyClaimMatchesNoteRequestPhrase(claims) &&
     materialErrors.length === 0 &&
     !claims.some((claim) => claim.emptySourceFabrication === true)
   ) {
@@ -1070,10 +1088,11 @@ export function evaluateBrief(input) {
     materialErrors,
     structuralChecks,
   );
-  const blocksStructuralAcceptance =
-    caseSpec.sourceText.trim().length === 0 &&
-    (!isNoteRequestOnly(claims) || claims.some((claim) => claim.emptySourceFabrication === true));
-  const usability = computeUsability(dimensions, materialErrors, { blocksStructuralAcceptance });
+  const emptySource = caseSpec.sourceText.trim().length === 0;
+  const usability = computeUsability(dimensions, materialErrors, {
+    blocksStructuralAcceptance: emptySource,
+    usableGateReason: emptySource ? 'empty-source-pending-human-review' : undefined,
+  });
 
   const unsupportedClaims = claims.filter((claim) => claim.verificationKind === 'unsupported');
 
