@@ -1,4 +1,17 @@
-"""Launch the disposable pilot in a private Ubuntu WSL namespace."""
+"""Launch the disposable pilot in a private Ubuntu WSL namespace.
+
+Check-result integrity note:
+The controller check interface is unchanged: stdin carries the case list and
+stdout carries a JSON array of {value} or {error} objects. Candidate stdout is
+not trusted. The guest must isolate it; this host accepts only one bounded,
+single-line JSON object per case and fails closed on timeout, non-zero exit,
+oversize output, trailing bytes, or any other ambiguous framing.
+
+Complete verifier integrity is not established under the current trust model
+while the candidate can still reach a guest result fd (for example through
+/proc/self/fd). Passing values from this pilot remain research observations,
+not sealed verifier proof.
+"""
 
 import hashlib
 import json
@@ -15,6 +28,8 @@ import time
 ROOT = Path(__file__).resolve().parent
 PYTHON = "/usr/bin/python3.12"
 FILES = ("limits.py", "measurement.py")
+CHECK_CASE_TIMEOUT = 3
+CHECK_OUTPUT_MAX = 4096
 PINNED = {
     "runner-bwrap": "e318903862396f96de3df57264e0158682b952fd3fb53ac23d876413e7b30f71",
     "runner-opencode": "9ca0b9953d49997601655e54f846a3efa464f237e47c6f1b04716d0f2e64c4c2",
@@ -117,6 +132,18 @@ def qualify():
     return all(cuts.values())
 
 
+def parse_check_outcome(raw):
+    """Parse one guest check frame. Reject trailing data and non-value shapes."""
+    if not raw or len(raw) > CHECK_OUTPUT_MAX:
+        raise ValueError("Check process did not return a bounded result.")
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise ValueError("Check evidence framing is invalid.")
+    value = json.loads(raw)
+    if not isinstance(value, dict) or set(value) != {"value"} or type(value["value"]) is not int:
+        raise ValueError("The check result is invalid.")
+    return value
+
+
 def verify_cases(source):
     cases = json.loads(sys.stdin.buffer.readline(32769))
     if not isinstance(cases, list) or not 1 <= len(cases) <= 16:
@@ -126,20 +153,18 @@ def verify_cases(source):
         with os.fdopen(os.memfd_create("cydeworks-check-output"), "w+b") as output:
             try:
                 completed = subprocess.run(command("invoke", source), input=json.dumps(case).encode() + b"\n",
-                                           stdout=output, stderr=subprocess.DEVNULL, check=False, timeout=6)
+                                           stdout=output, stderr=subprocess.DEVNULL, check=False,
+                                           timeout=CHECK_CASE_TIMEOUT)
             except subprocess.TimeoutExpired:
                 outcomes.append({"error": "timeout"})
                 continue
             output.seek(0)
-            raw = output.read(4097)
+            raw = output.read(CHECK_OUTPUT_MAX + 1)
         try:
-            if completed.returncode != 0 or len(raw) > 4096:
+            if completed.returncode != 0:
                 raise ValueError("Check process did not return a bounded result.")
-            value = json.loads(raw)
-            if not isinstance(value, dict) or set(value) != {"value"} or type(value["value"]) is not int:
-                raise ValueError("The check result is invalid.")
-            outcomes.append(value)
-        except ValueError:
+            outcomes.append(parse_check_outcome(raw))
+        except (ValueError, json.JSONDecodeError):
             outcomes.append({"error": "failed"})
     print(json.dumps(outcomes, separators=(",", ":")), flush=True)
 
