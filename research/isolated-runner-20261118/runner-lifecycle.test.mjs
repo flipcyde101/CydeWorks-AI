@@ -39,7 +39,7 @@ test('Windows Stop cancels owned WSL parent and child; repeated and stale Stop',
     const attempt = runOwned({claim,adapter,signal:controller.signal,execute:async()=>{
       controller.abort(Error('Synthetic Stop')); return new Promise(()=>{});
     }});
-    await assert.rejects(attempt,/Synthetic Stop/);
+    await assert.rejects(attempt,/unresolved/);
     assert.equal(reconcileClaim(join(dir,'claim')).state,'unresolved');
   } finally {
     await adapter.stopAndVerify(); claim.close(); rmSync(dir,{recursive:true});
@@ -66,7 +66,7 @@ test('unresolved cleanup and unknown inference cannot complete a claim', async (
   const dir = mkdtempSync(new URL('./lifecycle-test-', import.meta.url));
   try {
     for (const [name,stop] of [
-      ['unknown',async()=>({cleanup:'verified',inference:'unknown'})],
+      ['unknown',async()=>({cleanup:'unknown',inference:'settled'})],
       ['timeout',async()=>new Promise(()=>{})],
     ]) {
       const path=join(dir,name); const claim=claimRun(path,{synthetic:true});
@@ -79,4 +79,33 @@ test('unresolved cleanup and unknown inference cannot complete a claim', async (
       } finally {claim.close();}
     }
   } finally {rmSync(dir,{recursive:true});}
+});
+
+for (const hangs of [true, false]) test(`execute settlement independent of cleanup: hangs=${hangs}`, async () => {
+  const dir = mkdtempSync(new URL('./lifecycle-test-', import.meta.url));
+  const path = join(dir, 'claim'); const claim = claimRun(path, {});
+  try {
+    const adapter = {start: async ({nonce, record}) => {
+      assert.equal(reconcileClaim(path).rows.at(-1).state, 'launching');
+      record({nonce, birthIdentity:'fixture'}); return {};
+    }, stopAndVerify: async () => ({cleanup: hangs ? 'verified' : 'unknown', inference:'settled'})};
+    await assert.rejects(runOwned({claim, adapter, executeTimeoutMs:20, settlementTimeoutMs:20,
+      execute: async () => hangs ? new Promise(() => {}) : 1}), /unresolved/);
+    const last = reconcileClaim(path).rows.at(-1);
+    assert.equal(last.cleanup, hangs ? 'verified' : 'unknown');
+    assert.equal(last.inference, hangs ? 'unknown' : 'settled');
+  } finally { claim.close(); rmSync(dir,{recursive:true}); }
+});
+
+test('startup deadline aborts owned startup and retains uncertainty', async () => {
+  const dir = mkdtempSync(new URL('./lifecycle-test-', import.meta.url));
+  const path = join(dir,'claim'); const claim = claimRun(path,{});
+  let signal;
+  try {
+    await assert.rejects(runOwned({claim, startupTimeoutMs:20, adapter:{
+      start: async input => { signal=input.signal; return new Promise(()=>{}); },
+      stopAndVerify: async () => { assert.equal(signal.aborted,true); return {cleanup:'unknown'}; }
+    }, execute:()=>assert.fail('must not execute')}), /unresolved/);
+    assert.equal(reconcileClaim(path).state,'unresolved');
+  } finally {claim.close();rmSync(dir,{recursive:true});}
 });
