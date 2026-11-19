@@ -425,7 +425,7 @@ function inspectCurrentStep(rawCurrent, { validNow, started, dispatched = null, 
   };
 }
 
-function finalizeCurrentStep(parsedStep, { overallComplete, blockedReason, defaultUnavailableEta }) {
+function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone = false, blockedReason, defaultUnavailableEta }) {
   if (parsedStep.kind === 'none') {
     if (blockedReason !== null) {
       return {
@@ -436,6 +436,15 @@ function finalizeCurrentStep(parsedStep, { overallComplete, blockedReason, defau
       };
     }
     if (overallComplete) {
+      if (missingOverallDone) {
+        const reason = 'Completed step count is not recorded.';
+        return {
+          info: null,
+          etaMs: null,
+          eta: 'Unavailable because completed step count is not recorded.',
+          unavailableReason: reason,
+        };
+      }
       return {
         info: null,
         etaMs: 0,
@@ -462,11 +471,13 @@ function finalizeCurrentStep(parsedStep, { overallComplete, blockedReason, defau
   }
 
   if (parsedStep.kind === 'label') {
-    const etaMs = blockedReason !== null ? null : overallComplete ? 0 : null;
+    const etaMs = blockedReason !== null || missingOverallDone ? null : overallComplete ? 0 : null;
     const eta = blockedReason !== null
       ? blockedReason
       : overallComplete
-        ? 'Complete. No remaining work.'
+        ? missingOverallDone
+          ? 'Unavailable because completed step count is not recorded.'
+          : 'Complete. No remaining work.'
         : defaultUnavailableEta;
     return {
       info: {
@@ -486,7 +497,9 @@ function finalizeCurrentStep(parsedStep, { overallComplete, blockedReason, defau
       unavailableReason: blockedReason !== null
         ? blockedReason
         : overallComplete
-          ? null
+          ? missingOverallDone
+            ? 'Completed step count is not recorded.'
+            : null
           : 'Current-step sub-progress is not measured.',
     };
   }
@@ -520,9 +533,22 @@ function finalizeCurrentStep(parsedStep, { overallComplete, blockedReason, defau
   if (blockedReason !== null) {
     unavailableReason = blockedReason;
     eta = blockedReason;
-  } else if (overallComplete || (subEval.totalKnown && subEval.remaining === 0)) {
+  } else if (subEval.totalKnown && subEval.remaining === 0) {
     etaMs = 0;
-    eta = overallComplete ? 'Complete. No remaining work.' : 'Current step complete.';
+    eta = overallComplete && !missingOverallDone ? 'Complete. No remaining work.' : 'Current step complete.';
+  } else if (subEval.totalKnown && subEval.remaining !== null && subEval.remaining > 0 && overallComplete) {
+    unavailableReason = 'Completion was reported with remaining current-step work.';
+    eta = 'Unavailable because completion was reported with remaining current-step work.';
+  } else if (overallComplete && (!subEval.totalKnown || subEval.remaining === null)) {
+    unavailableReason = missingOverallDone
+      ? 'Completed step count is not recorded.'
+      : 'Current-step total or completed counter is missing.';
+    eta = missingOverallDone
+      ? 'Unavailable because completed step count is not recorded.'
+      : 'Unavailable because current-step sub-progress is not measured.';
+  } else if (overallComplete) {
+    etaMs = 0;
+    eta = 'Complete. No remaining work.';
   } else if (!subEval.totalKnown || subEval.remaining === null) {
     unavailableReason = 'Current-step total or completed counter is missing.';
     eta = 'Unavailable because current-step total or completed work is unknown.';
@@ -675,7 +701,10 @@ export function describeProgress(task, attempt, now = Date.now()) {
     || live?.complete === true
   );
   const stepsComplete = stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed === stepEval.total;
-  const prematureComplete = declaredComplete && stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed < stepEval.total;
+  const overallMissingDone = declaredComplete && stepEval.valid && stepEval.totalKnown && stepEval.completed === null;
+  const overallPremature = declaredComplete && stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed < stepEval.total;
+  const subPremature = declaredComplete && stepEval.valid && subEval !== null && subEval.totalKnown && subEval.completed !== null && subEval.completed < subEval.total;
+  const prematureComplete = overallPremature || subPremature;
   const isComplete = !prematureComplete && declaredComplete;
   const waitingForSettlementAfterSteps = isRunningAuthoritative && stepsComplete && !isFailed && !live?.stopping;
 
@@ -730,8 +759,13 @@ export function describeProgress(task, attempt, now = Date.now()) {
   if (prematureComplete) {
     phase = 'failed';
     status = 'Incomplete termination';
-    explanation = 'Completion was reported before all measured steps finished.';
-    remaining = `${stepEval.remaining} of ${stepEval.total} steps remaining.`;
+    if (overallPremature) {
+      explanation = 'Completion was reported before all measured steps finished.';
+      remaining = `${stepEval.remaining} of ${stepEval.total} steps remaining.`;
+    } else {
+      explanation = 'Completion was reported before all measured current-step sub-steps finished.';
+      remaining = `${subEval.remaining} of ${subEval.total} current-step sub-steps remaining.`;
+    }
   } else if (isFailed) {
     phase = 'failed';
     status = 'Attempt failed';
@@ -762,12 +796,16 @@ export function describeProgress(task, attempt, now = Date.now()) {
         : taskStatus === 'rejected'
           ? 'Proposal rejected'
           : 'Complete';
-    explanation = stepEval.valid && stepEval.totalKnown && stepEval.completed !== null
-      ? `All ${stepEval.total} measured steps completed.`
-      : 'The attempt has completed.';
-    remaining = stepEval.valid && stepEval.totalKnown && stepEval.total !== null
-      ? `0 of ${stepEval.total} steps remaining.`
-      : 'No remaining work.';
+    if (overallMissingDone) {
+      explanation = `The attempt reported completion, but the completed count for ${stepEval.total} total steps was not recorded.`;
+      remaining = `Remaining steps unknown; completed count for ${stepEval.total} total steps was not recorded.`;
+    } else if (stepsComplete) {
+      explanation = `All ${stepEval.total} measured steps completed.`;
+      remaining = `0 of ${stepEval.total} steps remaining.`;
+    } else {
+      explanation = 'The attempt has completed.';
+      remaining = 'No remaining work.';
+    }
   } else if (isDraft) {
     phase = 'waiting';
     status = 'Waiting for approval';
@@ -843,8 +881,10 @@ export function describeProgress(task, attempt, now = Date.now()) {
     ? 'Unavailable because the current clock timestamp is invalid or out of range.'
     : hasClockAnomaly
       ? 'Unavailable due to clock anomaly: ' + clockAnomalyReason
-      : prematureComplete
+      : overallPremature
         ? 'Unavailable because completion was reported with remaining steps.'
+        : subPremature
+          ? 'Unavailable because completion was reported with remaining current-step work.'
         : phase === 'failed'
           ? 'Unavailable because the attempt failed.'
           : phase === 'interrupted'
@@ -867,6 +907,7 @@ export function describeProgress(task, attempt, now = Date.now()) {
 
   const currentStepEval = finalizeCurrentStep(parsedCurrentStep, {
     overallComplete: isComplete,
+    missingOverallDone: overallMissingDone,
     blockedReason: etaBlockedReason,
     defaultUnavailableEta: defaultUnavailableCurrentStepEta,
   });
@@ -879,8 +920,13 @@ export function describeProgress(task, attempt, now = Date.now()) {
     overallEtaUnavailableReason = etaBlockedReason;
     overallEta = etaBlockedReason;
   } else if (isComplete) {
-    overallEtaMs = 0;
-    overallEta = 'Complete. No remaining time.';
+    if (overallMissingDone) {
+      overallEtaUnavailableReason = 'Completed step count is not recorded.';
+      overallEta = 'Unavailable because completed step count is not recorded.';
+    } else {
+      overallEtaMs = 0;
+      overallEta = 'Complete. No remaining time.';
+    }
   } else if (stepEval.present && !stepEval.valid) {
     overallEtaUnavailableReason = stepEval.rejectionReason;
     overallEta = 'Unavailable: ' + stepEval.rejectionReason;
@@ -1093,6 +1139,20 @@ export function progressAnnouncement(task, progress, connection) {
     const stepEval = evaluateStepSeries(rawStepInput, { validNow: MAX_DATE_MS, started: null });
     if (stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed < stepEval.total) {
       return `Incomplete termination. ${stepEval.remaining} of ${stepEval.total} steps remaining.`;
+    }
+    const parsedSub = inspectCurrentStep(
+      isPlainObject(rawStepInput) ? rawStepInput.currentStep : null,
+      { validNow: MAX_DATE_MS, started: null },
+    );
+    if (
+      stepEval.valid
+      && parsedSub.kind === 'measured'
+      && parsedSub.subEval?.valid
+      && parsedSub.subEval.totalKnown
+      && parsedSub.subEval.completed !== null
+      && parsedSub.subEval.completed < parsedSub.subEval.total
+    ) {
+      return `Incomplete termination. ${parsedSub.subEval.remaining} of ${parsedSub.subEval.total} current-step sub-steps remaining.`;
     }
   }
 
