@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createHash, randomBytes} from 'node:crypto';
 import {
-  existsSync, mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync,
+  copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync,
 } from 'node:fs';
 import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
@@ -20,6 +20,7 @@ import {
 import {
   beginDurableAcceptance,
   closeReplayStore,
+  getReplayLedgerId,
   inspectReplayRecord,
   openReplayStore,
   REPLAY_ERROR_MESSAGES,
@@ -73,14 +74,29 @@ function scratch(t) {
   return {dir, dbPath: join(dir, 'replay.sqlite')};
 }
 
+// Models the host's trusted pin store: the ledger id read right after
+// creation, keyed by path. Unknown paths get a well-formed id that matches
+// no real ledger, so identity can never be satisfied by accident.
+const PINS = new Map();
+const UNPINNED = '0'.repeat(32);
+
+function openPinned(options) {
+  if (options?.create) {
+    const store = openReplayStore(options);
+    PINS.set(options.path, getReplayLedgerId(store));
+    return store;
+  }
+  return openReplayStore({expectedLedgerId: PINS.get(options?.path) ?? UNPINNED, ...options});
+}
+
 function createStore(t, dbPath, extra = {}) {
-  const store = openReplayStore({path: dbPath, create: true, ...extra});
+  const store = openPinned({path: dbPath, create: true, ...extra});
   t.after(() => closeReplayStore(store));
   return store;
 }
 
 function openStore(t, dbPath, extra = {}) {
-  const store = openReplayStore({path: dbPath, ...extra});
+  const store = openPinned({path: dbPath, ...extra});
   t.after(() => closeReplayStore(store));
   return store;
 }
@@ -116,7 +132,7 @@ function rawExec(dbPath, sql, ...params) {
 const sha = text => createHash('sha256').update(text, 'utf8').digest('hex');
 const testRowDigest = (seq, digest, claimId, scopeHash, state) =>
   sha(`${REPLAY_STORE_FORMAT}\0row\0${seq}\0${digest}\0${claimId}\0${scopeHash}\0${state}`);
-const testGenesis = () => sha(`${REPLAY_STORE_FORMAT}\0genesis\0${REPLAY_STORE_SCOPE}`);
+const testGenesis = ledgerId => sha(`${REPLAY_STORE_FORMAT}\0genesis\0${REPLAY_STORE_SCOPE}\0${ledgerId}`);
 const testLink = (head, seq, digest, claimId, scopeHash) =>
   sha(`${REPLAY_STORE_FORMAT}\0link\0${head}\0${seq}\0${digest}\0${claimId}\0${scopeHash}`);
 
@@ -128,7 +144,7 @@ const NONCE_D = 'nonce-integrity-d-0004';
 // Builds a store with two settled synthetic records (A and B, rejected) and
 // one pending record (C). D is never reserved.
 function seedStore(path) {
-  const store = openReplayStore({path, create: true});
+  const store = openPinned({path, create: true});
   try {
     const claim = syntheticClaim();
     beginDurableAcceptance(store, hostController({nonce: NONCE_A, claim})).reject();
@@ -156,14 +172,14 @@ function assertStoreRefusesEverything(path, openHandle) {
     rejectsWith(() => beginDurableAcceptance(openHandle, hostController({nonce, claim})), 'STORE_CORRUPT');
     rejectsWith(() => inspectReplayRecord(openHandle, hostController({nonce, claim})), 'STORE_CORRUPT');
   }
-  rejectsWith(() => openReplayStore({path}), 'STORE_CORRUPT');
+  rejectsWith(() => openPinned({path}), 'STORE_CORRUPT');
 }
 
 // Never accepts: either open, begin, or commit must fail with one of the codes.
 function assertNeverAccepts(dbPath, codes) {
   let store;
   try {
-    store = openReplayStore({path: dbPath});
+    store = openPinned({path: dbPath});
   } catch (error) {
     assert.ok(error instanceof ReplayGuardError && codes.includes(error.code), 'open must fail closed');
     return;
@@ -199,7 +215,7 @@ const CHILD_SOURCE = [
   '  const auth = await import(arg.authUrl);',
   '  let store;',
   '  try {',
-  '    store = guard.openReplayStore({path: arg.dbPath, busyTimeoutMs: arg.busyTimeoutMs});',
+  '    store = guard.openReplayStore({path: arg.dbPath, busyTimeoutMs: arg.busyTimeoutMs, expectedLedgerId: arg.ledgerId});',
   '  } catch (e) {',
   "    out({ready: true}); out({code: typeof e?.code === 'string' ? e.code : 'UNEXPECTED'}); process.exit(0);",
   '  }',
@@ -323,7 +339,7 @@ test('concurrent processes racing the same nonce reserve it exactly once, and a 
   for (let index = 0; index < 6; index += 1) {
     children.push(startChild(dir, {
       mode: 'reserve', guardUrl: GUARD_URL, authUrl: AUTH_URL, dbPath, goPath,
-      nonce: FIXTURE_NONCE, claimRecord: FIXTURE_CLAIM, busyTimeoutMs: 5000,
+      nonce: FIXTURE_NONCE, claimRecord: FIXTURE_CLAIM, busyTimeoutMs: 5000, ledgerId: PINS.get(dbPath),
     }));
   }
   await Promise.all(children.map(child => child.ready));
@@ -356,14 +372,14 @@ test('a committed record survives a restart in a separate process', async t => {
   closeReplayStore(store);
   const restarted = startChild(dir, {
     mode: 'reserve', guardUrl: GUARD_URL, authUrl: AUTH_URL, dbPath,
-    nonce: FIXTURE_NONCE, claimRecord: FIXTURE_CLAIM, busyTimeoutMs: 2000,
+    nonce: FIXTURE_NONCE, claimRecord: FIXTURE_CLAIM, busyTimeoutMs: 2000, ledgerId: PINS.get(dbPath),
   });
   const outcome = await restarted.exited;
   assert.equal(outcome.code, 0);
   assert.equal(outcome.lines.at(-1).code, 'REPLAY_REJECTED');
 });
 
-test('a killed writer mid-transaction rolls back, and a busy commit is unresolved rather than accepted', async t => {
+test('a killed writer mid-transaction rolls back, and settlement blocked at BEGIN IMMEDIATE is unresolved', async t => {
   const {dir, dbPath} = scratch(t);
   const store = createStore(t, dbPath, {busyTimeoutMs: 150});
   const ticket = beginDurableAcceptance(store, hostController());
@@ -455,14 +471,14 @@ test('explicit reject burns the nonce durably', t => {
 
 test('callers cannot supply authority, claims, trusted flags, or forged controllers', t => {
   const {dbPath} = scratch(t);
-  rejectsWith(() => openReplayStore({path: dbPath, create: true, trusted: true}), 'STORE_CONFIG');
-  rejectsWith(() => openReplayStore({path: dbPath, create: true, claimId: 'x'}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: dbPath, create: true, trusted: true}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: dbPath, create: true, claimId: 'x'}), 'STORE_CONFIG');
   assert.equal(existsSync(dbPath), false);
   const store = createStore(t, dbPath);
   rejectsWith(() => beginDurableAcceptance(store, hostController(), {claim: syntheticClaim()}), 'STORE_CONFIG');
   const forged = Object.freeze({expectedInvocationNonce: 'nonce-forged-00000001', claim: FIXTURE_CLAIM});
   rejectsWith(() => beginDurableAcceptance(store, forged), 'CONTROLLER_REQUIRED');
-  assert.equal(inspectReplayRecord(store, forged), 'absent');
+  rejectsWith(() => inspectReplayRecord(store, forged), 'CONTROLLER_REQUIRED');
   rejectsWith(() => beginDurableAcceptance(store, null), 'CONTROLLER_REQUIRED');
   rejectsWith(() => beginDurableAcceptance({}, hostController()), 'STORE_UNAVAILABLE');
   const ticket = beginDurableAcceptance(store, hostController());
@@ -473,18 +489,18 @@ test('callers cannot supply authority, claims, trusted flags, or forged controll
 
 test('invalid configuration and missing storage fail closed without creating a store', t => {
   const {dir, dbPath} = scratch(t);
-  rejectsWith(() => openReplayStore({path: dbPath}), 'STORE_UNAVAILABLE');
+  rejectsWith(() => openPinned({path: dbPath}), 'STORE_UNAVAILABLE');
   assert.equal(existsSync(dbPath), false, 'a missing store must not be recreated silently');
-  rejectsWith(() => openReplayStore({path: 'relative.sqlite', create: true}), 'STORE_CONFIG');
-  rejectsWith(() => openReplayStore({path: ':memory:'}), 'STORE_CONFIG');
-  rejectsWith(() => openReplayStore({path: `file:${dbPath}`}), 'STORE_CONFIG');
-  rejectsWith(() => openReplayStore({path: `${dbPath}?mode=memory`}), 'STORE_CONFIG');
-  rejectsWith(() => openReplayStore({path: dbPath, busyTimeoutMs: -1}), 'STORE_CONFIG');
-  rejectsWith(() => openReplayStore({path: dbPath, create: 'yes'}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: 'relative.sqlite', create: true}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: ':memory:'}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: `file:${dbPath}`}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: `${dbPath}?mode=memory`}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: dbPath, busyTimeoutMs: -1}), 'STORE_CONFIG');
+  rejectsWith(() => openPinned({path: dbPath, create: 'yes'}), 'STORE_CONFIG');
   rejectsWith(() => openReplayStore(), 'STORE_CONFIG');
-  rejectsWith(() => openReplayStore({path: dir}), 'STORE_UNAVAILABLE');
+  rejectsWith(() => openPinned({path: dir}), 'STORE_UNAVAILABLE');
   closeReplayStore(createStore(t, dbPath));
-  rejectsWith(() => openReplayStore({path: dbPath, create: true}), 'STORE_EXISTS');
+  rejectsWith(() => openPinned({path: dbPath, create: true}), 'STORE_EXISTS');
 });
 
 test('corrupt, foreign, tampered or truncated storage never accepts', t => {
@@ -497,30 +513,30 @@ test('corrupt, foreign, tampered or truncated storage never accepts', t => {
 
   const empty = join(dir, 'empty.sqlite');
   writeFileSync(empty, '');
-  rejectsWith(() => openReplayStore({path: empty}), 'STORE_CORRUPT');
+  rejectsWith(() => openPinned({path: empty}), 'STORE_CORRUPT');
 
   const foreign = join(dir, 'foreign.sqlite');
   const foreignDb = rawDb(foreign);
   foreignDb.exec('CREATE TABLE replay_records (x TEXT)');
   foreignDb.close();
-  rejectsWith(() => openReplayStore({path: foreign}), 'STORE_CORRUPT');
+  rejectsWith(() => openPinned({path: foreign}), 'STORE_CORRUPT');
 
   const extraTable = join(dir, 'extra.sqlite');
-  closeReplayStore(openReplayStore({path: extraTable, create: true}));
+  closeReplayStore(openPinned({path: extraTable, create: true}));
   const extraDb = rawDb(extraTable);
   extraDb.exec('CREATE TABLE extra (x TEXT)');
   extraDb.close();
-  rejectsWith(() => openReplayStore({path: extraTable}), 'STORE_CORRUPT');
+  rejectsWith(() => openPinned({path: extraTable}), 'STORE_CORRUPT');
 
   const otherScope = join(dir, 'scope.sqlite');
-  closeReplayStore(openReplayStore({path: otherScope, create: true}));
+  closeReplayStore(openPinned({path: otherScope, create: true}));
   const scopeDb = rawDb(otherScope);
   scopeDb.exec("UPDATE replay_meta SET v = 'other-scope' WHERE k = 'scope'");
   scopeDb.close();
-  rejectsWith(() => openReplayStore({path: otherScope}), 'STORE_SCOPE_MISMATCH');
+  rejectsWith(() => openPinned({path: otherScope}), 'STORE_SCOPE_MISMATCH');
 
   const tamperedRow = join(dir, 'tampered.sqlite');
-  const tamperStore = openReplayStore({path: tamperedRow, create: true});
+  const tamperStore = openPinned({path: tamperedRow, create: true});
   try {
     beginDurableAcceptance(tamperStore, hostController()).reject();
     // Tamper while a handle is open: the next operation must notice.
@@ -530,10 +546,10 @@ test('corrupt, foreign, tampered or truncated storage never accepts', t => {
   } finally {
     closeReplayStore(tamperStore);
   }
-  rejectsWith(() => openReplayStore({path: tamperedRow}), 'STORE_CORRUPT');
+  rejectsWith(() => openPinned({path: tamperedRow}), 'STORE_CORRUPT');
 
   const truncated = join(dir, 'truncated.sqlite');
-  const truncStore = openReplayStore({path: truncated, create: true});
+  const truncStore = openPinned({path: truncated, create: true});
   beginDurableAcceptance(truncStore, hostController({nonce: 'nonce-trunc-0000001', claim: syntheticClaim()})).reject();
   closeReplayStore(truncStore);
   truncateSync(truncated, Math.floor(statSync(truncated).size / 2));
@@ -550,10 +566,10 @@ test('errors are fixed strings without nonces, keys, paths, claims or SQLite tex
       errors.push(error);
     }
   };
-  capture(() => openReplayStore({path: dbPath}));
+  capture(() => openPinned({path: dbPath}));
   const garbage = join(dir, 'garbage.sqlite');
   writeFileSync(garbage, randomBytes(4096));
-  capture(() => openReplayStore({path: garbage}));
+  capture(() => openPinned({path: garbage}));
   const store = createStore(t, dbPath);
   const ticket = beginDurableAcceptance(store, hostController());
   capture(() => beginDurableAcceptance(store, hostController()));
@@ -677,11 +693,246 @@ test('documented limit: a fully recomputed consistent rewrite is not detectable'
   const {dbPath} = scratch(t);
   seedStore(dbPath);
   const rows = readRows(dbPath).filter(row => row.seq !== 3);
-  let head = testGenesis();
+  let head = testGenesis(PINS.get(dbPath));
   for (const row of rows) head = testLink(head, row.seq, row.nonce_digest, row.claim_id, row.scope_hash);
   rawExec(dbPath, 'DELETE FROM replay_records WHERE seq = 3');
   rawExec(dbPath, "UPDATE replay_meta SET v = '2' WHERE k = 'count'");
   rawExec(dbPath, "UPDATE replay_meta SET v = ? WHERE k = 'head'", head);
   const store = openStore(t, dbPath);
   assert.equal(inspectReplayRecord(store, hostController({nonce: NONCE_C, claim: syntheticClaim()})), 'absent');
+});
+
+// Post-open changes to the header or schema must be caught inside the
+// deciding transaction, not only at open.
+for (const [label, sql] of [
+  ['application id', 'PRAGMA application_id = 1'],
+  ['user version', 'PRAGMA user_version = 99'],
+  ['added index', 'CREATE INDEX extra_idx ON replay_records (state)'],
+  ['added view', 'CREATE VIEW extra_view AS SELECT nonce_digest FROM replay_records'],
+  ['insert-suppressing trigger', 'CREATE TRIGGER suppress BEFORE INSERT ON replay_records BEGIN SELECT RAISE(IGNORE); END'],
+  ['meta-rewriting trigger',
+    "CREATE TRIGGER rewrite AFTER INSERT ON replay_records BEGIN UPDATE replay_meta SET v = v WHERE k = 'count'; END"],
+]) {
+  test(`structure: a post-open ${label} blocks every decision and writes no row`, t => {
+    const dbPath = tamperAndAssert(t, path => rawExec(path, sql));
+    assert.equal(readRows(dbPath).length, 3);
+  });
+}
+
+test('structure: a post-open trigger that suppresses settlement leaves the ticket unresolved, never committed', t => {
+  const {dbPath} = scratch(t);
+  const store = createStore(t, dbPath);
+  const ticket = beginDurableAcceptance(store, hostController());
+  rawExec(dbPath, 'CREATE TRIGGER hold BEFORE UPDATE ON replay_records BEGIN SELECT RAISE(IGNORE); END');
+  const error = rejectsWith(() => ticket.authenticateAndCommit(fixtureEvidence(), FIXTURE_BINDINGS),
+    'ACCEPTANCE_UNRESOLVED');
+  assert.equal(error.durable, 'unresolved');
+  rawExec(dbPath, 'DROP TRIGGER hold');
+  assert.equal(inspectReplayRecord(store, hostController()), 'pending');
+  rejectsWith(() => beginDurableAcceptance(store, hostController()), 'REPLAY_UNRESOLVED');
+});
+
+test('identity: open requires a well-formed pinned ledger id, and create refuses one', t => {
+  const {dbPath} = scratch(t);
+  rejectsWith(() => openReplayStore({path: dbPath, create: true, expectedLedgerId: UNPINNED}), 'STORE_CONFIG');
+  assert.equal(existsSync(dbPath), false);
+  const store = createStore(t, dbPath);
+  const pinned = getReplayLedgerId(store);
+  assert.match(pinned, /^[0-9a-f]{32}$/);
+  closeReplayStore(store);
+  rejectsWith(() => openReplayStore({path: dbPath}), 'STORE_CONFIG');
+  rejectsWith(() => openReplayStore({path: dbPath, expectedLedgerId: pinned.toUpperCase()}), 'STORE_CONFIG');
+  rejectsWith(() => openReplayStore({path: dbPath, expectedLedgerId: 42}), 'STORE_CONFIG');
+  rejectsWith(() => openReplayStore({path: dbPath, expectedLedgerId: UNPINNED}), 'STORE_IDENTITY_MISMATCH');
+  closeReplayStore(openReplayStore({path: dbPath, expectedLedgerId: pinned}));
+  rejectsWith(() => getReplayLedgerId(store), 'STORE_UNAVAILABLE');
+});
+
+test('identity: a different valid ledger for the same scope cannot stand in for the pinned one', t => {
+  const {dir, dbPath} = scratch(t);
+  const original = createStore(t, dbPath);
+  const pinned = getReplayLedgerId(original);
+  beginDurableAcceptance(original, hostController()).authenticateAndCommit(fixtureEvidence(), FIXTURE_BINDINGS);
+  closeReplayStore(original);
+
+  const otherPath = join(dir, 'other.sqlite');
+  closeReplayStore(createStore(t, otherPath));
+  assert.notEqual(PINS.get(otherPath), pinned);
+  rejectsWith(() => openReplayStore({path: otherPath, expectedLedgerId: pinned}), 'STORE_IDENTITY_MISMATCH');
+
+  // Substitute the other ledger at the original path: the spent nonce is
+  // absent there, but the pinned identity refuses it.
+  copyFileSync(otherPath, dbPath);
+  rejectsWith(() => openReplayStore({path: dbPath, expectedLedgerId: pinned}), 'STORE_IDENTITY_MISMATCH');
+});
+
+test('identity: a post-open ledger id change is refused inside the deciding transaction', t => {
+  const {dbPath} = scratch(t);
+  const store = createStore(t, dbPath);
+  const ticket = beginDurableAcceptance(store, hostController());
+  rawExec(dbPath, "UPDATE replay_meta SET v = ? WHERE k = 'ledger_id'", 'a'.repeat(32));
+  rejectsWith(() => beginDurableAcceptance(store, hostController({nonce: NONCE_D, claim: syntheticClaim()})),
+    'STORE_IDENTITY_MISMATCH');
+  rejectsWith(() => inspectReplayRecord(store, hostController()), 'STORE_IDENTITY_MISMATCH');
+  rejectsWith(() => ticket.authenticateAndCommit(fixtureEvidence(), FIXTURE_BINDINGS), 'ACCEPTANCE_UNRESOLVED');
+  const rows = readRows(dbPath);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'pending');
+});
+
+// Documents the stated limit: pinning does not stop rollback to an older
+// consistent copy of the same ledger, which carries the same id.
+test('documented limit: restoring an older copy of the same pinned ledger is not detectable', t => {
+  const {dir, dbPath} = scratch(t);
+  closeReplayStore(createStore(t, dbPath));
+  const backup = join(dir, 'backup.sqlite');
+  copyFileSync(dbPath, backup);
+  const store = openStore(t, dbPath);
+  beginDurableAcceptance(store, hostController()).authenticateAndCommit(fixtureEvidence(), FIXTURE_BINDINGS);
+  closeReplayStore(store);
+  copyFileSync(backup, dbPath);
+  const restored = openStore(t, dbPath);
+  assert.equal(inspectReplayRecord(restored, hostController()), 'absent');
+});
+
+test('input: forged, proxied or getter-bearing controllers get fixed errors and never run getters', t => {
+  const {dbPath} = scratch(t);
+  const store = createStore(t, dbPath);
+  let getterCalls = 0;
+  const trap = {};
+  for (const key of ['expectedInvocationNonce', 'claim']) {
+    Object.defineProperty(trap, key, {
+      get() {
+        getterCalls += 1;
+        throw new Error(`leak ${FIXTURE_NONCE} ${dbPath}`);
+      },
+    });
+  }
+  const genuine = hostController();
+  const proxied = new Proxy(genuine, {
+    get() {
+      getterCalls += 1;
+      throw new Error(`leak ${FIXTURE_NONCE}`);
+    },
+  });
+  const forged = Object.freeze({expectedInvocationNonce: FIXTURE_NONCE, claim: FIXTURE_CLAIM});
+  for (const candidate of [trap, proxied, forged, null, undefined, 'controller', 7]) {
+    rejectsWith(() => beginDurableAcceptance(store, candidate), 'CONTROLLER_REQUIRED');
+    rejectsWith(() => inspectReplayRecord(store, candidate), 'CONTROLLER_REQUIRED');
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(readRows(dbPath).length, 0);
+  // The genuine controller was never spent by any of the refused calls.
+  assert.equal(inspectReplayRecord(store, genuine), 'absent');
+  beginDurableAcceptance(store, genuine).authenticateAndCommit(fixtureEvidence(), FIXTURE_BINDINGS);
+});
+
+test('input: getter-bearing, proxied or symbol-keyed open options get fixed errors and never run getters', t => {
+  const {dbPath} = scratch(t);
+  let getterCalls = 0;
+  const getterPath = {create: true};
+  Object.defineProperty(getterPath, 'path', {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error(`leak ${dbPath}`);
+    },
+  });
+  const proxied = new Proxy({path: dbPath, create: true}, {
+    get() {
+      getterCalls += 1;
+      throw new Error('leak');
+    },
+  });
+  const symbolKeyed = {path: dbPath, create: true, [Symbol('x')]: 1};
+  const inherited = Object.create({path: dbPath, create: true});
+  for (const options of [getterPath, proxied, symbolKeyed, inherited, [dbPath], 'path']) {
+    rejectsWith(() => openReplayStore(options), 'STORE_CONFIG');
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(existsSync(dbPath), false);
+});
+
+test('input: evidence or bindings with throwing getters are rejected with fixed errors', t => {
+  const {dbPath} = scratch(t);
+  const store = createStore(t, dbPath);
+  const badEvidence = fixtureEvidence();
+  Object.defineProperty(badEvidence, 'claimId', {
+    enumerable: true,
+    get() {
+      throw new Error(`leak ${FIXTURE_NONCE}`);
+    },
+  });
+  const first = beginDurableAcceptance(store, hostController());
+  const error = rejectsWith(() => first.authenticateAndCommit(badEvidence, FIXTURE_BINDINGS), 'EVIDENCE_REJECTED');
+  assert.equal(error.message.includes(FIXTURE_NONCE), false);
+
+  const badBindings = {};
+  Object.defineProperty(badBindings, 'actualBaseRevision', {
+    get() {
+      throw new Error(`leak ${FIXTURE_NONCE}`);
+    },
+  });
+  const second = beginDurableAcceptance(store, hostController({nonce: NONCE_D}));
+  rejectsWith(() => second.authenticateAndCommit(fixtureEvidence(), badBindings), 'EVIDENCE_REJECTED');
+});
+
+// Holds a SQLite read transaction (SHARED lock) on a separate connection.
+// BEGIN IMMEDIATE still succeeds against a SHARED lock, but COMMIT needs an
+// EXCLUSIVE lock and returns SQLITE_BUSY after the busy timeout. The probe
+// below shows BEGIN IMMEDIATE is not the failing step; that COMMIT is the
+// failing step is inferred from SQLite's documented locking, not observed by
+// instrumentation inside the module.
+function holdReader(dbPath) {
+  const reader = rawDb(dbPath);
+  reader.exec('BEGIN DEFERRED');
+  reader.prepare('SELECT count(*) AS n FROM replay_records').get();
+  const probe = rawDb(dbPath);
+  try {
+    probe.exec('BEGIN IMMEDIATE');
+    probe.exec('ROLLBACK');
+  } finally {
+    probe.close();
+  }
+  return () => {
+    reader.exec('COMMIT');
+    reader.close();
+  };
+}
+
+test('commit failure: a settlement whose COMMIT is busy rolls back and stays unresolved', t => {
+  const {dbPath} = scratch(t);
+  const store = createStore(t, dbPath, {busyTimeoutMs: 100});
+  const ticket = beginDurableAcceptance(store, hostController());
+  const release = holdReader(dbPath);
+  let error;
+  try {
+    error = rejectsWith(() => ticket.authenticateAndCommit(fixtureEvidence(), FIXTURE_BINDINGS),
+      'ACCEPTANCE_UNRESOLVED');
+  } finally {
+    release();
+  }
+  assert.equal(error.durable, 'unresolved');
+  assert.equal(ticket.state, 'unresolved');
+  assert.equal(readRows(dbPath)[0].state, 'pending');
+  assert.equal(inspectReplayRecord(store, hostController()), 'pending');
+  rejectsWith(() => beginDurableAcceptance(store, hostController()), 'REPLAY_UNRESOLVED');
+  assert.equal(existsSync(`${dbPath}-journal`), false);
+});
+
+test('commit failure: a reservation whose COMMIT is busy throws and leaves no record', t => {
+  const {dbPath} = scratch(t);
+  const store = createStore(t, dbPath, {busyTimeoutMs: 100});
+  const controller = hostController();
+  const release = holdReader(dbPath);
+  try {
+    rejectsWith(() => beginDurableAcceptance(store, controller), 'STORE_BUSY');
+  } finally {
+    release();
+  }
+  assert.equal(readRows(dbPath).length, 0);
+  // The throwing call means the host never dispatched; the spent in-memory
+  // controller cannot be reused, and a fresh host controller may reserve.
+  rejectsWith(() => beginDurableAcceptance(store, controller), 'REPLAY_REJECTED');
+  beginDurableAcceptance(store, hostController()).authenticateAndCommit(fixtureEvidence(), FIXTURE_BINDINGS);
 });
