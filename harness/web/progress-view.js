@@ -543,14 +543,14 @@ export function presentProgress(progress, options = undefined) {
   if (!isBlocked) {
     if (phase === 'complete') {
       const subOpen = currentStep !== null && currentStep.total === null && currentStep.completed !== null;
-      if (!missingOverallDone && !missingSubDone && !subOpen && (raw.currentStepEtaMs === 0 || raw.etaMs === 0 || currentStep?.etaMs === 0)) {
+      if (!missingOverallDone && !missingSubDone && !subOpen && (raw.currentStepEtaMs === 0 || (currentStep !== null && currentStep.etaMs === 0))) {
         currentStepEtaMs = 0;
       }
     } else if (currentStep && currentStep.total !== null && currentStep.completed !== null && currentStep.remaining !== null) {
       if (currentStep.remaining === 0) {
         currentStepEtaMs = 0;
       } else if (currentStep.rate !== null && currentStep.rate > 0) {
-        currentStepEtaMs = validNonNegFinite(raw.currentStepEtaMs ?? raw.etaMs ?? currentStep.etaMs);
+        currentStepEtaMs = validNonNegFinite(raw.currentStepEtaMs ?? currentStep.etaMs);
       }
     }
   }
@@ -571,8 +571,17 @@ export function presentProgress(progress, options = undefined) {
     rows.push(row('clockAnomaly', 'Clock check', clockAnomalyReason, false, clockAnomalyReason));
   }
 
+  const hasCurrentStepInfo = currentStep !== null && (
+    currentStep.index !== null
+    || currentStep.label !== null
+    || currentStep.doneTotal !== null
+    || currentStep.completed !== null
+    || currentStep.total !== null
+    || currentStep.rate !== null
+  );
+
   // Current step row
-  if (currentStep !== null) {
+  if (hasCurrentStepInfo) {
     const parts = [];
     if (currentStep.index !== null && currentStep.label) {
       parts.push(`Step ${currentStep.index}: ${currentStep.label}`);
@@ -670,7 +679,7 @@ export function presentProgress(progress, options = undefined) {
     rows.push(row('rate', 'Rate', reason, false, reason));
   } else if (stepRate !== null) {
     const parts = [`${formatRate(stepRate)} steps/s`];
-    if (currentStep?.rate !== null) {
+    if (currentStep !== null && currentStep.rate !== null) {
       parts.push(`current step: ${formatRate(currentStep.rate)} sub-steps/s`);
     }
     if (charRate !== null) {

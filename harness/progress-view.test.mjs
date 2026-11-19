@@ -222,8 +222,32 @@ test('measured counts and separate current-step vs overall estimates render accu
     },
   },attempt,then+11000);
   const nearlyView=presentProgress(nearlyDone,{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(nearlyView,'currentStep').value,'Unavailable (current step not reported)');
+  assert.equal(rowByKey(nearlyView,'rate').value,'9999.9 steps/s');
   assert.equal(rowByKey(nearlyView,'completed').value,'99999 of 100000 steps (99999/100000, 99.99%)');
   assert.doesNotMatch(rowByKey(nearlyView,'completed').value,/100%/);
+
+  // Empty currentStep object with positive overall stepRate falls back to not-reported without crashing
+  const emptyStepView=presentProgress(describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{},
+      },
+    },
+  },attempt,then+5000),{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(emptyStepView,'currentStep').value,'Unavailable (current step not reported)');
+  assert.equal(rowByKey(emptyStepView,'rate').value,'0.5 steps/s');
+  assert.equal(rowByKey(emptyStepView,'overallEta').value,'6.0 s');
 });
 
 test('stale data, zero rates, waiting-for-completion, and unavailable inputs behave conservatively',()=>{
