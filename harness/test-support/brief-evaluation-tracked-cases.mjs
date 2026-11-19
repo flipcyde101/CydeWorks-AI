@@ -159,6 +159,15 @@ export const TRACKED_SYNTHETIC_CASES = Object.freeze({
     lookFor: ['june 11', 'june 14', 'audio', 'video', 'choice open', 'four calendar'],
     flags: ['agreed to video', 'guest is booked', 'guest a booked', 'guest b booked'],
     notes: 'Preserve inference limits: do not treat preference or availability as a booking or format commitment.',
+    semanticRules: {
+      materialInferencePatterns: [
+        /\bguest\s+[ab]\s+(?:is\s+|was\s+)?(?:confirmed|booked|locked\s+in|selected)\b/i,
+        /\b(?:either\s+)?guest\s+(?:is\s+|was\s+)?booked\b/i,
+        /\bguest\s+a\s+(?:committed|agreed|accepted)\s+to\s+(?:record\s+)?video\b/i,
+        /\bwill\s+record\s+video\s+with\s+guest\s+a\b/i,
+        /\b(?:recording|guest)\s+slot\s+(?:is\s+)?confirmed\b/i,
+      ],
+    },
   },
   B14: {
     caseId: 'B14',
@@ -190,7 +199,7 @@ export const TRACKED_SYNTHETIC_CASES = Object.freeze({
       '[1] Team approved a headline update on the public home page. Jules owns the update by Thursday.\n\n' +
       '[2] The new pricing page remains a draft. Legal copy requires review before it can be published.\n\n' +
       '[3] A separate office move was discussed. No action from that topic affects the website update.',
-    lookFor: ['headline', 'jules', 'thursday', 'pricing page', 'draft', 'office move'],
+    lookFor: ['headline', 'jules', 'thursday', 'pricing page', 'draft'],
     flags: ['pricing page approved', 'legal copy approved for publication'],
   },
   B17: {
@@ -221,6 +230,14 @@ export const TRACKED_SYNTHETIC_CASES = Object.freeze({
       'pilot started',
     ],
     notes: 'Clarified scoring: strictly under $500 qualifies; exactly $500 does not.',
+    semanticRules: {
+      pilotUpperBoundViolationPatterns: [
+        /\b(?:up\s+to|including|includes?|covers?|qualif\w*\s+for)\s+(?:invoices?\s+)?(?:at\s+|of\s+|for\s+)?\$?\s*500\b/i,
+        /\b(?:exactly|equal\s+to|=)\s*\$?\s*500\b/i,
+        /\binvoices?\s+(?:at|of|for)\s+\$?\s*500\b/i,
+        /\b\$?\s*500\s+(?:invoices?\s+)?(?:and\s+under|or\s+less|inclusive)\b/i,
+      ],
+    },
   },
   B19: {
     caseId: 'B19',

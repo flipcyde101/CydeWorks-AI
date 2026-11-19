@@ -1,6 +1,6 @@
 // Offline anchored brief evaluation (RB-P08-C).
 // Pure in-memory scoring against the tracked synthetic suite and holdout set.
-// Structural checks and anchor overlap do not prove factual truth.
+// Deterministic checks cannot establish factual truth without human semantic review.
 
 import { deepFreeze } from './portable-manifest-contract.mjs';
 import {
@@ -22,8 +22,13 @@ export const CLAIM_VERIFICATION_KINDS = Object.freeze([
   'missing-evidence',
 ]);
 
+export const VALID_SUITE_KINDS = Object.freeze(['tracked', 'holdout', 'ad-hoc']);
+
 export const STRUCTURAL_CHECK_DISCLAIMER =
   'This result is a structural check only. It does not prove factual truth.';
+
+export const HUMAN_SEMANTIC_REVIEW_REQUIRED =
+  'Deterministic checks cannot establish factual truth; human semantic review is required.';
 
 export const RUBRIC_DIMENSIONS = Object.freeze([
   'accuracy',
@@ -40,6 +45,8 @@ export const BRIEF_EVALUATION_LIMITS = deepFreeze({
   maxClaims: 256,
   maxLineAnchors: 512,
   maxMaterialErrors: 64,
+  maxSuiteMapEntries: 32,
+  factualAnchorOverlapMinimum: 0.45,
 });
 
 export {
@@ -58,13 +65,19 @@ const CITATION_PATTERN = /\[(\d+)\]/g;
 const LINE_ANCHOR_PATTERN = /\b(?:line|L)\s*[:.]?\s*(\d+)\b/gi;
 const SENTENCE_SPLIT = /(?<=[.!?])\s+|\n+/;
 
-const B18_EXACTLY_FIVE_HUNDRED_PATTERN =
-  /\b(?:exactly|equal to|=)\s*\$?\s*500\b|invoices?\s+of\s+\$?\s*500\b|\$500\s+qualif/i;
-
 const INSTRUCTION_LIKE_PATTERNS = Object.freeze([
   /\bignore\s+(?:the\s+)?brief\b/i,
   /\bdisregard\s+(?:the\s+)?(?:notes|source)\b/i,
   /\byou\s+must\s+now\b/i,
+]);
+
+const NOTE_REQUEST_PATTERN =
+  /\b(no notes|not supplied|ask for notes|provide source|decision context|empty input|no input were supplied)\b/i;
+
+const FABRICATION_ON_EMPTY_PATTERNS = Object.freeze([
+  /\b(?:approved|booked|confirmed|shipment|deliver(?:y|ed)|deadline|pilot started|owns)\b/i,
+  /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}\b/i,
+  /\b\d{4}-\d{2}-\d{2}\b/,
 ]);
 
 function fail(message) {
@@ -87,7 +100,7 @@ function assertPlainObject(value, label, allowedKeys) {
   if (proto !== Object.prototype && proto !== null) {
     fail(`${label} must have a standard object prototype.`);
   }
-  const allowedSet = new Set(allowedKeys);
+  const allowedSet = allowedKeys === null ? null : new Set(allowedKeys);
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string') {
       fail(`${label} contains a non-string property key.`);
@@ -96,10 +109,10 @@ function assertPlainObject(value, label, allowedKeys) {
       fail(`${label} contains a forbidden prototype key.`);
     }
     const desc = Object.getOwnPropertyDescriptor(value, key);
-    if (!desc || desc.get !== undefined || desc.set !== undefined) {
+    if (!desc || !('value' in desc) || desc.get !== undefined || desc.set !== undefined) {
       fail(`${label} cannot contain accessor properties.`);
     }
-    if (!allowedSet.has(key)) {
+    if (allowedSet && !allowedSet.has(key)) {
       fail(`${label} contains unknown field "${key}".`);
     }
   }
@@ -118,11 +131,23 @@ function readString(value, label, maxBytes, { allowEmpty = false } = {}) {
   return value;
 }
 
+function readSuiteKind(value) {
+  if (value === undefined) {
+    return null;
+  }
+  const suiteKind = readString(value, 'suiteKind', 32, { allowEmpty: false });
+  if (!VALID_SUITE_KINDS.includes(suiteKind)) {
+    fail('Unsupported suite kind.');
+  }
+  return suiteKind;
+}
+
 function cloneAnchors(anchors) {
   return anchors.map((anchor) => ({
     anchorId: anchor.anchorId,
     lineNumber: anchor.lineNumber,
     lineEnd: anchor.lineEnd,
+    headerLineNumber: anchor.headerLineNumber ?? anchor.lineNumber,
     excerpt: anchor.excerpt,
     segmentKind: anchor.segmentKind,
   }));
@@ -130,9 +155,14 @@ function cloneAnchors(anchors) {
 
 function parseSourceLineAnchors(sourceText) {
   const lines = sourceText.split(/\r?\n/);
+  const sourceLines = lines.map((text, index) => ({
+    lineNumber: index + 1,
+    text,
+  }));
   const anchors = [];
   const noteIndex = new Map();
   let activeNote = null;
+  let activeHeaderLine = null;
   let activeStartLine = null;
   const lineBuffer = [];
 
@@ -141,18 +171,21 @@ function parseSourceLineAnchors(sourceText) {
       return;
     }
     const excerpt = lineBuffer.join('\n').trim();
-    if (excerpt.length > 0) {
-      const record = {
-        anchorId: activeNote,
-        lineNumber: activeStartLine,
-        lineEnd: activeStartLine + Math.max(lineBuffer.length - 1, 0),
-        excerpt,
-        segmentKind: 'note-segment',
-      };
-      anchors.push(record);
-      noteIndex.set(activeNote, record);
-    }
+    const contentStart = activeStartLine ?? activeHeaderLine;
+    const lineEnd =
+      lineBuffer.length === 0 ? activeHeaderLine : activeHeaderLine + lineBuffer.length;
+    const record = {
+      anchorId: activeNote,
+      lineNumber: contentStart,
+      lineEnd,
+      headerLineNumber: activeHeaderLine,
+      excerpt,
+      segmentKind: 'note-segment',
+    };
+    anchors.push(record);
+    noteIndex.set(activeNote, record);
     activeNote = null;
+    activeHeaderLine = null;
     activeStartLine = null;
     lineBuffer.length = 0;
   }
@@ -163,20 +196,29 @@ function parseSourceLineAnchors(sourceText) {
     const noteMatch = trimmed.match(/^\[(\d+)\]\s*(.*)$/);
     if (noteMatch) {
       flushActiveNote();
-      activeNote = Number(noteMatch[1]);
-      activeStartLine = lineNumber;
-      if (noteMatch[2]) {
+      const noteId = Number(noteMatch[1]);
+      if (noteIndex.has(noteId)) {
+        fail(`Duplicate note id ${noteId} in source.`);
+      }
+      activeNote = noteId;
+      activeHeaderLine = lineNumber;
+      if (noteMatch[2].length > 0) {
+        activeStartLine = lineNumber;
         lineBuffer.push(noteMatch[2]);
       }
       continue;
     }
     if (activeNote !== null) {
+      if (activeStartLine === null) {
+        activeStartLine = lineNumber;
+      }
       lineBuffer.push(lines[index]);
     } else if (trimmed.length > 0) {
       anchors.push({
         anchorId: null,
         lineNumber,
         lineEnd: lineNumber,
+        headerLineNumber: lineNumber,
         excerpt: trimmed,
         segmentKind: 'plain-line',
       });
@@ -188,7 +230,7 @@ function parseSourceLineAnchors(sourceText) {
     fail('Source line anchors exceed the maximum count.');
   }
 
-  return { anchors: cloneAnchors(anchors), noteIndex };
+  return { anchors: cloneAnchors(anchors), noteIndex, sourceLines };
 }
 
 function extractClaimSegments(briefText) {
@@ -218,22 +260,28 @@ function collectLineAnchors(text) {
   return [...lines].sort((a, b) => a - b);
 }
 
-function resolveLineAnchorTargets(lineNumbers, anchors) {
+function resolveExplicitLineReferences(lineNumbers, sourceLines) {
   const resolved = [];
   for (const lineNumber of lineNumbers) {
-    const hit =
-      anchors.find((anchor) => lineNumber >= anchor.lineNumber && lineNumber <= anchor.lineEnd) ??
-      anchors.find((anchor) => anchor.lineNumber === lineNumber);
-    if (hit) {
+    const line = sourceLines.find((entry) => entry.lineNumber === lineNumber);
+    if (!line) {
       resolved.push({
-        anchorId: hit.anchorId,
-        lineNumber: hit.lineNumber,
-        lineEnd: hit.lineEnd,
-        excerpt: hit.excerpt,
-        segmentKind: hit.segmentKind,
-        matchedLine: lineNumber,
+        lineNumber,
+        valid: false,
+        excerpt: '',
+        segmentKind: 'explicit-line-reference',
       });
+      continue;
     }
+    const excerpt = line.text.trim();
+    resolved.push({
+      lineNumber,
+      lineEnd: lineNumber,
+      valid: true,
+      excerpt,
+      segmentKind: 'explicit-line-reference',
+      anchorId: null,
+    });
   }
   return resolved;
 }
@@ -269,17 +317,41 @@ function looksLikeFactualClaim(text) {
   if (/^(open question|recommendation|inference|note)\b/i.test(text)) {
     return false;
   }
-  return /\b(is|are|was|were|will|has|have|confirmed|approved|booked|owns|costs?|exceeds|holds|fits|totals?)\b/i.test(
+  if (NOTE_REQUEST_PATTERN.test(text)) {
+    return false;
+  }
+  return /\b(is|are|was|were|will|has|have|confirmed|approved|booked|owns|costs?|exceeds|holds|fits|totals?|shipped|delivered)\b/i.test(
     text,
   );
+}
+
+function looksLikeNoteRequestBrief(briefText) {
+  return NOTE_REQUEST_PATTERN.test(briefText);
+}
+
+function looksLikeFabricationOnEmptySource(text) {
+  return FABRICATION_ON_EMPTY_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function matchesFlagLiteral(normalizedText, flag, rawText = '') {
+  const source = rawText.length > 0 ? rawText : normalizedText;
+  const flagNorm = flag.toLowerCase();
+  if (flagNorm === 'agreed to video') {
+    if (/\b(?:has\s+)?not\s+agreed\s+to\s+video\b/i.test(source)) {
+      return null;
+    }
+    return /\bagreed\s+to\s+video\b/i.test(source) ? flag : null;
+  }
+  return normalizedText.includes(flagNorm) ? flag : null;
 }
 
 function matchesAnyPattern(text, patterns) {
   const normalized = normalizeForMatch(text);
   for (const pattern of patterns) {
     if (typeof pattern === 'string') {
-      if (normalized.includes(pattern.toLowerCase())) {
-        return pattern;
+      const hit = matchesFlagLiteral(normalized, pattern);
+      if (hit) {
+        return hit;
       }
     } else if (pattern.test(text)) {
       return pattern.source;
@@ -288,7 +360,37 @@ function matchesAnyPattern(text, patterns) {
   return null;
 }
 
+function detectSemanticRuleViolations(caseSpec, text) {
+  const rules = caseSpec.semanticRules;
+  if (!rules) {
+    return [];
+  }
+  const hits = [];
+  const collapsed = normalizeForMatch(text);
+  if (Array.isArray(rules.materialInferencePatterns)) {
+    for (const pattern of rules.materialInferencePatterns) {
+      if (pattern.test(text) || pattern.test(collapsed)) {
+        hits.push({ code: 'semantic-inference-limit', pattern: pattern.source });
+      }
+    }
+  }
+  if (Array.isArray(rules.pilotUpperBoundViolationPatterns)) {
+    for (const pattern of rules.pilotUpperBoundViolationPatterns) {
+      if (pattern.test(text) || pattern.test(collapsed)) {
+        hits.push({ code: 'semantic-pilot-boundary', pattern: pattern.source });
+      }
+    }
+  }
+  return hits;
+}
+
 function buildCaseSpec(caseRecord, suiteKind) {
+  const suiteLabel =
+    suiteKind === 'holdout'
+      ? SYNTHETIC_HOLDOUT_SUITE_LABEL
+      : suiteKind === 'ad-hoc'
+        ? 'ad-hoc-unregistered'
+        : 'tracked-synthetic';
   return {
     caseId: caseRecord.caseId,
     title: caseRecord.title,
@@ -297,12 +399,32 @@ function buildCaseSpec(caseRecord, suiteKind) {
     lookFor: caseRecord.lookFor ?? [],
     flags: caseRecord.flags ?? [],
     notes: caseRecord.notes ?? null,
+    semanticRules: caseRecord.semanticRules ?? null,
     suiteKind,
-    suiteLabel: suiteKind === 'holdout' ? SYNTHETIC_HOLDOUT_SUITE_LABEL : 'tracked-synthetic',
+    suiteLabel,
   };
 }
 
-function scoreDimensionFromSignals(dimension, signals) {
+function resolveRegisteredCase(caseId, suiteKind) {
+  if (!caseId) {
+    fail('caseId is required for registered synthetic cases.');
+  }
+  if (suiteKind === 'holdout') {
+    if (!SYNTHETIC_HOLDOUT_CASE_IDS.includes(caseId)) {
+      fail('Unknown holdout synthetic case id.');
+    }
+    return buildCaseSpec(SYNTHETIC_HOLDOUT_CASES[caseId], 'holdout');
+  }
+  if (suiteKind === 'tracked') {
+    if (!TRACKED_SYNTHETIC_CASE_IDS.includes(caseId)) {
+      fail('Unknown tracked synthetic case id.');
+    }
+    return buildCaseSpec(TRACKED_SYNTHETIC_CASES[caseId], 'tracked');
+  }
+  fail('Registered synthetic cases require suiteKind tracked or holdout.');
+}
+
+function scoreDimensionFromSignals(signals) {
   if (signals.materialError || signals.hardFail) {
     return 0;
   }
@@ -324,11 +446,13 @@ function computeUsability(dimensions, materialErrors) {
     dimensionSum: sum,
     usableWithMinorEdits,
     structuralOnly: true,
+    requiresHumanSemanticReview: true,
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+    humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
   });
 }
 
-function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCount }) {
+function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCount, claims }) {
   const checks = [];
   const push = (name, pass, detail) => {
     checks.push(
@@ -337,6 +461,8 @@ function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCo
         pass,
         kind: 'structural-check-only',
         disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+        requiresHumanSemanticReview: true,
+        humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
         detail: detail ?? null,
       }),
     );
@@ -347,14 +473,25 @@ function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCo
   if (emptySource) {
     push(
       'Empty source requests context instead of inventing notes',
-      /\b(no notes|not supplied|ask for notes|empty input|no input)\b/i.test(briefText),
+      looksLikeNoteRequestBrief(briefText),
       'B20 empty-source handling',
     );
-    push('Brief does not fabricate project facts on empty input', claimCount === 0 || briefText.length < 400, null);
+    const fabricatedClaims = claims.filter(
+      (claim) => claim.emptySourceFabrication === true || claim.verificationKind === 'unsupported',
+    );
+    push(
+      'Brief does not fabricate project facts on empty input',
+      fabricatedClaims.length === 0,
+      fabricatedClaims.length > 0 ? `${fabricatedClaims.length} fabricated claim segment(s)` : null,
+    );
   } else {
     push('At least one note citation is present', hasCitation, null);
     const invalidRefs = collectCitationIds(briefText).filter((id) => !noteIds.has(id));
-    push('Every note citation references a parsed source segment', invalidRefs.length === 0, invalidRefs.join(',') || null);
+    push(
+      'Every note citation references a parsed source segment',
+      invalidRefs.length === 0,
+      invalidRefs.join(',') || null,
+    );
   }
 
   push('Brief text is treated as data rather than instructions', !looksLikeExecutableInstruction(briefText), null);
@@ -367,21 +504,25 @@ function runStructuralChecks({ briefText, sourceText, noteIds, caseSpec, claimCo
     );
   }
 
-  if (caseSpec.caseId === 'B18') {
+  if (caseSpec.semanticRules) {
+    const semanticViolations = detectSemanticRuleViolations(caseSpec, briefText);
     push(
-      'B18 pilot scope uses strictly under $500 wording when $500 boundary cited',
-      !B18_EXACTLY_FIVE_HUNDRED_PATTERN.test(briefText),
-      'Exactly $500 must not qualify for the pilot',
+      `Case ${caseSpec.caseId} semantic rule limits`,
+      semanticViolations.length === 0,
+      semanticViolations.length > 0 ? semanticViolations.map((hit) => hit.code).join(', ') : null,
     );
   }
 
-  if (caseSpec.caseId === 'B13') {
-    push(
-      'B13 preserves inference limits on bookings and video commitments',
-      !/\b(guest\s+(a|b)\s+)?booked\b/i.test(briefText) && !/\bagreed to video\b/i.test(briefText),
-      null,
-    );
-  }
+  const needsSemanticFollowUp = claims.some(
+    (claim) =>
+      claim.requiresHumanSemanticReview === true &&
+      (claim.verificationKind === 'missing-evidence' || claim.verificationKind === 'unsupported'),
+  );
+  push(
+    'Human semantic review guidance',
+    true,
+    needsSemanticFollowUp ? HUMAN_SEMANTIC_REVIEW_REQUIRED : 'No missing-evidence or unsupported claims flagged',
+  );
 
   return checks;
 }
@@ -398,9 +539,12 @@ function looksLikeExecutableInstruction(text) {
 function detectMaterialErrors(caseSpec, briefText) {
   const errors = [];
   const flagHits = [];
+  const collapsedBrief = normalizeForMatch(briefText);
 
   for (const flag of caseSpec.flags) {
-    const hit = matchesAnyPattern(briefText, [flag]);
+    const flagNormalized = flag.toLowerCase();
+    const hit =
+      matchesFlagLiteral(collapsedBrief, flag, briefText) ?? matchesAnyPattern(briefText, [flag]);
     if (hit) {
       flagHits.push(flag);
       errors.push(
@@ -408,21 +552,27 @@ function detectMaterialErrors(caseSpec, briefText) {
           code: 'material-unsupported-claim',
           message: `Flag pattern matched for case ${caseSpec.caseId}.`,
           matchedPattern: String(hit),
+          scope: 'whole-brief',
           structuralOnly: true,
+          requiresHumanSemanticReview: true,
           disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+          humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
         }),
       );
     }
   }
 
-  if (caseSpec.caseId === 'B18' && B18_EXACTLY_FIVE_HUNDRED_PATTERN.test(briefText)) {
+  for (const violation of detectSemanticRuleViolations(caseSpec, briefText)) {
     errors.push(
       deepFreeze({
-        code: 'b18-exactly-500-boundary',
-        message: 'B18 scoring treats exactly $500 as outside the pilot scope.',
-        matchedPattern: B18_EXACTLY_FIVE_HUNDRED_PATTERN.source,
+        code: violation.code,
+        message: `Semantic rule violation for case ${caseSpec.caseId}.`,
+        matchedPattern: violation.pattern,
+        scope: 'whole-brief',
         structuralOnly: true,
+        requiresHumanSemanticReview: true,
         disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+        humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
       }),
     );
   }
@@ -437,40 +587,54 @@ function detectMaterialErrors(caseSpec, briefText) {
 function scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, structuralChecks) {
   const normalizedBrief = normalizeForMatch(briefText);
   const lookForHits = caseSpec.lookFor.filter((phrase) => normalizedBrief.includes(phrase.toLowerCase()));
-  const citationClaims = claims.filter((claim) => claim.sourceLineAnchors.length > 0);
+  const anchorCitedClaims = claims.filter(
+    (claim) => claim.citedNoteIds.length > 0 || claim.citedLines.length > 0,
+  );
   const unsupportedCount = claims.filter((claim) => claim.verificationKind === 'unsupported').length;
   const missingCount = claims.filter((claim) => claim.verificationKind === 'missing-evidence').length;
+  const uncitedFactualCount = claims.filter(
+    (claim) => claim.citedNoteIds.length === 0 && claim.verificationKind === 'missing-evidence',
+  ).length;
   const structuralPass = structuralChecks.every((check) => check.pass);
+  const emptySource = caseSpec.sourceText.trim().length === 0;
+  const citedRatio = anchorCitedClaims.length / Math.max(claims.length, 1);
 
-  const accuracy = scoreDimensionFromSignals('accuracy', {
+  const accuracy = scoreDimensionFromSignals({
     materialError: materialErrors.length > 0,
     hardFail: unsupportedCount > 0,
     strong: lookForHits.length >= Math.min(3, caseSpec.lookFor.length),
     weakCount: caseSpec.lookFor.length - lookForHits.length,
   });
 
-  const traceability = scoreDimensionFromSignals('traceability', {
-    materialError: missingCount > 2,
-    hardFail: false,
-    strong: citationClaims.length >= Math.max(1, Math.floor(claims.length / 2)),
-    weakCount: missingCount,
+  let traceabilityStrong =
+    (citedRatio >= 0.5 && missingCount <= Math.ceil(claims.length / 2) && uncitedFactualCount <= 1) ||
+    (anchorCitedClaims.length >= 3 && uncitedFactualCount === 0);
+  if (emptySource && looksLikeNoteRequestBrief(briefText) && materialErrors.length === 0) {
+    traceabilityStrong = true;
+  }
+
+  const traceability = scoreDimensionFromSignals({
+    materialError: uncitedFactualCount > 2 && !emptySource,
+    hardFail: !emptySource && anchorCitedClaims.length === 0,
+    strong: traceabilityStrong,
+    weakCount: uncitedFactualCount,
   });
 
-  const decisionAndCoverage = scoreDimensionFromSignals('decisionAndCoverage', {
+  const decisionAndCoverage = scoreDimensionFromSignals({
     materialError: materialErrors.length > 0,
-    hardFail: caseSpec.caseId === 'B20' && !/\b(no notes|ask for)\b/i.test(briefText),
-    strong: lookForHits.length >= 2,
+    hardFail: emptySource && !looksLikeNoteRequestBrief(briefText),
+    strong: lookForHits.length >= 2 || (emptySource && looksLikeNoteRequestBrief(briefText)),
     weakCount: caseSpec.lookFor.length - lookForHits.length,
   });
 
-  const actionsAndUncertainty = scoreDimensionFromSignals('actionsAndUncertainty', {
+  const actionsAndUncertainty = scoreDimensionFromSignals({
     materialError: materialErrors.some((err) => err.code === 'material-unsupported-claim'),
     hardFail: false,
     strong: /\b(open|unknown|not set|pending|tbd)\b/i.test(briefText),
     weakCount: 0,
   });
 
-  const readability = scoreDimensionFromSignals('readability', {
+  const readability = scoreDimensionFromSignals({
     materialError: false,
     hardFail: briefText.length > 4000,
     strong: briefText.length >= 80 && briefText.length <= 2000,
@@ -488,9 +652,18 @@ function scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, stru
   return { dimensions, lookForHits };
 }
 
-function classifyClaims(caseSpec, claimSegments, noteIndex, anchors) {
+function hasSubstantiveAnchorSupport(claimText, anchorRecords) {
+  if (anchorRecords.length === 0) {
+    return false;
+  }
+  const overlap = Math.max(...anchorRecords.map((anchor) => tokenOverlapScore(claimText, anchor.excerpt)), 0);
+  return overlap >= BRIEF_EVALUATION_LIMITS.factualAnchorOverlapMinimum;
+}
+
+function classifyClaims(caseSpec, claimSegments, noteIndex, anchors, sourceLines) {
   const claims = [];
   const seen = new Set();
+  const emptySource = caseSpec.sourceText.trim().length === 0;
 
   for (let index = 0; index < claimSegments.length; index += 1) {
     const text = claimSegments[index];
@@ -504,7 +677,9 @@ function classifyClaims(caseSpec, claimSegments, noteIndex, anchors) {
           duplicate: true,
           sourceLineAnchors: [],
           structuralOnly: true,
+          requiresHumanSemanticReview: true,
           disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+          humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
         }),
       );
       continue;
@@ -522,37 +697,65 @@ function classifyClaims(caseSpec, claimSegments, noteIndex, anchors) {
           anchorId: note.anchorId,
           lineNumber: note.lineNumber,
           lineEnd: note.lineEnd,
+          headerLineNumber: note.headerLineNumber,
           excerpt: note.excerpt,
           segmentKind: note.segmentKind,
         });
       }
     }
 
-    for (const resolved of resolveLineAnchorTargets(lineRefs, anchors)) {
-      anchorRecords.push({
-        anchorId: resolved.anchorId,
-        lineNumber: resolved.lineNumber,
-        lineEnd: resolved.lineEnd,
-        excerpt: resolved.excerpt,
-        segmentKind: resolved.segmentKind,
-        matchedLine: resolved.matchedLine,
-      });
+    for (const resolved of resolveExplicitLineReferences(lineRefs, sourceLines)) {
+      if (!resolved.valid) {
+        anchorRecords.push({
+          anchorId: null,
+          lineNumber: resolved.lineNumber,
+          lineEnd: resolved.lineNumber,
+          excerpt: '',
+          segmentKind: 'explicit-line-reference',
+          invalidLineReference: true,
+        });
+      } else {
+        anchorRecords.push({
+          anchorId: resolved.anchorId,
+          lineNumber: resolved.lineNumber,
+          lineEnd: resolved.lineEnd,
+          excerpt: resolved.excerpt,
+          segmentKind: 'explicit-line-reference',
+        });
+      }
     }
 
-    let verificationKind = 'missing-evidence';
-    const flagHit = matchesAnyPattern(text, [...caseSpec.flags, B18_EXACTLY_FIVE_HUNDRED_PATTERN]);
+    const semanticViolations = detectSemanticRuleViolations(caseSpec, text);
+    const flagHit = matchesAnyPattern(text, caseSpec.flags);
+    const emptySourceFabrication = emptySource && looksLikeFabricationOnEmptySource(text);
 
-    if (flagHit) {
+    let verificationKind = 'missing-evidence';
+    let requiresHumanSemanticReview = true;
+
+    if (
+      emptySourceFabrication ||
+      flagHit ||
+      semanticViolations.length > 0 ||
+      anchorRecords.some((anchor) => anchor.invalidLineReference === true)
+    ) {
       verificationKind = 'unsupported';
     } else if (citationIds.length > 0 && citationIds.some((id) => !noteIndex.has(id))) {
       verificationKind = 'unsupported';
-    } else if (anchorRecords.length > 0) {
-      const maxOverlap = Math.max(...anchorRecords.map((anchor) => tokenOverlapScore(text, anchor.excerpt)), 0);
-      verificationKind = maxOverlap >= 0.08 || !looksLikeFactualClaim(text) ? 'verified-by-anchor' : 'unsupported';
     } else if (looksLikeFactualClaim(text)) {
-      verificationKind = caseSpec.sourceText.trim().length === 0 ? 'verified-by-anchor' : 'missing-evidence';
-    } else {
+      if (anchorRecords.length === 0) {
+        verificationKind = emptySource ? 'unsupported' : 'missing-evidence';
+      } else if (hasSubstantiveAnchorSupport(text, anchorRecords)) {
+        verificationKind = 'verified-by-anchor';
+        requiresHumanSemanticReview = true;
+      } else {
+        verificationKind = 'missing-evidence';
+        requiresHumanSemanticReview = true;
+      }
+    } else if (looksLikeNoteRequestBrief(text) || !looksLikeFactualClaim(text)) {
       verificationKind = 'verified-by-anchor';
+      requiresHumanSemanticReview = !looksLikeNoteRequestBrief(text);
+    } else {
+      verificationKind = 'missing-evidence';
     }
 
     claims.push(
@@ -564,8 +767,12 @@ function classifyClaims(caseSpec, claimSegments, noteIndex, anchors) {
         citedNoteIds: citationIds,
         citedLines: lineRefs,
         structuralOnly: true,
+        requiresHumanSemanticReview,
+        emptySourceFabrication,
         disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+        humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
         matchedFlagPattern: flagHit ? String(flagHit) : null,
+        semanticViolations: semanticViolations.map((item) => item.code),
       }),
     );
   }
@@ -603,26 +810,31 @@ export function listSyntheticSuites() {
 }
 
 export function evaluateBrief(input) {
-  assertPlainObject(input, 'evaluateBrief input', ['caseId', 'taskText', 'sourceText', 'briefText', 'suiteKind']);
+  assertPlainObject(input, 'evaluateBrief input', [
+    'caseId',
+    'taskText',
+    'sourceText',
+    'briefText',
+    'suiteKind',
+  ]);
   const caseId = input.caseId === undefined ? null : readString(input.caseId, 'caseId', 16, { allowEmpty: false });
-  const taskText = readString(input.taskText, 'taskText', BRIEF_EVALUATION_LIMITS.maxTaskTextBytes, { allowEmpty: true });
+  const taskText = readString(input.taskText, 'taskText', BRIEF_EVALUATION_LIMITS.maxTaskTextBytes, {
+    allowEmpty: true,
+  });
   const sourceText = readString(input.sourceText, 'sourceText', BRIEF_EVALUATION_LIMITS.maxSourceTextBytes, {
     allowEmpty: true,
   });
   const briefText = readString(input.briefText, 'briefText', BRIEF_EVALUATION_LIMITS.maxBriefTextBytes, {
     allowEmpty: true,
   });
-  const suiteKind = input.suiteKind ?? (caseId?.startsWith('H') ? 'holdout' : 'tracked');
+  const explicitSuiteKind = readSuiteKind(input.suiteKind);
+  const suiteKind =
+    explicitSuiteKind ?? (caseId === null ? 'ad-hoc' : caseId.startsWith('H') ? 'holdout' : 'tracked');
 
   let caseSpec;
+  let limitations = null;
   if (caseId) {
-    caseSpec =
-      suiteKind === 'holdout'
-        ? buildCaseSpec(SYNTHETIC_HOLDOUT_CASES[caseId], 'holdout')
-        : buildCaseSpec(TRACKED_SYNTHETIC_CASES[caseId], 'tracked');
-    if (!caseSpec) {
-      fail('Case definition not found.');
-    }
+    caseSpec = resolveRegisteredCase(caseId, suiteKind);
     if (taskText.length > 0 && taskText !== caseSpec.taskText) {
       fail('taskText does not match the registered synthetic case.');
     }
@@ -641,21 +853,32 @@ export function evaluateBrief(input) {
       },
       'ad-hoc',
     );
+    limitations = Object.freeze([
+      'Ad hoc evaluation is unregistered and omits tracked rubric answer keys.',
+      HUMAN_SEMANTIC_REVIEW_REQUIRED,
+    ]);
   }
 
-  const { anchors, noteIndex } = parseSourceLineAnchors(sourceText);
+  const { anchors, noteIndex, sourceLines } = parseSourceLineAnchors(sourceText);
   const noteIds = new Set([...noteIndex.keys()]);
   const claimSegments = briefText.trim().length === 0 ? [] : extractClaimSegments(briefText);
-  const claims = classifyClaims(caseSpec, claimSegments, noteIndex, anchors);
+  const claims = classifyClaims(caseSpec, claimSegments, noteIndex, anchors, sourceLines);
   const structuralChecks = runStructuralChecks({
     briefText,
     sourceText,
     noteIds,
     caseSpec,
     claimCount: claimSegments.length,
+    claims,
   });
   const { errors: materialErrors, flagHits } = detectMaterialErrors(caseSpec, briefText);
-  const { dimensions, lookForHits } = scoreRubricDimensions(caseSpec, briefText, claims, materialErrors, structuralChecks);
+  const { dimensions, lookForHits } = scoreRubricDimensions(
+    caseSpec,
+    briefText,
+    claims,
+    materialErrors,
+    structuralChecks,
+  );
   const usability = computeUsability(dimensions, materialErrors);
 
   const unsupportedClaims = claims.filter((claim) => claim.verificationKind === 'unsupported');
@@ -679,8 +902,11 @@ export function evaluateBrief(input) {
       usability,
       scoringNotes: caseSpec.notes,
     }),
+    limitations,
     dataOnlyBoundary: true,
+    requiresHumanSemanticReview: true,
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+    humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
   });
 }
 
@@ -712,19 +938,35 @@ export function scoreHoldoutSyntheticCase(caseId, briefInput) {
   });
 }
 
-function readBriefMap(input, label) {
+function readBriefMap(input, label, { allowedCaseIds = null } = {}) {
   if (input === null || typeof input !== 'object' || Array.isArray(input) || ArrayBuffer.isView(input)) {
     fail(`${label} must be a plain object.`);
   }
+  const proto = Object.getPrototypeOf(input);
+  if (proto !== Object.prototype && proto !== null) {
+    fail(`${label} must have a standard object prototype.`);
+  }
+  const keys = Reflect.ownKeys(input);
+  if (keys.length > BRIEF_EVALUATION_LIMITS.maxSuiteMapEntries) {
+    fail(`${label} exceeds the maximum suite map size.`);
+  }
+  const allowedSet = allowedCaseIds ? new Set(allowedCaseIds) : null;
   const result = new Map();
-  for (const key of Reflect.ownKeys(input)) {
+  for (const key of keys) {
     if (typeof key !== 'string') {
       fail(`${label} contains a non-string key.`);
     }
     if (PROTOTYPE_KEYS.has(key)) {
       fail(`${label} contains a forbidden prototype key.`);
     }
-    const entry = input[key];
+    if (allowedSet && !allowedSet.has(key)) {
+      fail(`${label} contains unexpected case id "${key}".`);
+    }
+    const desc = Object.getOwnPropertyDescriptor(input, key);
+    if (!desc || !('value' in desc) || desc.get !== undefined || desc.set !== undefined) {
+      fail(`${label}.${key} cannot use accessor properties.`);
+    }
+    const entry = desc.value;
     assertPlainObject(entry, `${label}.${key}`, ['briefText']);
     result.set(
       key,
@@ -736,8 +978,14 @@ function readBriefMap(input, label) {
   return result;
 }
 
+function summarizeMaterialUnsupported(materialErrors) {
+  return materialErrors.filter(
+    (err) => err.code === 'material-unsupported-claim' || err.code === 'semantic-inference-limit' || err.code === 'semantic-pilot-boundary',
+  ).length;
+}
+
 export function runTrackedSyntheticSuite(briefsByCaseId) {
-  const briefs = readBriefMap(briefsByCaseId, 'briefsByCaseId');
+  const briefs = readBriefMap(briefsByCaseId, 'briefsByCaseId', { allowedCaseIds: TRACKED_SYNTHETIC_CASE_IDS });
   const cases = [];
   const missing = [];
   for (const caseId of TRACKED_SYNTHETIC_CASE_IDS) {
@@ -752,7 +1000,7 @@ export function runTrackedSyntheticSuite(briefsByCaseId) {
   }
 
   const materialUnsupportedClaimCount = cases.reduce(
-    (acc, item) => acc + item.unsupportedClaims.filter((claim) => claim.matchedFlagPattern).length,
+    (acc, item) => acc + summarizeMaterialUnsupported(item.materialErrors),
     0,
   );
   const usableCount = cases.filter((item) => item.rubric.usability.usableWithMinorEdits).length;
@@ -775,11 +1023,12 @@ export function runTrackedSyntheticSuite(briefsByCaseId) {
       zeroMaterialUnsupportedClaimsAcrossTracked: materialUnsupportedClaimCount === 0,
     }),
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+    humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
   });
 }
 
 export function runHoldoutSyntheticSuite(briefsByCaseId) {
-  const briefs = readBriefMap(briefsByCaseId, 'briefsByCaseId');
+  const briefs = readBriefMap(briefsByCaseId, 'briefsByCaseId', { allowedCaseIds: SYNTHETIC_HOLDOUT_CASE_IDS });
   const cases = [];
   const missing = [];
   for (const caseId of SYNTHETIC_HOLDOUT_CASE_IDS) {
@@ -793,6 +1042,11 @@ export function runHoldoutSyntheticSuite(briefsByCaseId) {
     fail(`Holdout synthetic suite missing explicit case briefs: ${missing.join(', ')}`);
   }
 
+  const materialUnsupportedClaimCount = cases.reduce(
+    (acc, item) => acc + summarizeMaterialUnsupported(item.materialErrors),
+    0,
+  );
+
   return deepFreeze({
     suiteKind: 'holdout',
     suiteLabel: SYNTHETIC_HOLDOUT_SUITE_LABEL,
@@ -801,8 +1055,10 @@ export function runHoldoutSyntheticSuite(briefsByCaseId) {
       count: cases.length,
       expectedCount: SYNTHETIC_HOLDOUT_CASE_IDS.length,
       notDrawnFromTrackedSuite: true,
+      materialUnsupportedClaimCount,
     }),
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+    humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
   });
 }
 
@@ -816,6 +1072,7 @@ export function runTwentyPlusFiveEvaluation(input) {
     tracked,
     holdout,
     disclaimer: STRUCTURAL_CHECK_DISCLAIMER,
+    humanReviewNote: HUMAN_SEMANTIC_REVIEW_REQUIRED,
   });
 }
 
@@ -825,9 +1082,11 @@ export class BriefEvaluationLibrary {
   }
 
   parseSourceLineAnchors(sourceText) {
-    return parseSourceLineAnchors(readString(sourceText, 'sourceText', BRIEF_EVALUATION_LIMITS.maxSourceTextBytes, {
-      allowEmpty: true,
-    }));
+    return parseSourceLineAnchors(
+      readString(sourceText, 'sourceText', BRIEF_EVALUATION_LIMITS.maxSourceTextBytes, {
+        allowEmpty: true,
+      }),
+    );
   }
 
   getTrackedSyntheticCaseDefinition(caseId) {
