@@ -2069,11 +2069,15 @@ test('approvedRoots re-verifies registered root identity and never offers an unv
     ).run('unbound-project','Unbound',resolveLocalRoot(unboundDir),null,stamp,stamp);
     assert.throws(()=>projects.approvedRoots('unbound-project'),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
 
-    // Replaced root: same path, new directory.
-    rmSync(projectDir,{recursive:true,force:true});
+    // Replaced root: same path, new directory. The original is renamed to a sibling and kept
+    // alive through the assertions, so the filesystem cannot reuse its inode for the replacement.
+    const retainedOriginal=join(scratch,'roots-repo-original');
+    renameSync(projectDir,retainedOriginal);
     mkdirSync(projectDir);
+    assert.ok(existsSync(retainedOriginal));
     assert.throws(()=>projects.approvedRoots(project.id),{status:409,code:'PROJECT_ROOT_REPLACED'});
     assert.throws(()=>projects.approvedRoots(project.id,{useTime:true}),{status:409,code:'PROJECT_ROOT_REPLACED'});
+    rmSync(retainedOriginal,{recursive:true,force:true});
 
     // Removed root.
     rmSync(projectDir,{recursive:true,force:true});
