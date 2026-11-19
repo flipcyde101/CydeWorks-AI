@@ -1025,13 +1025,38 @@ test('constructor and all five request operations reject raw objects and trapped
       () => runner.inspect(raw),
       () => runner.stop(raw),
       () => runner.collect(raw),
-      () => runner.tick(raw),
     ]) {
       assert.throws(
         op,
         error => error instanceof SyntheticRunnerError && error.code === 'INVALID_INPUT',
       );
     }
+  }
+
+  // tick accepts only a bounded safe integer scalar (1..maxTickSteps) and rejects objects, proxies, and invalid scalars without side effects
+  for (const badSteps of [
+    null,
+    true,
+    {},
+    [],
+    new Date(),
+    trappedObjProxy,
+    trappedArrProxy,
+    trappedFnProxy,
+    trappedGetterObj,
+    '1',
+    '123',
+    0,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    SYNTHETIC_BOUNDS.maxTickSteps + 1,
+  ]) {
+    assert.throws(
+      () => runner.tick(badSteps),
+      error => error instanceof SyntheticRunnerError && error.code === 'INVALID_INPUT',
+    );
   }
 
   // Non-function clock argument is rejected; clock inside optionsJson is rejected
@@ -1049,5 +1074,17 @@ test('constructor and all five request operations reject raw objects and trapped
   assert.equal(trapInvoked, false);
   assert.equal(getterInvoked, false);
   assert.equal(runner.stats().totalStarted, 1);
-  assert.equal(runner.inspect(toJson({workerId: started.workerId})).status, 'running');
+  assert.equal(runner.stats().virtualNowMs, 1000);
+  const stillRunning = runner.inspect(toJson({workerId: started.workerId}));
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(stillRunning.progress.completedSteps, 0);
+
+  // Valid bounded scalar tick(123) succeeds on an isolated fixture
+  const isolatedTickRunner = createRunner({initialTimeMs: 1000, stepMs: 25});
+  const isoRun = isolatedTickRunner.start(makeStartJson({deadlineAt: 6000}));
+  const ticked = isolatedTickRunner.tick(123);
+  assert.equal(ticked.advancedSteps, 123);
+  assert.equal(ticked.virtualNowMs, 1000 + 123 * 25);
+  assert.equal(ticked.activeRuns, 0);
+  assert.equal(isolatedTickRunner.inspect(toJson({workerId: isoRun.workerId})).status, 'succeeded');
 });
