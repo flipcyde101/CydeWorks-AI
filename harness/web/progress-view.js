@@ -21,6 +21,22 @@ const PHASE_LABELS = {
 
 const UNAVAILABLE_EXPLANATION = 'Progress data is unavailable or malformed.';
 
+const SAFE_FAILURE_STATUSES = new Set([
+  'Attempt failed',
+  'Incomplete termination',
+]);
+
+const SAFE_FAILURE_EXPLANATIONS = new Set([
+  'Completion was reported before all measured steps finished.',
+  'Completion was reported before all measured current-step sub-steps finished.',
+  'The attempt failed before completion.',
+]);
+
+const CONTROLLED_FAILURE_SUMMARY =
+  'Attempt failed (code: E_ATTEMPT_FAILED). Detailed diagnostics are omitted; review recovery status before retrying.';
+
+const SAFE_FAILURE_REMAINING_RE = /^\d+ of \d+ (?:steps|current-step sub-steps) remaining\.$/;
+
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value) || ArrayBuffer.isView(value)) {
     return false;
@@ -51,7 +67,7 @@ function sanitizeText(value, maxLength = MAX_TEXT_LENGTH) {
   text = text
     .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, '[redacted credential]')
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]')
-    .replace(/\b(api[_-]?key|access[_-]?key|secret|password|passwd|token|authorization|cookie|session[_-]?key)\s*([:=])\s*(['"]?)[^\s,;'"`]+\3/gi, '$1$2[redacted]')
+    .replace(/(["']?)(api[_-]?key|access[_-]?key|secret|password|passwd|token|authorization|cookie|session[_-]?key)\1\s*([:=])\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;'"`}\]]+)/gi, '$1$2$1$3[redacted]')
     .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,}|gho_[A-Za-z0-9]{12,}|AIza[A-Za-z0-9_-]{16,})\b/g, '[redacted credential]')
     .replace(/\b(https?:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, '$1[redacted]@')
     .replace(/\bfile:\/\/\/[^\s,;)]+/gi, '[redacted path]')
@@ -483,8 +499,15 @@ export function presentProgress(progress, options = undefined) {
     }
   }
 
-  const status = formatStatusValue(phase, statusText);
-  const explanation = explanationText ?? `${PHASE_LABELS[phase]} state reported.`;
+  const status = formatStatusValue(
+    phase,
+    phase === 'failed'
+      ? (SAFE_FAILURE_STATUSES.has(statusText) ? statusText : 'Attempt failed')
+      : statusText,
+  );
+  const explanation = phase === 'failed'
+    ? (SAFE_FAILURE_EXPLANATIONS.has(explanationText) ? explanationText : CONTROLLED_FAILURE_SUMMARY)
+    : (explanationText ?? `${PHASE_LABELS[phase]} state reported.`);
 
   const isTerminal = phase === 'complete' || phase === 'failed' || phase === 'interrupted' || phase === 'cancelled';
   const isBlocked = hasClockAnomaly
@@ -523,15 +546,24 @@ export function presentProgress(progress, options = undefined) {
   const reasonCurrentEta = sanitizeText(raw.unavailableReasons?.currentStepEta);
   const reasonOverallEta = sanitizeText(raw.unavailableReasons?.overallEta);
   const reasonCompletion = sanitizeText(raw.unavailableReasons?.completion);
-  const remainingNote = sanitizeText(raw.remaining);
+  const rawCurrentEtaText = sanitizeText(raw.currentStepEta ?? raw.eta ?? currentStep?.eta);
+  const rawOverallEtaText = sanitizeText(raw.overallEta);
+  const rawRemainingNote = sanitizeText(raw.remaining);
+  const remainingNote = phase === 'failed'
+    ? (rawRemainingNote === 'Review the problem and recovery status before retrying.' || (rawRemainingNote !== null && SAFE_FAILURE_REMAINING_RE.test(rawRemainingNote))
+      ? rawRemainingNote
+      : 'Review recovery status before retrying.')
+    : rawRemainingNote;
 
   const missingOverallDone = phase === 'complete' && totalKnown && completedSteps === null;
   const missingSubDone = phase === 'complete' && currentStep !== null && currentStep.total !== null && currentStep.completed === null;
 
+  const overallExplicitlyUnavailable = reasonOverallEta !== null
+    || (rawOverallEtaText !== null && /^unavailable/i.test(rawOverallEtaText));
   let overallEtaMs = null;
-  if (!isBlocked) {
+  if (!isBlocked && !overallExplicitlyUnavailable) {
     if (phase === 'complete') {
-      if (!missingOverallDone && (raw.overallEtaMs === 0 || (totalKnown && remainingSteps === 0))) {
+      if (!missingOverallDone && raw.overallEtaMs === 0) {
         overallEtaMs = 0;
       }
     } else if (totalKnown && completedSteps !== null && remainingSteps !== null && stepRate !== null && stepRate > 0) {
@@ -539,18 +571,23 @@ export function presentProgress(progress, options = undefined) {
     }
   }
 
+  const currentExplicitlyUnavailable = reasonCurrentEta !== null
+    || (rawCurrentEtaText !== null && /^unavailable/i.test(rawCurrentEtaText));
   let currentStepEtaMs = null;
-  if (!isBlocked) {
+  if (!isBlocked && !currentExplicitlyUnavailable) {
     if (phase === 'complete') {
       const subOpen = currentStep !== null && currentStep.total === null && currentStep.completed !== null;
       if (!missingOverallDone && !missingSubDone && !subOpen && (raw.currentStepEtaMs === 0 || (currentStep !== null && currentStep.etaMs === 0))) {
         currentStepEtaMs = 0;
       }
     } else if (currentStep && currentStep.total !== null && currentStep.completed !== null && currentStep.remaining !== null) {
+      const authoritativeSubEtaMs = raw.currentStepEtaMs ?? currentStep.etaMs;
       if (currentStep.remaining === 0) {
-        currentStepEtaMs = 0;
+        if (authoritativeSubEtaMs === 0) {
+          currentStepEtaMs = 0;
+        }
       } else if (currentStep.rate !== null && currentStep.rate > 0) {
-        currentStepEtaMs = validNonNegFinite(raw.currentStepEtaMs ?? currentStep.etaMs);
+        currentStepEtaMs = validNonNegFinite(authoritativeSubEtaMs);
       }
     }
   }
@@ -649,7 +686,7 @@ export function presentProgress(progress, options = undefined) {
   if (stepRejectionReason) {
     rows.push(row('remaining', 'Remaining', `Unknown (${stepRejectionReason})`, false, stepRejectionReason));
   } else if (totalKnown && remainingSteps !== null && totalSteps !== null) {
-    const text = remainingSteps === 0 && phase !== 'complete'
+    const text = remainingSteps === 0 && phase === 'waiting'
       ? `0 of ${totalSteps} steps remaining (waiting for completion)`
       : `${remainingSteps} of ${totalSteps} steps remaining`;
     rows.push(row('remaining', 'Remaining', text, true));
@@ -745,7 +782,6 @@ export function presentProgress(progress, options = undefined) {
   }
 
   // Current step ETA row (separate from Overall ETA)
-  const rawCurrentEtaText = sanitizeText(raw.currentStepEta ?? raw.eta);
   if (isBlocked) {
     const reason = ensureUnavailablePrefix(blockedReason, 'Unavailable');
     rows.push(row('currentStepEta', 'Current step ETA', reason, false, blockedReason));
@@ -767,7 +803,6 @@ export function presentProgress(progress, options = undefined) {
   }
 
   // Overall ETA row (separate from Current step ETA)
-  const rawOverallEtaText = sanitizeText(raw.overallEta);
   if (isBlocked) {
     const reason = ensureUnavailablePrefix(blockedReason, 'Unavailable');
     rows.push(row('overallEta', 'Overall ETA', reason, false, blockedReason));
