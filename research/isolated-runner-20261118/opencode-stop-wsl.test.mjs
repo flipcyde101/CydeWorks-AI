@@ -218,6 +218,12 @@ test('failure or abort during record never sends dispatch and stops held namespa
   assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm']);
   assert.equal(log.oneshotCalls[0].payload.expectedNonce, NONCE_1);
   assert.equal(log.oneshotCalls[1].payload.expectedNonce, NONCE_1);
+  await assert.rejects(
+    adapter.start({nonce: NONCE_2, record: async () => {}}),
+    /record must complete synchronously/,
+  );
+  assert.equal(log.serveFrames.some(f => f.op === 'dispatch'), false);
+  assert.deepEqual(log.oneshotCalls.slice(2).map(c => c.payload.expectedNonce), [NONCE_2, NONCE_2]);
 });
 
 test('stale nonce, forged birthIdentity, and strict identity violations return unknown without Guest call', async () => {
