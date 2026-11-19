@@ -17,6 +17,7 @@ import {digest as jsonOrTextDigest} from './runner-lifecycle.mjs';
 export const APPROVED_FIXTURE_FILES = Object.freeze(['limits.py', 'measurement.py']);
 const MAX_FILE_BYTES = 8192;
 const MAX_PATCH_BYTES = 65536;
+const MAX_CASES = 64;
 const GIT_TIMEOUT_MS = 6000;
 const GIT_MAX_BUFFER = 262144;
 
@@ -26,11 +27,13 @@ const CLAIM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CTRL_RE = /[\x00-\x1f\x7f]/;
 const WIN_RESERVED_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 const SAFE_ENV = new Set(['path', 'pathext', 'systemroot', 'windir', 'comspec', 'temp', 'tmp', 'tmpdir']);
+const SCOPE_KEYS = ['baseFileDigests', 'baseRevision', 'casesDigest', 'files', 'totalCases'].join('\0');
 
 const GIT_BIN = process.platform === 'win32' ? 'git.exe' : 'git';
 const NULL_DEV = process.platform === 'win32' ? 'NUL' : '/dev/null';
 const SAFE_GIT_ARGS = [
   '--no-optional-locks',
+  '--no-replace-objects',
   '-c', `core.hooksPath=${NULL_DEV}`,
   '-c', 'core.fsmonitor=false',
   '-c', 'core.autocrlf=false',
@@ -111,8 +114,7 @@ function toBytes(name, value) {
 
 export function computeSortedFileDigests(files) {
   if (!isPlainObj(files)) throw Error('Files map must be a plain object.');
-  const keys = Object.keys(files).sort(cmp);
-  if (keys.join('\0') !== APPROVED_FIXTURE_FILES.join('\0')) {
+  if (Object.keys(files).sort(cmp).join('\0') !== APPROVED_FIXTURE_FILES.join('\0')) {
     throw Error(`Files must match exact allowlist (${APPROVED_FIXTURE_FILES.join(', ')}).`);
   }
   const fileDigests = {};
@@ -140,6 +142,38 @@ function normalizeDigestMap(map, label) {
   return Object.freeze(out);
 }
 
+export function parseApprovedCases(cases) {
+  if (!Array.isArray(cases) || cases.length === 0 || cases.length > MAX_CASES) {
+    throw Error('Approved cases must be a bounded non-empty array.');
+  }
+  for (const entry of cases) {
+    if ((!Array.isArray(entry) && !isPlainObj(entry)) ||
+        (Array.isArray(entry) && entry.length === 0)) {
+      throw Error('Each approved check case must be a non-empty array or plain object.');
+    }
+  }
+  return Object.freeze({casesDigest: jsonOrTextDigest(cases), totalCases: cases.length});
+}
+
+export function buildScope({baseRevision, baseFileDigests, cases, files = APPROVED_FIXTURE_FILES}) {
+  if (typeof baseRevision !== 'string' || !HEX_REV_RE.test(baseRevision)) {
+    throw Error('Invalid baseRevision commit SHA.');
+  }
+  if (!Array.isArray(files) || files.join('\0') !== APPROVED_FIXTURE_FILES.join('\0')) {
+    throw Error('Scope files must match exact two-file allowlist.');
+  }
+  const normalizedBase = normalizeDigestMap(baseFileDigests, 'baseFileDigests');
+  const {casesDigest, totalCases} = parseApprovedCases(cases);
+  const scope = Object.freeze({
+    files: APPROVED_FIXTURE_FILES,
+    baseRevision,
+    baseFileDigests: normalizedBase,
+    casesDigest,
+    totalCases,
+  });
+  return Object.freeze({scope, scopeHash: jsonOrTextDigest(scope)});
+}
+
 function runGit(args, {cwd, input, encoding = 'utf8'} = {}) {
   if (args.some(a => typeof a !== 'string' || CTRL_RE.test(a))) throw Error('Unsafe Git argument.');
   const env = Object.fromEntries(
@@ -147,7 +181,7 @@ function runGit(args, {cwd, input, encoding = 'utf8'} = {}) {
   );
   return execFileSync(GIT_BIN, [...SAFE_GIT_ARGS, ...args], {
     cwd, input, encoding, windowsHide: true, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER,
-    env: {...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: NULL_DEV,
+    env: {...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: NULL_DEV, GIT_NO_REPLACE_OBJECTS: '1',
       GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: '', GIT_ASKPASS: '', LC_ALL: 'C', LANG: 'C'},
   });
 }
@@ -157,22 +191,18 @@ export function validatePatchAllowlist(patch) {
       Buffer.byteLength(patch, 'utf8') > MAX_PATCH_BYTES) {
     throw Error('Patch must be a bounded, non-empty UTF-8 string.');
   }
-  const touched = new Set();
   for (const line of patch.split('\n')) {
     if (line.startsWith('diff --git ')) {
       const m = /^diff --git a\/([^\s"]+) b\/([^\s"]+)$/.exec(line);
       if (!m || m[1] !== m[2] || !APPROVED_FIXTURE_FILES.includes(assertSafeFixtureRelativePath(m[1]))) {
         throw Error(`Patch targets unapproved or mismatched path: ${line}`);
       }
-      if (touched.has(m[1])) throw Error(`Duplicate diff section for ${m[1]}.`);
-      touched.add(m[1]);
     } else if (/^(?:GIT binary patch|Binary files |rename (?:from|to) |copy (?:from|to) |new file mode |deleted file mode |old mode |new mode )/.test(line) ||
                /^index .* (?:120000|160000)$/.test(line) || line === '--- /dev/null' || line === '+++ /dev/null') {
       throw Error(`Forbidden patch directive: ${line}`);
     }
   }
-  if (touched.size === 0) throw Error('Patch must target at least one approved fixture file.');
-  return {filesTouched: Object.freeze([...touched].sort(cmp)), patchSha256: jsonOrTextDigest(patch)};
+  return jsonOrTextDigest(patch);
 }
 
 function inspectBaseRepo(baseRepoDir, expectedRev) {
@@ -219,9 +249,92 @@ function initDisposableCopy(dir, baseFiles) {
     'commit', '--quiet', '--no-verify', '-m', 'Disposable base copy'], {cwd: dir});
 }
 
-function makeScratch(scratchRoot) {
-  const parent = scratchRoot === undefined ? realpathSync(tmpdir()) : assertSafeHostDir(scratchRoot, 'scratchRoot');
-  return mkdtempSync(join(parent, 'verified-patch-'));
+function makeScratch(scratchRoot = tmpdir()) {
+  return mkdtempSync(join(assertSafeHostDir(scratchRoot, 'scratchRoot'), 'verified-patch-'));
+}
+
+function validateBoundScope(claim, expectedRev, actualBaseDigests, approvedCases) {
+  if (!isPlainObj(claim) || typeof claim.claimId !== 'string' || !CLAIM_ID_RE.test(claim.claimId) ||
+      typeof claim.scopeHash !== 'string' || !HEX_SHA256_RE.test(claim.scopeHash) || !isPlainObj(claim.scope)) {
+    throw Error('Claim must include claimId, immutable scope, and scopeHash.');
+  }
+  const {scope} = claim;
+  if (Object.keys(scope).sort(cmp).join('\0') !== SCOPE_KEYS) {
+    throw Error('Claim scope keys do not match required binding schema.');
+  }
+  if (!Array.isArray(scope.files) || scope.files.join('\0') !== APPROVED_FIXTURE_FILES.join('\0') ||
+      scope.baseRevision !== expectedRev ||
+      typeof scope.casesDigest !== 'string' || !HEX_SHA256_RE.test(scope.casesDigest) ||
+      !Number.isSafeInteger(scope.totalCases) || scope.totalCases <= 0) {
+    throw Error('Invalid claim scope binding fields.');
+  }
+  const boundBaseDigests = normalizeDigestMap(scope.baseFileDigests, 'claim.scope.baseFileDigests');
+  for (const name of APPROVED_FIXTURE_FILES) {
+    if (boundBaseDigests[name] !== actualBaseDigests[name]) {
+      throw Error(`Claim scope base digest mismatch for ${name}.`);
+    }
+  }
+  if (jsonOrTextDigest(scope) !== claim.scopeHash) {
+    throw Error('Substituted or mutated scope: scopeHash does not match recomputed scope digest.');
+  }
+  if (approvedCases !== undefined) {
+    const parsed = parseApprovedCases(approvedCases);
+    if (parsed.casesDigest !== scope.casesDigest || parsed.totalCases !== scope.totalCases) {
+      throw Error('Claim scope check digest or count does not match parsed approved cases.');
+    }
+  }
+  return Object.freeze({
+    files: APPROVED_FIXTURE_FILES,
+    baseRevision: expectedRev,
+    baseFileDigests: boundBaseDigests,
+    casesDigest: scope.casesDigest,
+    totalCases: scope.totalCases,
+  });
+}
+
+function deriveAndVerifyDisposableIndex(dir) {
+  if (readdirSync(dir).sort(cmp).join('\0') !== ['.git', ...APPROVED_FIXTURE_FILES].sort(cmp).join('\0')) {
+    throw Error('Disposable copy contains unexpected files after apply.');
+  }
+  const indexEntries = runGit(['ls-files', '-s', '-z'], {cwd: dir, encoding: 'buffer'}).toString('utf8').split('\0').filter(Boolean);
+  const indexedFiles = indexEntries.map(line => {
+    const m = /^(100644|100755) [0-9a-f]{40,64} 0\t(.+)$/.exec(line);
+    if (!m) throw Error(`Unsupported disposable index entry: ${line}`);
+    return assertSafeFixtureRelativePath(m[2]);
+  }).sort(cmp);
+  if (indexedFiles.join('\0') !== APPROVED_FIXTURE_FILES.join('\0')) {
+    throw Error('Disposable index files changed unexpectedly.');
+  }
+
+  const diffTokens = runGit(['diff', '--cached', '--name-status', '-z', '--no-renames'], {cwd: dir, encoding: 'buffer'})
+    .toString('utf8').split('\0');
+  if (diffTokens.at(-1) === '') diffTokens.pop();
+  const changed = [];
+  for (let i = 0; i < diffTokens.length; i += 2) {
+    if (diffTokens[i] !== 'M' || !diffTokens[i + 1]) {
+      throw Error(`Expected modified index entry, got ${diffTokens[i]} ${diffTokens[i + 1] ?? ''}.`);
+    }
+    changed.push(assertSafeFixtureRelativePath(diffTokens[i + 1]));
+  }
+  const derivedChanged = Object.freeze(changed.sort(cmp));
+  if (derivedChanged.join('\0') !== APPROVED_FIXTURE_FILES.join('\0')) {
+    throw Error('Disposable Git index must show both approved files modified.');
+  }
+
+  const statusRows = runGit(['status', '--porcelain', '-z', '--untracked-files=all', '--ignored=matching'], {cwd: dir, encoding: 'buffer'})
+    .toString('utf8').split('\0').filter(Boolean).sort(cmp);
+  if (statusRows.join('\0') !== APPROVED_FIXTURE_FILES.map(f => `M  ${f}`).join('\0')) {
+    throw Error('Disposable working tree has unstaged, untracked, or missing changes.');
+  }
+
+  const rawFiles = {};
+  for (const name of APPROVED_FIXTURE_FILES) {
+    const disk = readSafeFileBytes(dir, name);
+    const staged = runGit(['cat-file', 'blob', `:${name}`], {cwd: dir, encoding: 'buffer'});
+    if (!disk.equals(staged)) throw Error(`Disposable working tree differs from staged index for ${name}.`);
+    rawFiles[name] = disk;
+  }
+  return {derivedChanged, reproduced: computeSortedFileDigests(rawFiles)};
 }
 
 export function buildCandidatePatch({baseRepoDir, baseRevision, candidateFiles, scratchRoot}) {
@@ -234,8 +347,8 @@ export function buildCandidatePatch({baseRepoDir, baseRevision, candidateFiles, 
     initDisposableCopy(dir, base.baseFiles);
     for (const name of APPROVED_FIXTURE_FILES) writeFileSync(join(dir, name), cand.fileBytes[name]);
     const patch = runGit(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--full-index', '--', ...APPROVED_FIXTURE_FILES], {cwd: dir});
-    const {patchSha256, filesTouched} = validatePatchAllowlist(patch);
-    return {patch, patchSha256, filesTouched, fileDigests: cand.fileDigests, treeSha256: cand.treeSha256};
+    const patchSha256 = validatePatchAllowlist(patch);
+    return {patch, patchSha256, fileDigests: cand.fileDigests, treeSha256: cand.treeSha256};
   } finally {
     rmSync(scratch, {recursive: true, force: true});
   }
@@ -247,35 +360,27 @@ export function verifyAndBindPatch({
   claim,
   verification,
   patch,
+  approvedCases,
   candidateFiles,
-  requireAllFilesChanged = false,
   scratchRoot,
 }) {
   if (typeof baseRevision !== 'string' || !HEX_REV_RE.test(baseRevision)) throw Error('Invalid baseRevision commit SHA.');
-  const {filesTouched, patchSha256} = validatePatchAllowlist(patch);
-  if (requireAllFilesChanged && filesTouched.length !== APPROVED_FIXTURE_FILES.length) {
-    throw Error('Patch must modify both approved fixture files.');
-  }
-
+  const patchSha256 = validatePatchAllowlist(patch);
   const base = inspectBaseRepo(baseRepoDir, baseRevision);
-  if (!isPlainObj(claim) || typeof claim.claimId !== 'string' || !CLAIM_ID_RE.test(claim.claimId) ||
-      typeof claim.scopeHash !== 'string' || !HEX_SHA256_RE.test(claim.scopeHash) || claim.baseRevision !== baseRevision) {
-    throw Error('Invalid or mismatched claim binding.');
-  }
-  if (claim.baseFileDigests !== undefined) {
-    const claimedBase = normalizeDigestMap(claim.baseFileDigests, 'claim.baseFileDigests');
-    for (const name of APPROVED_FIXTURE_FILES) {
-      if (claimedBase[name] !== base.fileDigests[name]) throw Error(`Claim base digest mismatch for ${name}.`);
-    }
-  }
+  const boundScope = validateBoundScope(claim, baseRevision, base.fileDigests, approvedCases);
 
   if (!isPlainObj(verification) || verification.trusted !== true || verification.passed !== true ||
       verification.claimId !== claim.claimId || verification.baseRevision !== baseRevision ||
-      typeof verification.casesDigest !== 'string' || !HEX_SHA256_RE.test(verification.casesDigest) ||
-      !Number.isSafeInteger(verification.totalCases) || verification.totalCases <= 0 ||
-      verification.passedCases !== verification.totalCases ||
+      verification.casesDigest !== boundScope.casesDigest || verification.totalCases !== boundScope.totalCases ||
+      verification.passedCases !== boundScope.totalCases ||
       !Array.isArray(verification.failures) || verification.failures.length !== 0) {
-    throw Error('Missing or invalid protected verifier evidence.');
+    throw Error('Missing, mismatched, or invalid protected verifier evidence.');
+  }
+  if (verification.results !== undefined) {
+    if (!Array.isArray(verification.results) || verification.results.length !== boundScope.totalCases ||
+        verification.results.some(r => !isPlainObj(r) || Object.keys(r).join('\0') !== 'value' || !Number.isSafeInteger(r.value))) {
+      throw Error('Invalid parsed verifier results payload.');
+    }
   }
   const verifiedDigests = normalizeDigestMap(verification.fileDigests, 'verification.fileDigests');
   const expectedTreeSha = jsonOrTextDigest(APPROVED_FIXTURE_FILES.map(name => [name, verifiedDigests[name]]));
@@ -291,36 +396,24 @@ export function verifyAndBindPatch({
   }
 
   const scratch = makeScratch(scratchRoot);
-  let reproduced;
+  let indexOutcome;
   try {
     const dir = join(scratch, 'base-copy');
     initDisposableCopy(dir, base.baseFiles);
     runGit(['apply', '--check', '--index', '-'], {cwd: dir, input: patch});
     runGit(['apply', '--index', '-'], {cwd: dir, input: patch});
-
-    if (readdirSync(dir).sort(cmp).join('\0') !== ['.git', ...APPROVED_FIXTURE_FILES].sort(cmp).join('\0')) {
-      throw Error('Disposable copy contains unexpected files after apply.');
-    }
-    if (runGit(['ls-files', '-z'], {cwd: dir, encoding: 'buffer'}).toString('utf8').split('\0').filter(Boolean).sort(cmp).join('\0') !== APPROVED_FIXTURE_FILES.join('\0')) {
-      throw Error('Disposable copy tracked files changed unexpectedly.');
-    }
-    for (const rec of runGit(['status', '--porcelain', '-z', '--untracked-files=all', '--ignored=matching'], {cwd: dir, encoding: 'buffer'}).toString('utf8').split('\0').filter(Boolean)) {
-      if (rec.slice(0, 2) !== 'M ' || !APPROVED_FIXTURE_FILES.includes(rec.slice(3))) {
-        throw Error(`Forbidden change in disposable copy: ${rec}`);
-      }
-    }
-    const rawFiles = Object.fromEntries(APPROVED_FIXTURE_FILES.map(name => [name, readSafeFileBytes(dir, name)]));
-    reproduced = computeSortedFileDigests(rawFiles);
+    indexOutcome = deriveAndVerifyDisposableIndex(dir);
   } finally {
     rmSync(scratch, {recursive: true, force: true});
   }
 
+  const {derivedChanged, reproduced} = indexOutcome;
   for (const name of APPROVED_FIXTURE_FILES) {
     if (reproduced.fileDigests[name] !== verifiedDigests[name] ||
         (expectedRawBytes && !reproduced.fileBytes[name].equals(expectedRawBytes[name]))) {
       throw Error(`Reproduced raw bytes mismatch for ${name}.`);
     }
-    if (requireAllFilesChanged && reproduced.fileDigests[name] === base.fileDigests[name]) {
+    if (reproduced.fileDigests[name] === base.fileDigests[name]) {
       throw Error(`Approved file ${name} remained unchanged.`);
     }
   }
@@ -333,6 +426,7 @@ export function verifyAndBindPatch({
     status: 'verified-patch',
     claimId: claim.claimId,
     scopeHash: claim.scopeHash,
+    scope: boundScope,
     baseRevision,
     baseFileDigests: base.fileDigests,
     baseTreeSha256: base.treeSha256,
@@ -340,14 +434,14 @@ export function verifyAndBindPatch({
     fileDigests: reproduced.fileDigests,
     treeSha256: reproduced.treeSha256,
     patchSha256,
-    patchedFiles: filesTouched,
+    patchedFiles: derivedChanged,
     verification: Object.freeze({
       trusted: true,
       passed: true,
       claimId: claim.claimId,
       baseRevision,
-      casesDigest: verification.casesDigest,
-      totalCases: verification.totalCases,
+      casesDigest: boundScope.casesDigest,
+      totalCases: boundScope.totalCases,
       passedCases: verification.passedCases,
     }),
     baseUnchanged: true,
