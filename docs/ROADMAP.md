@@ -22,7 +22,7 @@ These documents are historical planning references, not evidence of the current 
 
 ## Next gates
 
-The Windows controller has stopped an inert child in the pinned Bubblewrap fixture. The recovery evidence so far covers a separate inert WSL fixture. The standalone patch verifier reproduced the checked bytes from a disposable Git base in its focused tests. The actual worker, protected result source, and integrated proposal path still require qualification and independent review.
+The Windows controller stopped an inert child in the pinned Bubblewrap fixture. In a separate test, a fresh controller replayed the durable claim after interruption, did not dispatch again, and verified both recorded processes had exited. Interruption before complete identity stayed unresolved and did not redispatch. The standalone patch verifier reproduced the checked bytes from a disposable Git base. Its independent review found the approved check set still needs to be bound to the claim. The actual worker and integrated proposal path still require qualification and review.
 
 1. Verify Windows-initiated Stop against a disposable worker and its descendants, including repeated and stale requests. Keep uncertain outcomes unresolved.
 2. Verify controller restart recovery and request replay without duplicate execution. Record worker identity, outcome, and evidence.
