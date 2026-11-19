@@ -36,6 +36,7 @@ test('unknown totals and missing runner counters never invent percentages, rates
   assert.match(rowByKey(waitingView,'completed').value,/unmeasured|unavailable/i);
   assert.match(rowByKey(waitingView,'remaining').value,/unknown/i);
   assert.match(rowByKey(waitingView,'rate').value,/unavailable/i);
+  assert.doesNotMatch(rowByKey(waitingView,'rate').value,/supplied/i);
   assert.equal(rowByKey(waitingView,'elapsed').value,'5.0 s');
   assert.match(rowByKey(waitingView,'currentStepEta').value,/unavailable/i);
   assert.match(rowByKey(waitingView,'overallEta').value,/unavailable/i);
@@ -61,7 +62,7 @@ test('unknown totals and missing runner counters never invent percentages, rates
   assert.equal(rowByKey(streamView,'completed').value,'Unavailable (2400 UTF-16 code units received; work counts unmeasured)');
   assert.equal(rowByKey(streamView,'output').value,'2400 UTF-16 code units (total unknown)');
   assert.equal(rowByKey(streamView,'rate').value,'240.0 UTF-16 code units/s');
-  assert.doesNotMatch(streamView.text,/\bcharacters(?:\/s)?\b/i);
+  assert.doesNotMatch(streamView.text,/\bcharacters(?:\/s)?\b|measured rate unavailable|supplied/i);
   assert.match(rowByKey(streamView,'remaining').value,/unknown/i);
   assert.match(rowByKey(streamView,'overallEta').value,/unknown/i);
   assert.match(rowByKey(streamView,'completion').value,/unavailable/i);
@@ -1148,5 +1149,29 @@ test('validated unit contract formats allowlisted units accurately and falls bac
   assert.equal(unmeasuredUnitView.counts.unit,null);
   assert.equal(unmeasuredUnitView.counts.unitSingular,null);
   assert.equal(rowByKey(unmeasuredUnitView,'currentStep').value,'Step 1: Queued check (sub-progress not measured)');
+
+  // Streaming UTF-16 code units with measured work counters whose rate lacks timed samples uses unit-aware wording
+  const charsWithMeasuredFilesView=presentProgress({
+    phase:'active',
+    status:'Running',
+    totalKnown:true,
+    unit:'files',
+    unitSingular:'file',
+    completedSteps:2,
+    totalSteps:5,
+    remainingSteps:3,
+    stepSamplesValid:true,
+    stepRate:null,
+    chars:2400,
+    rate:240,
+    unavailableReasons:{
+      rate:'Insufficient measured step samples to calculate rate.',
+    },
+  });
+  assert.equal(
+    rowByKey(charsWithMeasuredFilesView,'rate').value,
+    '240.0 UTF-16 code units/s (file rate unavailable: Insufficient measured file samples to calculate rate.)',
+  );
+  assert.doesNotMatch(rowByKey(charsWithMeasuredFilesView,'rate').value,/\bstep\b/i);
 });
 
