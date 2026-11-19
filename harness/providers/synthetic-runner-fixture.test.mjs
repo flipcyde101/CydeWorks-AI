@@ -41,8 +41,10 @@ test('pinned synthetic multi-file fixtures and route metadata are frozen and exp
   assert.match(SYNTHETIC_PATCH_SHA256, /^[a-f0-9]{64}$/);
   assert.ok(SYNTHETIC_MULTI_FILE_PATCH.includes('diff --git a/limits.py b/limits.py'));
   assert.ok(SYNTHETIC_MULTI_FILE_PATCH.includes('diff --git a/measurement.py b/measurement.py'));
-  assert.ok(SYNTHETIC_LIMITS.length >= 5);
+  assert.ok(SYNTHETIC_LIMITS.length >= 6);
   assert.equal(SYNTHETIC_LIMITS.some(entry => /across process restarts/i.test(entry)), true);
+  assert.equal(SYNTHETIC_LIMITS.some(entry => /bounded serialized JSON/i.test(entry)), true);
+  assert.equal(SYNTHETIC_BOUNDS.maxInputBytes, 8192);
 
   const runner = createSyntheticRunnerFixture();
   const route = runner.route();
@@ -679,3 +681,281 @@ test('malformed and mismatched inputs fail closed without leaking diagnostics, s
     assert.equal(caught.message.includes(canaryPath), false);
   }
 });
+
+test('maxEventBytes admission guarantees all terminal variants fit and tests exact boundary', () => {
+  const probeSucceeded = createSyntheticRunnerFixture({initialTimeMs: 1000, stepMs: 25});
+  const sRun = probeSucceeded.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 2000}));
+  probeSucceeded.tick(4);
+  const succeededEvents = probeSucceeded.events({workerId: sRun.workerId, afterSequence: 0}).events;
+
+  const probeCancelled = createSyntheticRunnerFixture({initialTimeMs: 1000, stepMs: 25});
+  const cRun = probeCancelled.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 2000}));
+  probeCancelled.tick(2);
+  probeCancelled.stop({workerId: cRun.workerId, attemptId: 'attempt-bnd', confirm: true});
+  const cancelledEvents = probeCancelled.events({workerId: cRun.workerId, afterSequence: 0}).events;
+
+  const probeFailed = createSyntheticRunnerFixture({initialTimeMs: 1000, stepMs: 25});
+  const fRun = probeFailed.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 1060}));
+  probeFailed.tick(3);
+  const failedEvents = probeFailed.events({workerId: fRun.workerId, afterSequence: 0}).events;
+
+  const startedBytes = Buffer.byteLength(JSON.stringify(succeededEvents[0]), 'utf8');
+  const maxTerminalBytes = Math.max(
+    ...[...succeededEvents, ...cancelledEvents, ...failedEvents].map(ev =>
+      Buffer.byteLength(JSON.stringify(ev), 'utf8'),
+    ),
+  );
+  assert.ok(maxTerminalBytes > startedBytes);
+
+  // A bound that only fits the started event must reject at start rather than stranding later operations
+  const startedOnly = createSyntheticRunnerFixture({
+    initialTimeMs: 1000,
+    stepMs: 25,
+    maxEventBytes: startedBytes,
+  });
+  assert.throws(
+    () => startedOnly.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 2000})),
+    error => error instanceof SyntheticRunnerError && error.code === 'EVENT_LIMIT_EXCEEDED',
+  );
+  assert.equal(startedOnly.stats().retainedRuns, 0);
+  assert.equal(startedOnly.stats().totalStarted, 0);
+
+  // One byte below the largest terminal variant must reject at start
+  const justBelow = createSyntheticRunnerFixture({
+    initialTimeMs: 1000,
+    stepMs: 25,
+    maxEventBytes: maxTerminalBytes - 1,
+  });
+  assert.throws(
+    () => justBelow.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 2000})),
+    error => error instanceof SyntheticRunnerError && error.code === 'EVENT_LIMIT_EXCEEDED',
+  );
+  assert.equal(justBelow.stats().retainedRuns, 0);
+
+  // At the exact boundary, all three terminal outcomes (succeeded, cancelled, failed) complete cleanly
+  const exactSucceeded = createSyntheticRunnerFixture({
+    initialTimeMs: 1000,
+    stepMs: 25,
+    maxEventBytes: maxTerminalBytes,
+  });
+  const runS = exactSucceeded.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 2000}));
+  exactSucceeded.tick(4);
+  assert.equal(exactSucceeded.inspect({workerId: runS.workerId}).status, 'succeeded');
+  assert.equal(exactSucceeded.collect({workerId: runS.workerId}).status, 'succeeded');
+
+  const exactCancelled = createSyntheticRunnerFixture({
+    initialTimeMs: 1000,
+    stepMs: 25,
+    maxEventBytes: maxTerminalBytes,
+  });
+  const runC = exactCancelled.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 2000}));
+  exactCancelled.tick(2);
+  assert.equal(exactCancelled.stop({workerId: runC.workerId, confirm: true}).status, 'cancelled');
+  assert.equal(exactCancelled.inspect({workerId: runC.workerId}).status, 'cancelled');
+  assert.equal(exactCancelled.collect({workerId: runC.workerId}).status, 'cancelled');
+
+  const exactFailed = createSyntheticRunnerFixture({
+    initialTimeMs: 1000,
+    stepMs: 25,
+    maxEventBytes: maxTerminalBytes,
+  });
+  const runF = exactFailed.start(makeStartArgs({attemptId: 'attempt-bnd', deadlineAt: 1060}));
+  exactFailed.tick(3);
+  assert.equal(exactFailed.inspect({workerId: runF.workerId}).status, 'failed');
+  assert.equal(exactFailed.collect({workerId: runF.workerId}).status, 'failed');
+});
+
+test('stale generation stop does not synchronize events or state when clock advances with no prior poll', () => {
+  let nowMs = 1000;
+  let clockReads = 0;
+  const runner = createSyntheticRunnerFixture({
+    clock: () => {
+      clockReads++;
+      return nowMs;
+    },
+    stepMs: 25,
+  });
+
+  const started = runner.start(makeStartArgs({deadlineAt: 2000}));
+  assert.equal(clockReads, 1);
+
+  // Advance clock past completion with no prior poll
+  nowMs = 1200;
+
+  // Stale wrt stored generation (0 !== 1) fails before reading clock or running syncRun
+  assert.throws(
+    () => runner.stop({workerId: started.workerId, attemptId: 'attempt-1', generation: 0, confirm: true}),
+    error => error instanceof SyntheticRunnerError && error.code === 'STALE_CONTROL',
+  );
+  assert.equal(clockReads, 1);
+
+  // Stored generation 1 becomes stale after sync transitions run to succeeded (generation 2),
+  // so recheck before cancellation rejects STALE_CONTROL without cancelling
+  assert.throws(
+    () => runner.stop({workerId: started.workerId, attemptId: 'attempt-1', generation: 1, confirm: true}),
+    error => error instanceof SyntheticRunnerError && error.code === 'STALE_CONTROL',
+  );
+  assert.equal(runner.inspect({workerId: started.workerId}).status, 'succeeded');
+  assert.equal(runner.stats().totalStopped, 0);
+});
+
+test('tick samples and validates clock before committing offset so failed tick does not alter future progress', () => {
+  let nowMs = 1000;
+  let clockCalls = 0;
+  const runner = createSyntheticRunnerFixture({
+    clock: () => {
+      clockCalls++;
+      if (clockCalls === 2) {
+        throw new Error('transient clock read failure');
+      }
+      return nowMs;
+    },
+    stepMs: 25,
+  });
+
+  const started = runner.start(makeStartArgs({deadlineAt: 2000}));
+  assert.throws(
+    () => runner.tick(3),
+    error => error instanceof SyntheticRunnerError && error.code === 'INVALID_CLOCK',
+  );
+
+  // Offset was not committed on the failed tick
+  const afterFailure = runner.inspect({workerId: started.workerId});
+  assert.equal(afterFailure.elapsedMs, 0);
+  assert.equal(afterFailure.progress.completedSteps, 0);
+  assert.equal(afterFailure.status, 'running');
+
+  // Next tick advances cleanly by 1 step from 1000 to 1025, not 1075 or 1100
+  const nextTick = runner.tick(1);
+  assert.equal(nextTick.virtualNowMs, 1025);
+  assert.equal(runner.inspect({workerId: started.workerId}).progress.completedSteps, 1);
+});
+
+test('revoked proxies fail closed with fixed privacy-safe errors across all entrypoints', () => {
+  const revokedObj = Proxy.revocable({}, {});
+  revokedObj.revoke();
+  const revokedArr = Proxy.revocable([], {});
+  revokedArr.revoke();
+  const revokedFn = Proxy.revocable(() => 0, {});
+  revokedFn.revoke();
+
+  for (const badOpts of [revokedObj.proxy, revokedArr.proxy, revokedFn.proxy]) {
+    assert.throws(
+      () => createSyntheticRunnerFixture(badOpts),
+      error => error instanceof SyntheticRunnerError && error.code === 'INVALID_OPTIONS',
+    );
+  }
+
+  const brokenClockRunner = createSyntheticRunnerFixture({clock: revokedFn.proxy});
+  assert.throws(
+    () => brokenClockRunner.start(makeStartArgs()),
+    error => error instanceof SyntheticRunnerError && error.code === 'INVALID_CLOCK',
+  );
+
+  const runner = createSyntheticRunnerFixture({initialTimeMs: 1000, stepMs: 25});
+  const started = runner.start(makeStartArgs({deadlineAt: 2000}));
+
+  for (const badInput of [revokedObj.proxy, revokedArr.proxy, revokedFn.proxy]) {
+    for (const fn of [
+      () => runner.start(badInput),
+      () => runner.events(badInput),
+      () => runner.inspect(badInput),
+      () => runner.stop(badInput),
+      () => runner.collect(badInput),
+    ]) {
+      assert.throws(
+        fn,
+        error => error instanceof SyntheticRunnerError && error.code === 'INVALID_INPUT',
+      );
+    }
+  }
+
+  assert.throws(
+    () => runner.start(makeStartArgs({claimId: 'c-rp1', attemptId: 'a-rp1', grantId: 'g-rp1', snapshotRef: revokedArr.proxy})),
+    error => error instanceof SyntheticRunnerError && error.code === 'SNAPSHOT_MISMATCH',
+  );
+  assert.throws(
+    () => runner.start(makeStartArgs({claimId: 'c-rp2', attemptId: 'a-rp2', grantId: 'g-rp2', snapshotRef: {files: revokedArr.proxy}})),
+    error => error instanceof SyntheticRunnerError && error.code === 'SNAPSHOT_MISMATCH',
+  );
+  assert.throws(
+    () => runner.start(makeStartArgs({claimId: 'c-rp3', attemptId: 'a-rp3', grantId: 'g-rp3', route: revokedArr.proxy})),
+    error => error instanceof SyntheticRunnerError && error.code === 'ROUTE_MISMATCH',
+  );
+  assert.throws(
+    () => runner.start(makeStartArgs({claimId: 'c-rp4', attemptId: 'a-rp4', grantId: 'g-rp4', route: {engine: 'fixture', readiness: revokedArr.proxy}})),
+    error => error instanceof SyntheticRunnerError && error.code === 'ROUTE_MISMATCH',
+  );
+  assert.throws(
+    () => runner.stop({workerId: started.workerId, confirm: revokedObj.proxy}),
+    error => error instanceof SyntheticRunnerError && error.code === 'STOP_NOT_CONFIRMED',
+  );
+  assert.throws(
+    () => runner.stop({workerId: started.workerId, confirm: true, generation: revokedObj.proxy}),
+    error => error instanceof SyntheticRunnerError && error.code === 'STALE_CONTROL',
+  );
+});
+
+test('oversized strings and serialized JSON payloads respect pre-enumeration bounds', () => {
+  const runner = createSyntheticRunnerFixture({initialTimeMs: 1000, stepMs: 25});
+
+  // Oversized snapshotRef, files, route, and scopeHash are bounded by length before scanning
+  assert.throws(
+    () => runner.start(makeStartArgs({snapshotRef: 'x'.repeat(100_000)})),
+    error => error instanceof SyntheticRunnerError && error.code === 'SNAPSHOT_MISMATCH',
+  );
+  assert.throws(
+    () => runner.start(makeStartArgs({snapshotRef: {files: {'limits.py': 'y'.repeat(100_000), 'measurement.py': SYNTHETIC_BASELINE_FILES['measurement.py']}}})),
+    error => error instanceof SyntheticRunnerError && error.code === 'SNAPSHOT_MISMATCH',
+  );
+  assert.throws(
+    () => runner.start(makeStartArgs({route: 'z'.repeat(100_000)})),
+    error => error instanceof SyntheticRunnerError && error.code === 'ROUTE_MISMATCH',
+  );
+  assert.throws(
+    () => runner.start(makeStartArgs({scopeHash: 'a'.repeat(100_000)})),
+    error => error instanceof SyntheticRunnerError && error.code === 'INVALID_INPUT',
+  );
+
+  // Oversized serialized JSON payloads fail before JSON.parse or property enumeration
+  const hugeJson = '{"claimId":"c1","attemptId":"a1","grantId":"g1","snapshotRef":"synthetic-limits-measurement-v1","route":"fixture","deadlineAt":2000,' +
+    '"pad":"' + 'p'.repeat(SYNTHETIC_BOUNDS.maxInputBytes) + '"}';
+  const multiByteOverUtf8 = '{"claimId":"' + '\u2603'.repeat(3000) + '"}';
+  assert.ok(multiByteOverUtf8.length <= SYNTHETIC_BOUNDS.maxInputBytes);
+  assert.ok(Buffer.byteLength(multiByteOverUtf8, 'utf8') > SYNTHETIC_BOUNDS.maxInputBytes);
+
+  for (const badSerialized of ['', '{not-json', '[]', 'null', '{"__proto__":{}}', hugeJson, multiByteOverUtf8]) {
+    assert.throws(
+      () => runner.start(badSerialized),
+      error => error instanceof SyntheticRunnerError && error.code === 'INVALID_INPUT',
+    );
+  }
+  assert.equal(runner.stats().totalStarted, 0);
+
+  // Bounded serialized JSON inputs work end-to-end across start, inspect, events, stop, and collect
+  const jsonStart = JSON.stringify(makeStartArgs({
+    claimId: 'claim-json',
+    attemptId: 'attempt-json',
+    grantId: 'grant-json',
+    deadlineAt: 2000,
+  }));
+  const started = runner.start(jsonStart);
+  assert.equal(started.attemptId, 'attempt-json');
+  assert.equal(
+    runner.inspect(JSON.stringify({workerId: started.workerId, attemptId: 'attempt-json'})).status,
+    'running',
+  );
+  assert.equal(
+    runner.events(JSON.stringify({workerId: started.workerId, afterSequence: 0})).events.length,
+    1,
+  );
+  assert.equal(
+    runner.stop(JSON.stringify({workerId: started.workerId, attemptId: 'attempt-json', generation: 1, confirm: true})).status,
+    'cancelled',
+  );
+  assert.equal(
+    runner.collect(JSON.stringify({workerId: started.workerId, attemptId: 'attempt-json'})).status,
+    'cancelled',
+  );
+});
+
