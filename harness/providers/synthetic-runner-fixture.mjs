@@ -1,0 +1,1144 @@
+// Disconnected, inert synthetic runner fixture for CydeWorks staging prep.
+//
+// Pure in-memory simulation: spawns zero processes, reads/writes zero files,
+// makes zero network calls, invokes zero models, reads zero credentials or
+// environment variables, and never executes candidate code.
+//
+// Input boundary: createSyntheticRunnerFixture(optionsJson, clock) and all
+// caller-controlled request operations (start, events, inspect, stop, collect)
+// accept bounded UTF-8 JSON strings (<= SYNTHETIC_BOUNDS.maxInputBytes) only.
+// Raw objects, arrays, functions, proxies, and other non-string values are
+// rejected in O(1) before property enumeration or trap invocation. Future
+// adapters must construct bounded JSON explicitly from individually validated
+// scalar fields and must never serialize arbitrary caller-supplied objects.
+//
+// Host clock boundary: the optional clock parameter is a trusted process-local
+// test/configuration function and must never be sourced from HTTP, IPC, or a
+// caller-supplied trust flag. Same-process hostile code is outside this
+// fixture's security boundary.
+//
+// All outcomes, checks, usage fields, and receipt-like payloads are explicitly
+// labeled synthetic with no model run and no real charge.
+
+import {createHash} from 'node:crypto';
+import {types} from 'node:util';
+
+export const SYNTHETIC_FIXTURE_ID = 'synthetic-runner-fixture-v1';
+export const SYNTHETIC_SNAPSHOT_REF = 'synthetic-limits-measurement-v1';
+
+const FILE_NAMES = Object.freeze(['limits.py', 'measurement.py']);
+
+function deepFreeze(value) {
+  if (value === null || typeof value !== 'object') return value;
+  Object.freeze(value);
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    deepFreeze(child);
+  }
+  return value;
+}
+
+const sha256 = text => createHash('sha256').update(text, 'utf8').digest('hex');
+
+export const SYNTHETIC_BASELINE_FILES = deepFreeze({
+  'limits.py': 'def clamp(value):\n    return value\n',
+  'measurement.py': 'from limits import clamp\n\n\ndef normalize(raw):\n    return clamp(int(raw))\n',
+});
+
+export const SYNTHETIC_REPLACEMENT_FILES = deepFreeze({
+  'limits.py': [
+    'def clamp(value):',
+    '    if value < 0:',
+    '        return 0',
+    '    if value > 100:',
+    '        return 100',
+    '    return value',
+    '',
+  ].join('\n'),
+  'measurement.py': [
+    'from limits import clamp',
+    '',
+    '',
+    'def normalize(raw):',
+    '    try:',
+    '        value = int(raw)',
+    '    except (TypeError, ValueError):',
+    '        return 0',
+    '    return clamp(value)',
+    '',
+  ].join('\n'),
+});
+
+export const SYNTHETIC_BASELINE_DIGESTS = deepFreeze({
+  'limits.py': sha256(SYNTHETIC_BASELINE_FILES['limits.py']),
+  'measurement.py': sha256(SYNTHETIC_BASELINE_FILES['measurement.py']),
+});
+
+export const SYNTHETIC_BASELINE_HASH = sha256(
+  JSON.stringify([SYNTHETIC_SNAPSHOT_REF, SYNTHETIC_BASELINE_DIGESTS]),
+);
+
+export const SYNTHETIC_REPLACEMENT_DIGESTS = deepFreeze({
+  'limits.py': sha256(SYNTHETIC_REPLACEMENT_FILES['limits.py']),
+  'measurement.py': sha256(SYNTHETIC_REPLACEMENT_FILES['measurement.py']),
+});
+
+function patchLines(text, prefix) {
+  if (!text) return [];
+  const lines = text.split('\n');
+  const hasFinalNewline = text.endsWith('\n');
+  if (hasFinalNewline) lines.pop();
+  const linesOut = lines.map(line => prefix + line);
+  if (!hasFinalNewline) linesOut.push('\\ No newline at end of file');
+  return linesOut;
+}
+
+function unifiedFilePatch(filename, before, after) {
+  if (before === after) return '';
+  const lineCount = text => text ? text.split('\n').length - (text.endsWith('\n') ? 1 : 0) : 0;
+  const range = text => lineCount(text) ? '1,' + lineCount(text) : '0,0';
+  return [
+    'diff --git a/' + filename + ' b/' + filename,
+    '--- a/' + filename,
+    '+++ b/' + filename,
+    '@@ -' + range(before) + ' +' + range(after) + ' @@',
+    ...patchLines(before, '-'),
+    ...patchLines(after, '+'),
+  ].join('\n') + '\n';
+}
+
+export const SYNTHETIC_MULTI_FILE_PATCH = FILE_NAMES
+  .map(name => unifiedFilePatch(name, SYNTHETIC_BASELINE_FILES[name], SYNTHETIC_REPLACEMENT_FILES[name]))
+  .join('');
+
+export const SYNTHETIC_PATCH_SHA256 = sha256(SYNTHETIC_MULTI_FILE_PATCH);
+
+export const SYNTHETIC_ROUTE = deepFreeze({
+  id: 'fixture',
+  engine: 'fixture',
+  backend: 'fixture',
+  model: 'fixture',
+  label: 'Synthetic runner fixture',
+  endpoint: null,
+  digest: null,
+  synthetic: true,
+  modelRan: false,
+  readiness: {
+    eligible: true,
+    reason: 'Synthetic fixture only. No model runs and no code is executed.',
+  },
+});
+
+export const SYNTHETIC_LIMITS = Object.freeze([
+  'Synthetic fixture output only. No model ran and no tokens were generated.',
+  'No candidate code was executed, no process was spawned, and no files or network endpoints were accessed.',
+  'Synthetic check summaries are pinned in-memory placeholders and do not constitute protected verification.',
+  'No real provider charge occurred; charge evidence remains unavailable.',
+  'In-memory fixture state is volatile and does not provide durable replay or claim protection across process restarts.',
+  'Options and all request operations accept bounded UTF-8 JSON strings (<= 8192 bytes) only; future adapters must construct JSON from validated scalar fields.',
+  'Injected clock hooks are trusted process-local test functions (never from HTTP, IPC, or caller trust flags); same-process hostile code is outside this fixture boundary.',
+  'Windows Stop, controller recovery, protected verifier, patch-binding, and Sol High safety gates remain separate and mandatory.',
+]);
+
+export const SYNTHETIC_BOUNDS = Object.freeze({
+  defaultStepMs: 25,
+  minStepMs: 1,
+  maxStepMs: 60000,
+  defaultMaxActiveRuns: 8,
+  maxActiveRunsLimit: 64,
+  defaultMaxRetainedRuns: 32,
+  maxRetainedRunsLimit: 256,
+  defaultMaxEventsPerRun: 16,
+  maxEventsPerRunLimit: 128,
+  defaultMaxEventBytes: 2048,
+  minEventBytes: 64,
+  maxEventBytesLimit: 16384,
+  defaultMaxEventsPerRead: 32,
+  maxEventsPerReadLimit: 128,
+  maxInputBytes: 8192,
+  maxTickSteps: 1000,
+  maxDeadlineWindowMs: 3600000,
+  maxClockMs: 8640000000000000,
+});
+
+const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const HEX64_PATTERN = /^[a-f0-9]{64}$/;
+const CONTROL_PATTERN = /[\u0000-\u001f\u007f]/;
+const MAX_SNAPSHOT_REF_STRING_LEN = 64;
+const MAX_ROUTE_STRING_LEN = 32;
+const MAX_READINESS_REASON_LEN = 256;
+
+const MESSAGES = Object.freeze({
+  INVALID_OPTIONS: 'Synthetic runner options are invalid.',
+  INVALID_INPUT: 'Synthetic runner input is invalid.',
+  INVALID_CLOCK: 'Synthetic runner clock produced an invalid or backwards timestamp.',
+  SNAPSHOT_MISMATCH: 'Synthetic runner accepts only the pinned synthetic multi-file fixture.',
+  ROUTE_MISMATCH: 'Synthetic runner accepts only the synthetic fixture route.',
+  DUPLICATE_START: 'An active or retained synthetic run already used this attempt, claim, grant, or request identifier.',
+  STALE_START: 'Synthetic start deadline is already expired or out of bounds.',
+  CAPACITY_EXCEEDED: 'Synthetic runner has reached its active or retained run bound.',
+  WORKER_NOT_FOUND: 'No synthetic worker was found for the supplied identifier.',
+  ATTEMPT_MISMATCH: 'Synthetic worker does not match the supplied attempt identifier.',
+  STALE_CONTROL: 'Synthetic control generation is stale for this worker.',
+  STOP_NOT_CONFIRMED: 'Synthetic stop requires explicit confirmation (confirm: true).',
+  RUN_NOT_TERMINAL: 'Synthetic run has not reached a terminal state.',
+  EVENT_LIMIT_EXCEEDED: 'Synthetic event exceeded the configured byte bound.',
+});
+
+export class SyntheticRunnerError extends Error {
+  constructor(code) {
+    const known = Object.hasOwn(MESSAGES, code) ? code : 'INVALID_INPUT';
+    super(MESSAGES[known]);
+    this.name = 'SyntheticRunnerError';
+    this.code = known;
+  }
+
+  toJSON() {
+    return {name: this.name, code: this.code, message: this.message};
+  }
+}
+
+const fail = code => {
+  throw new SyntheticRunnerError(code);
+};
+
+function readPlainRecord(value, allowedKeys, code = 'INVALID_INPUT') {
+  // Check proxy status before Array.isArray because Array.isArray throws on a revoked proxy.
+  if (value === null || typeof value !== 'object' || types.isProxy(value) || Array.isArray(value)) {
+    fail(code);
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    fail(code);
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > allowedKeys.length) {
+    fail(code);
+  }
+  const out = Object.create(null);
+  for (const key of keys) {
+    if (typeof key !== 'string' || !allowedKeys.includes(key)) {
+      fail(code);
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      fail(code);
+    }
+    out[key] = descriptor.value;
+  }
+  return out;
+}
+
+function parseBoundedJsonRecord(input, allowedKeys, code = 'INVALID_INPUT') {
+  if (typeof input !== 'string') {
+    fail(code);
+  }
+  if (input.length === 0 || input.length > SYNTHETIC_BOUNDS.maxInputBytes) {
+    fail(code);
+  }
+  if (Buffer.byteLength(input, 'utf8') > SYNTHETIC_BOUNDS.maxInputBytes) {
+    fail(code);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
+    fail(code);
+  }
+  return readPlainRecord(parsed, allowedKeys, code);
+}
+
+function readSafeId(value, code = 'INVALID_INPUT') {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > 128 ||
+    CONTROL_PATTERN.test(value) ||
+    value.includes('..') ||
+    !ID_PATTERN.test(value)
+  ) {
+    fail(code);
+  }
+  return value;
+}
+
+function readBoundedInt(value, min, max, code = 'INVALID_OPTIONS') {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    fail(code);
+  }
+  return value;
+}
+
+function parseTimestampMs(value, code = 'INVALID_INPUT') {
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0 || value > SYNTHETIC_BOUNDS.maxClockMs) {
+      fail(code);
+    }
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (value.length !== 24 || CONTROL_PATTERN.test(value)) {
+      fail(code);
+    }
+    const ms = Date.parse(value);
+    if (
+      !Number.isSafeInteger(ms) ||
+      ms < 0 ||
+      ms > SYNTHETIC_BOUNDS.maxClockMs ||
+      new Date(ms).toISOString() !== value
+    ) {
+      fail(code);
+    }
+    return ms;
+  }
+  fail(code);
+}
+
+function validateSnapshotRef(snapshotRef) {
+  if (typeof snapshotRef === 'string') {
+    if (
+      snapshotRef.length === 0 ||
+      snapshotRef.length > MAX_SNAPSHOT_REF_STRING_LEN ||
+      (snapshotRef !== SYNTHETIC_SNAPSHOT_REF && snapshotRef !== SYNTHETIC_BASELINE_HASH)
+    ) {
+      fail('SNAPSHOT_MISMATCH');
+    }
+    return SYNTHETIC_SNAPSHOT_REF;
+  }
+  const obj = readPlainRecord(snapshotRef, ['ref', 'baselineHash', 'sourceHash', 'files'], 'SNAPSHOT_MISMATCH');
+  let sawField = false;
+  if (obj.ref !== undefined) {
+    sawField = true;
+    if (
+      typeof obj.ref !== 'string' ||
+      obj.ref.length !== SYNTHETIC_SNAPSHOT_REF.length ||
+      obj.ref !== SYNTHETIC_SNAPSHOT_REF
+    ) {
+      fail('SNAPSHOT_MISMATCH');
+    }
+  }
+  if (obj.baselineHash !== undefined) {
+    sawField = true;
+    if (
+      typeof obj.baselineHash !== 'string' ||
+      obj.baselineHash.length !== 64 ||
+      obj.baselineHash !== SYNTHETIC_BASELINE_HASH
+    ) {
+      fail('SNAPSHOT_MISMATCH');
+    }
+  }
+  if (obj.sourceHash !== undefined) {
+    sawField = true;
+    if (
+      typeof obj.sourceHash !== 'string' ||
+      obj.sourceHash.length !== 64 ||
+      obj.sourceHash !== SYNTHETIC_BASELINE_HASH
+    ) {
+      fail('SNAPSHOT_MISMATCH');
+    }
+  }
+  if (obj.files !== undefined) {
+    sawField = true;
+    const files = readPlainRecord(obj.files, FILE_NAMES, 'SNAPSHOT_MISMATCH');
+    for (const name of FILE_NAMES) {
+      const expected = SYNTHETIC_BASELINE_FILES[name];
+      if (typeof files[name] !== 'string' || files[name].length !== expected.length || files[name] !== expected) {
+        fail('SNAPSHOT_MISMATCH');
+      }
+    }
+  }
+  if (!sawField) fail('SNAPSHOT_MISMATCH');
+  return SYNTHETIC_SNAPSHOT_REF;
+}
+
+function validateRoute(route) {
+  if (typeof route === 'string') {
+    if (
+      route.length === 0 ||
+      route.length > MAX_ROUTE_STRING_LEN ||
+      (route !== 'fixture' && route !== 'synthetic-fixture')
+    ) {
+      fail('ROUTE_MISMATCH');
+    }
+    return {engine: 'fixture', backend: 'fixture', model: 'fixture', synthetic: true};
+  }
+  const obj = readPlainRecord(
+    route,
+    ['id', 'engine', 'backend', 'model', 'revision', 'synthetic', 'label', 'endpoint', 'digest', 'modelRan', 'readiness'],
+    'ROUTE_MISMATCH',
+  );
+  if (obj.engine !== 'fixture') fail('ROUTE_MISMATCH');
+  if (obj.backend !== undefined && obj.backend !== 'fixture') fail('ROUTE_MISMATCH');
+  if (obj.model !== undefined && obj.model !== 'fixture') fail('ROUTE_MISMATCH');
+  if (obj.id !== undefined && obj.id !== 'fixture') fail('ROUTE_MISMATCH');
+  if (obj.synthetic !== undefined && obj.synthetic !== true) fail('ROUTE_MISMATCH');
+  if (obj.modelRan !== undefined && obj.modelRan !== false) fail('ROUTE_MISMATCH');
+  if (obj.endpoint !== undefined && obj.endpoint !== null) fail('ROUTE_MISMATCH');
+  if (obj.digest !== undefined && obj.digest !== null) fail('ROUTE_MISMATCH');
+  if (
+    obj.label !== undefined &&
+    (typeof obj.label !== 'string' || obj.label.length !== SYNTHETIC_ROUTE.label.length || obj.label !== SYNTHETIC_ROUTE.label)
+  ) {
+    fail('ROUTE_MISMATCH');
+  }
+  if (obj.readiness !== undefined) {
+    const readiness = readPlainRecord(obj.readiness, ['eligible', 'reason'], 'ROUTE_MISMATCH');
+    if (
+      readiness.eligible !== true ||
+      typeof readiness.reason !== 'string' ||
+      readiness.reason.length === 0 ||
+      readiness.reason.length > MAX_READINESS_REASON_LEN
+    ) {
+      fail('ROUTE_MISMATCH');
+    }
+  }
+  if (
+    obj.revision !== undefined &&
+    (typeof obj.revision !== 'string' || obj.revision.length !== 64 || !HEX64_PATTERN.test(obj.revision))
+  ) {
+    fail('ROUTE_MISMATCH');
+  }
+  return {engine: 'fixture', backend: 'fixture', model: 'fixture', synthetic: true};
+}
+
+function cloneFrozen(value) {
+  return deepFreeze(structuredClone(value));
+}
+
+const STEP_SPECS = Object.freeze([
+  Object.freeze({
+    step: 1,
+    phase: 'staging-fixture',
+    type: 'progress',
+    message: 'Synthetic fixture snapshot staged in memory (no files touched).',
+  }),
+  Object.freeze({
+    step: 2,
+    phase: 'generating-candidate',
+    type: 'progress',
+    message: 'Synthetic candidate prepared from pinned fixture (no model ran).',
+  }),
+  Object.freeze({
+    step: 3,
+    phase: 'running-checks',
+    type: 'progress',
+    message: 'Synthetic check suite evaluated against pinned expectations (no code executed).',
+  }),
+  Object.freeze({
+    step: 4,
+    phase: 'completed',
+    type: 'terminal',
+    status: 'succeeded',
+    reason: 'synthetic-completed',
+    message: 'Synthetic run completed (synthetic only; no model ran, no code executed).',
+  }),
+]);
+
+const TOTAL_STEPS = STEP_SPECS.length;
+
+function emptySyntheticUsage() {
+  return {
+    evidence: 'synthetic',
+    semantics: 'unavailable',
+    input: null,
+    output: null,
+    cached: null,
+    cacheWrite: null,
+    reasoning: null,
+    generationMs: null,
+    loadMs: null,
+    promptMs: null,
+    providerCharge: null,
+    chargeEvidence: 'unavailable',
+    modelRan: false,
+  };
+}
+
+function buildReceiptPayload(run, endedAtMs) {
+  const elapsedMs = endedAtMs - run.startedAtMs;
+  const usage = emptySyntheticUsage();
+  return {
+    synthetic: true,
+    modelRan: false,
+    codeExecuted: false,
+    provider: 'fixture',
+    backend: 'fixture',
+    model: 'fixture',
+    status: run.status,
+    outcomeKnown: true,
+    startedAtMs: run.startedAtMs,
+    endedAtMs,
+    elapsedMs,
+    usage: {
+      evidence: usage.evidence,
+      semantics: usage.semantics,
+      input: usage.input,
+      output: usage.output,
+      cached: usage.cached,
+      cacheWrite: usage.cacheWrite,
+      reasoning: usage.reasoning,
+      generationMs: usage.generationMs,
+      loadMs: usage.loadMs,
+      promptMs: usage.promptMs,
+      providerCharge: usage.providerCharge,
+    },
+    cost: null,
+    chargeEvidence: 'unavailable',
+    limits: [...SYNTHETIC_LIMITS],
+  };
+}
+
+function buildEvent({workerId, attemptId, sequence, type, phase, status, reason, timestampMs, message, completedSteps}) {
+  return {
+    workerId,
+    attemptId,
+    sequence,
+    type,
+    phase,
+    ...(status !== undefined ? {status} : {}),
+    ...(reason !== undefined ? {reason} : {}),
+    timestamp: new Date(timestampMs).toISOString(),
+    timestampMs,
+    message,
+    progress: {
+      completedSteps,
+      totalSteps: TOTAL_STEPS,
+      percent: Math.round((completedSteps / TOTAL_STEPS) * 100),
+    },
+    synthetic: true,
+    modelRan: false,
+    codeExecuted: false,
+  };
+}
+
+export function createSyntheticRunnerFixture(optionsJson = '{}', clock = undefined) {
+  const opts = parseBoundedJsonRecord(
+    optionsJson,
+    ['initialTimeMs', 'stepMs', 'maxActiveRuns', 'maxRetainedRuns', 'maxEventsPerRun', 'maxEventBytes', 'maxEventsPerRead'],
+    'INVALID_OPTIONS',
+  );
+
+  if (clock !== undefined && typeof clock !== 'function') {
+    fail('INVALID_OPTIONS');
+  }
+  const initialTimeMs = opts.initialTimeMs === undefined
+    ? 0
+    : parseTimestampMs(opts.initialTimeMs, 'INVALID_OPTIONS');
+  const stepMs = opts.stepMs === undefined
+    ? SYNTHETIC_BOUNDS.defaultStepMs
+    : readBoundedInt(opts.stepMs, SYNTHETIC_BOUNDS.minStepMs, SYNTHETIC_BOUNDS.maxStepMs);
+  const maxActiveRuns = opts.maxActiveRuns === undefined
+    ? SYNTHETIC_BOUNDS.defaultMaxActiveRuns
+    : readBoundedInt(opts.maxActiveRuns, 1, SYNTHETIC_BOUNDS.maxActiveRunsLimit);
+  const maxRetainedRuns = opts.maxRetainedRuns === undefined
+    ? SYNTHETIC_BOUNDS.defaultMaxRetainedRuns
+    : readBoundedInt(opts.maxRetainedRuns, 1, SYNTHETIC_BOUNDS.maxRetainedRunsLimit);
+  const maxEventsPerRun = opts.maxEventsPerRun === undefined
+    ? SYNTHETIC_BOUNDS.defaultMaxEventsPerRun
+    : readBoundedInt(opts.maxEventsPerRun, 1, SYNTHETIC_BOUNDS.maxEventsPerRunLimit);
+  const maxEventBytes = opts.maxEventBytes === undefined
+    ? SYNTHETIC_BOUNDS.defaultMaxEventBytes
+    : readBoundedInt(opts.maxEventBytes, SYNTHETIC_BOUNDS.minEventBytes, SYNTHETIC_BOUNDS.maxEventBytesLimit);
+  const maxEventsPerRead = opts.maxEventsPerRead === undefined
+    ? SYNTHETIC_BOUNDS.defaultMaxEventsPerRead
+    : readBoundedInt(opts.maxEventsPerRead, 1, SYNTHETIC_BOUNDS.maxEventsPerReadLimit);
+
+  const rawClock = clock ?? (() => initialTimeMs);
+  let tickOffsetMs = 0;
+  let lastObservedClockMs;
+
+  function sampleClock(additionalTickOffsetMs = 0) {
+    let raw;
+    try {
+      raw = rawClock();
+    } catch {
+      fail('INVALID_CLOCK');
+    }
+    if (!Number.isSafeInteger(raw) || raw < 0 || raw > SYNTHETIC_BOUNDS.maxClockMs) {
+      fail('INVALID_CLOCK');
+    }
+    if (lastObservedClockMs !== undefined && raw < lastObservedClockMs) {
+      fail('INVALID_CLOCK');
+    }
+    const nextTickOffset = tickOffsetMs + additionalTickOffsetMs;
+    const effective = raw + nextTickOffset;
+    if (
+      !Number.isSafeInteger(nextTickOffset) ||
+      !Number.isSafeInteger(effective) ||
+      effective > SYNTHETIC_BOUNDS.maxClockMs
+    ) {
+      fail('INVALID_CLOCK');
+    }
+    return {raw, nextTickOffset, effective};
+  }
+
+  function readEffectiveNow() {
+    const sample = sampleClock(0);
+    lastObservedClockMs = sample.raw;
+    return sample.effective;
+  }
+
+  const runs = new Map();
+  const attemptIndex = new Map();
+  const claimIndex = new Map();
+  const grantIndex = new Map();
+  const requestIndex = new Map();
+  const internalSessions = new WeakMap();
+
+  let runCounter = 0;
+  let totalStarted = 0;
+  let totalStopped = 0;
+  let totalCompleted = 0;
+  let totalFailed = 0;
+
+  function ensureAllRunEventsFit({workerId, attemptId, effectiveNow, deadlineAtMs}) {
+    const worstCaseSteps = TOTAL_STEPS - 1;
+    const candidates = [
+      buildEvent({
+        workerId,
+        attemptId,
+        sequence: 1,
+        type: 'started',
+        phase: 'starting',
+        timestampMs: effectiveNow,
+        message: 'Synthetic worker initialized in memory (no model ran, no process spawned).',
+        completedSteps: 0,
+      }),
+      ...STEP_SPECS.map((spec, index) => buildEvent({
+        workerId,
+        attemptId,
+        sequence: index + 2,
+        type: spec.type,
+        phase: spec.phase,
+        status: spec.status,
+        reason: spec.reason,
+        timestampMs: deadlineAtMs,
+        message: spec.message,
+        completedSteps: spec.step,
+      })),
+      buildEvent({
+        workerId,
+        attemptId,
+        sequence: TOTAL_STEPS + 1,
+        type: 'terminal',
+        phase: 'stopped',
+        status: 'cancelled',
+        reason: 'operator-stopped',
+        timestampMs: deadlineAtMs,
+        message: 'Synthetic run stopped before completion (synthetic only).',
+        completedSteps: worstCaseSteps,
+      }),
+      buildEvent({
+        workerId,
+        attemptId,
+        sequence: TOTAL_STEPS + 1,
+        type: 'terminal',
+        phase: 'failed',
+        status: 'failed',
+        reason: 'deadline-exceeded',
+        timestampMs: deadlineAtMs,
+        message: 'Synthetic run exceeded its configured deadline (synthetic only).',
+        completedSteps: worstCaseSteps,
+      }),
+    ];
+    for (const candidate of candidates) {
+      if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > maxEventBytes) {
+        fail('EVENT_LIMIT_EXCEEDED');
+      }
+    }
+  }
+
+  function appendEvent(run, eventPayload) {
+    const sequence = run.lastSequence + 1;
+    const event = buildEvent({
+      workerId: run.workerId,
+      attemptId: run.attemptId,
+      sequence,
+      ...eventPayload,
+    });
+    const encodedBytes = Buffer.byteLength(JSON.stringify(event), 'utf8');
+    if (encodedBytes > maxEventBytes) {
+      fail('EVENT_LIMIT_EXCEEDED');
+    }
+    run.lastSequence = sequence;
+    if (run.events.length >= maxEventsPerRun) {
+      run.events.shift();
+      run.droppedEvents++;
+      run.retainedFromSequence = run.events.length > 0 ? run.events[0].sequence : sequence;
+    }
+    if (run.events.length === 0) {
+      run.retainedFromSequence = sequence;
+    }
+    run.events.push(event);
+  }
+
+  function syncRun(run, effectiveNow) {
+    if (run.status !== 'running') return;
+    for (let step = run.completedSteps + 1; step <= TOTAL_STEPS; step++) {
+      const spec = STEP_SPECS[step - 1];
+      const stepAtMs = run.startedAtMs + step * stepMs;
+      if (stepAtMs <= effectiveNow && stepAtMs <= run.deadlineAtMs) {
+        appendEvent(run, {
+          type: spec.type,
+          phase: spec.phase,
+          status: spec.status,
+          reason: spec.reason,
+          timestampMs: stepAtMs,
+          message: spec.message,
+          completedSteps: step,
+        });
+        run.completedSteps = step;
+        if (spec.type === 'terminal') {
+          run.status = spec.status;
+          run.state = 'exited';
+          run.reason = spec.reason;
+          run.endedAtMs = stepAtMs;
+          run.generation++;
+          totalCompleted++;
+          return;
+        }
+      } else {
+        break;
+      }
+    }
+    if (run.status === 'running' && effectiveNow >= run.deadlineAtMs) {
+      appendEvent(run, {
+        type: 'terminal',
+        phase: 'failed',
+        status: 'failed',
+        reason: 'deadline-exceeded',
+        timestampMs: run.deadlineAtMs,
+        message: 'Synthetic run exceeded its configured deadline (synthetic only).',
+        completedSteps: run.completedSteps,
+      });
+      run.status = 'failed';
+      run.state = 'exited';
+      run.reason = 'deadline-exceeded';
+      run.endedAtMs = run.deadlineAtMs;
+      run.generation++;
+      totalFailed++;
+    }
+  }
+
+  function syncAll(effectiveNow) {
+    for (const run of runs.values()) {
+      syncRun(run, effectiveNow);
+    }
+  }
+
+  function lookupRun(inputJson, allowedKeys) {
+    const args = parseBoundedJsonRecord(inputJson, allowedKeys);
+    const workerId = readSafeId(args.workerId);
+    const run = runs.get(workerId);
+    if (!run) fail('WORKER_NOT_FOUND');
+    if (args.attemptId !== undefined) {
+      const attemptId = readSafeId(args.attemptId);
+      if (attemptId !== run.attemptId) fail('ATTEMPT_MISMATCH');
+    }
+    return {args, run};
+  }
+
+  function inspectPayload(run, nowMs) {
+    const endMs = run.endedAtMs;
+    const referenceMs = endMs === null ? nowMs : endMs;
+    const elapsedMs = Math.max(0, referenceMs - run.startedAtMs);
+    return cloneFrozen({
+      workerId: run.workerId,
+      attemptId: run.attemptId,
+      claimId: run.claimId,
+      grantId: run.grantId,
+      snapshotRef: run.snapshotRef,
+      state: run.state,
+      status: run.status,
+      confirmed: true,
+      ...(run.reason !== null ? {reason: run.reason} : {}),
+      generation: run.generation,
+      cursor: run.lastSequence,
+      startedAt: new Date(run.startedAtMs).toISOString(),
+      startedAtMs: run.startedAtMs,
+      endedAt: endMs === null ? null : new Date(endMs).toISOString(),
+      endedAtMs: endMs,
+      elapsedMs,
+      deadlineAt: new Date(run.deadlineAtMs).toISOString(),
+      deadlineAtMs: run.deadlineAtMs,
+      progress: {
+        completedSteps: run.completedSteps,
+        totalSteps: TOTAL_STEPS,
+        percent: Math.round((run.completedSteps / TOTAL_STEPS) * 100),
+      },
+      route: {...run.route},
+      synthetic: true,
+      modelRan: false,
+      codeExecuted: false,
+      chargeEvidence: 'unavailable',
+    });
+  }
+
+  return Object.freeze({
+    route() {
+      return cloneFrozen(SYNTHETIC_ROUTE);
+    },
+
+    stats() {
+      const effectiveNow = readEffectiveNow();
+      syncAll(effectiveNow);
+      let activeRuns = 0;
+      for (const run of runs.values()) {
+        if (run.status === 'running') activeRuns++;
+      }
+      return cloneFrozen({
+        activeRuns,
+        retainedRuns: runs.size,
+        totalStarted,
+        totalStopped,
+        totalCompleted,
+        totalFailed,
+        virtualNowMs: effectiveNow,
+        bounds: {
+          stepMs,
+          maxActiveRuns,
+          maxRetainedRuns,
+          maxEventsPerRun,
+          maxEventBytes,
+          maxEventsPerRead,
+        },
+        synthetic: true,
+      });
+    },
+
+    tick(steps = 1) {
+      const count = readBoundedInt(steps, 1, SYNTHETIC_BOUNDS.maxTickSteps, 'INVALID_INPUT');
+      const sample = sampleClock(count * stepMs);
+      lastObservedClockMs = sample.raw;
+      tickOffsetMs = sample.nextTickOffset;
+      syncAll(sample.effective);
+      let activeRuns = 0;
+      for (const run of runs.values()) {
+        if (run.status === 'running') activeRuns++;
+      }
+      return cloneFrozen({
+        advancedSteps: count,
+        virtualNowMs: sample.effective,
+        activeRuns,
+        synthetic: true,
+      });
+    },
+
+    start(inputJson) {
+      const args = parseBoundedJsonRecord(
+        inputJson,
+        ['claimId', 'attemptId', 'grantId', 'snapshotRef', 'route', 'deadlineAt', 'requestId', 'scopeHash'],
+      );
+      const claimId = readSafeId(args.claimId);
+      const attemptId = readSafeId(args.attemptId);
+      const grantId = readSafeId(args.grantId);
+      const requestId = args.requestId === undefined ? undefined : readSafeId(args.requestId);
+      if (
+        args.scopeHash !== undefined &&
+        (typeof args.scopeHash !== 'string' || args.scopeHash.length !== 64 || !HEX64_PATTERN.test(args.scopeHash))
+      ) {
+        fail('INVALID_INPUT');
+      }
+      const snapshotRef = validateSnapshotRef(args.snapshotRef);
+      const route = validateRoute(args.route);
+      const deadlineAtMs = parseTimestampMs(args.deadlineAt);
+
+      const effectiveNow = readEffectiveNow();
+      syncAll(effectiveNow);
+
+      if (
+        attemptIndex.has(attemptId) ||
+        claimIndex.has(claimId) ||
+        grantIndex.has(grantId) ||
+        (requestId !== undefined && requestIndex.has(requestId))
+      ) {
+        fail('DUPLICATE_START');
+      }
+
+      if (deadlineAtMs <= effectiveNow || deadlineAtMs - effectiveNow > SYNTHETIC_BOUNDS.maxDeadlineWindowMs) {
+        fail('STALE_START');
+      }
+
+      let activeCount = 0;
+      for (const existing of runs.values()) {
+        if (existing.status === 'running') activeCount++;
+      }
+      if (activeCount >= maxActiveRuns || runs.size >= maxRetainedRuns) {
+        fail('CAPACITY_EXCEEDED');
+      }
+
+      const nextRunCounter = runCounter + 1;
+      const workerId = 'syn-worker-' + sha256(JSON.stringify([nextRunCounter, attemptId, claimId])).slice(0, 16);
+      const internalSessionRef = 'syn-session-' + sha256(JSON.stringify([nextRunCounter, grantId, effectiveNow])).slice(0, 24);
+
+      ensureAllRunEventsFit({workerId, attemptId, effectiveNow, deadlineAtMs});
+      runCounter = nextRunCounter;
+
+      const run = {
+        workerId,
+        attemptId,
+        claimId,
+        grantId,
+        requestId,
+        scopeHash: args.scopeHash ?? null,
+        snapshotRef,
+        route,
+        state: 'running',
+        status: 'running',
+        reason: null,
+        generation: 1,
+        startedAtMs: effectiveNow,
+        endedAtMs: null,
+        deadlineAtMs,
+        completedSteps: 0,
+        lastSequence: 0,
+        retainedFromSequence: 1,
+        droppedEvents: 0,
+        events: [],
+      };
+
+      appendEvent(run, {
+        type: 'started',
+        phase: 'starting',
+        timestampMs: effectiveNow,
+        message: 'Synthetic worker initialized in memory (no model ran, no process spawned).',
+        completedSteps: 0,
+      });
+
+      internalSessions.set(run, internalSessionRef);
+      runs.set(workerId, run);
+      attemptIndex.set(attemptId, workerId);
+      claimIndex.set(claimId, workerId);
+      grantIndex.set(grantId, workerId);
+      if (requestId !== undefined) {
+        requestIndex.set(requestId, workerId);
+      }
+      totalStarted++;
+
+      return cloneFrozen({
+        workerId,
+        attemptId,
+        claimId,
+        grantId,
+        snapshotRef,
+        cursor: run.lastSequence,
+        generation: run.generation,
+        state: run.state,
+        status: run.status,
+        startedAt: new Date(effectiveNow).toISOString(),
+        startedAtMs: effectiveNow,
+        deadlineAt: new Date(deadlineAtMs).toISOString(),
+        deadlineAtMs,
+        route: {...route},
+        synthetic: true,
+        modelRan: false,
+        codeExecuted: false,
+        chargeEvidence: 'unavailable',
+      });
+    },
+
+    events(input) {
+      const {args, run} = lookupRun(input, ['workerId', 'attemptId', 'afterSequence', 'limit']);
+      const afterSequence = args.afterSequence === undefined
+        ? 0
+        : readBoundedInt(args.afterSequence, 0, Number.MAX_SAFE_INTEGER, 'INVALID_INPUT');
+      const limit = args.limit === undefined
+        ? maxEventsPerRead
+        : readBoundedInt(args.limit, 1, maxEventsPerRead, 'INVALID_INPUT');
+
+      const effectiveNow = readEffectiveNow();
+      syncRun(run, effectiveNow);
+
+      const matched = run.events.filter(event => event.sequence > afterSequence);
+      const selected = matched.slice(0, limit);
+      const cursor = selected.length > 0 ? selected.at(-1).sequence : run.lastSequence;
+
+      return cloneFrozen({
+        workerId: run.workerId,
+        attemptId: run.attemptId,
+        events: selected,
+        cursor,
+        latestSequence: run.lastSequence,
+        retainedFromSequence: run.retainedFromSequence,
+        droppedEvents: run.droppedEvents,
+        historyTruncated: run.droppedEvents > 0,
+        missedRequested: run.droppedEvents > 0 && afterSequence < run.retainedFromSequence - 1,
+        hasMore: matched.length > selected.length,
+        terminal: run.status !== 'running',
+        status: run.status,
+        synthetic: true,
+        modelRan: false,
+        codeExecuted: false,
+      });
+    },
+
+    inspect(input) {
+      const {args, run} = lookupRun(input, ['workerId', 'attemptId', 'generation']);
+      if (args.generation !== undefined) {
+        if (!Number.isSafeInteger(args.generation) || args.generation !== run.generation) {
+          fail('STALE_CONTROL');
+        }
+      }
+      const effectiveNow = readEffectiveNow();
+      syncRun(run, effectiveNow);
+      if (args.generation !== undefined && args.generation !== run.generation) {
+        fail('STALE_CONTROL');
+      }
+      return inspectPayload(run, effectiveNow);
+    },
+
+    stop(input) {
+      const {args, run} = lookupRun(input, ['workerId', 'attemptId', 'generation', 'confirm']);
+      if (args.confirm !== true) {
+        fail('STOP_NOT_CONFIRMED');
+      }
+      if (args.generation !== undefined) {
+        if (!Number.isSafeInteger(args.generation) || args.generation !== run.generation) {
+          fail('STALE_CONTROL');
+        }
+      }
+      const effectiveNow = readEffectiveNow();
+      syncRun(run, effectiveNow);
+
+      if (args.generation !== undefined && args.generation !== run.generation) {
+        fail('STALE_CONTROL');
+      }
+
+      if (run.status !== 'running') {
+        return cloneFrozen({
+          workerId: run.workerId,
+          attemptId: run.attemptId,
+          state: 'exited',
+          status: run.status,
+          confirmed: true,
+          stopped: run.status === 'cancelled',
+          alreadyTerminal: true,
+          generation: run.generation,
+          cursor: run.lastSequence,
+          endedAt: new Date(run.endedAtMs).toISOString(),
+          endedAtMs: run.endedAtMs,
+          synthetic: true,
+          modelRan: false,
+          codeExecuted: false,
+          chargeEvidence: 'unavailable',
+        });
+      }
+
+      appendEvent(run, {
+        type: 'terminal',
+        phase: 'stopped',
+        status: 'cancelled',
+        reason: 'operator-stopped',
+        timestampMs: effectiveNow,
+        message: 'Synthetic run stopped before completion (synthetic only).',
+        completedSteps: run.completedSteps,
+      });
+
+      run.status = 'cancelled';
+      run.state = 'exited';
+      run.reason = 'operator-stopped';
+      run.endedAtMs = effectiveNow;
+      run.generation++;
+      totalStopped++;
+
+      return cloneFrozen({
+        workerId: run.workerId,
+        attemptId: run.attemptId,
+        state: 'exited',
+        status: 'cancelled',
+        confirmed: true,
+        stopped: true,
+        alreadyTerminal: false,
+        generation: run.generation,
+        cursor: run.lastSequence,
+        endedAt: new Date(run.endedAtMs).toISOString(),
+        endedAtMs: run.endedAtMs,
+        synthetic: true,
+        modelRan: false,
+        codeExecuted: false,
+        chargeEvidence: 'unavailable',
+      });
+    },
+
+    collect(input) {
+      const {run} = lookupRun(input, ['workerId', 'attemptId']);
+      const effectiveNow = readEffectiveNow();
+      syncRun(run, effectiveNow);
+
+      if (run.status === 'running') {
+        fail('RUN_NOT_TERMINAL');
+      }
+
+      const succeeded = run.status === 'succeeded';
+      const usage = emptySyntheticUsage();
+      const elapsedMs = Math.max(0, run.endedAtMs - run.startedAtMs);
+
+      return cloneFrozen({
+        workerId: run.workerId,
+        attemptId: run.attemptId,
+        claimId: run.claimId,
+        grantId: run.grantId,
+        snapshotRef: run.snapshotRef,
+        state: 'exited',
+        status: run.status,
+        settled: true,
+        ...(run.reason !== null ? {reason: run.reason} : {}),
+        synthetic: true,
+        modelRan: false,
+        codeExecuted: false,
+        verificationStatus: 'synthetic-unverified',
+        limits: [...SYNTHETIC_LIMITS],
+        route: {...run.route},
+        timing: {
+          startedAt: new Date(run.startedAtMs).toISOString(),
+          startedAtMs: run.startedAtMs,
+          endedAt: new Date(run.endedAtMs).toISOString(),
+          endedAtMs: run.endedAtMs,
+          elapsedMs,
+          timebase: 'clock',
+        },
+        proposal: succeeded
+          ? {
+              summary: 'Synthetic multi-file fixture replacement for limits.py and measurement.py. No model ran and no code was executed.',
+              files: {
+                'limits.py': SYNTHETIC_REPLACEMENT_FILES['limits.py'],
+                'measurement.py': SYNTHETIC_REPLACEMENT_FILES['measurement.py'],
+              },
+              fileDigests: {
+                'limits.py': SYNTHETIC_REPLACEMENT_DIGESTS['limits.py'],
+                'measurement.py': SYNTHETIC_REPLACEMENT_DIGESTS['measurement.py'],
+              },
+              baselineDigests: {
+                'limits.py': SYNTHETIC_BASELINE_DIGESTS['limits.py'],
+                'measurement.py': SYNTHETIC_BASELINE_DIGESTS['measurement.py'],
+              },
+              patch: SYNTHETIC_MULTI_FILE_PATCH,
+              patchSha256: SYNTHETIC_PATCH_SHA256,
+            }
+          : null,
+        checks: succeeded
+          ? [
+              {
+                name: 'Synthetic multi-file fixture matches pinned replacement',
+                pass: true,
+                synthetic: true,
+                codeExecuted: false,
+                evidence: 'pinned-in-memory-fixture',
+              },
+              {
+                name: 'Synthetic check cases (non-executed fixture placeholder)',
+                pass: true,
+                synthetic: true,
+                codeExecuted: false,
+                cases: 12,
+                passed: 12,
+                failed: 0,
+                evidence: 'pinned-in-memory-fixture',
+              },
+            ]
+          : [],
+        usage,
+        receipt: buildReceiptPayload(run, run.endedAtMs),
+      });
+    },
+  });
+}
