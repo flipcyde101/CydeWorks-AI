@@ -50,6 +50,11 @@ SCHEMA = "cydeworks.opencode-stop.v1"
 FRAME_MAX = 8192
 WORKLOAD_LINE_MAX = 4096
 WORKLOAD_FRAMES_MAX = 512
+# One serve iteration may publish only this many workload lines, and only
+# until this deadline. A slow stdout write therefore cannot stack into a
+# delay of control input or the hold and lifetime checks.
+WORKLOAD_DRAIN_BATCH = 8
+WORKLOAD_DRAIN_SECONDS = 0.05
 PROFILES = ("inert-fixture", "actual-opencode")
 # Real OpenCode dispatch stays disabled until the Stop and verifier gates pass
 # independent review. Changing this constant is out of scope for this change.
@@ -889,8 +894,11 @@ def serve(stdin=None, emit=write_frame, **options):
                 reason = "hold-expired" if not supervisor.dispatched else "lifetime-expired"
                 break
 
+            more_workload = False
             if supervisor.dispatched and workload_reader is not None:
-                while True:
+                drain_deadline = time.monotonic() + WORKLOAD_DRAIN_SECONDS
+                drained = 0
+                while drained < WORKLOAD_DRAIN_BATCH and time.monotonic() < drain_deadline:
                     wline = workload_reader.pop_line()
                     if wline is None:
                         workload_reader = None
@@ -898,6 +906,9 @@ def serve(stdin=None, emit=write_frame, **options):
                     if wline is False:
                         break
                     publish({"event": "workload", "data": wline[:WORKLOAD_LINE_MAX].decode("utf-8", "replace")})
+                    drained += 1
+                if workload_reader is not None and workload_reader.lines:
+                    more_workload = True
 
             cline = stdin_reader.pop_line()
             if cline is None:
@@ -923,6 +934,13 @@ def serve(stdin=None, emit=write_frame, **options):
                 else:
                     reason = "invalid-frame"
                     break
+                continue
+
+            if more_workload:
+                # Pull any control bytes before the next workload batch so a
+                # stop frame already in the pipe is not stuck behind it.
+                if stdin_reader.fd is not None or not stdin_reader.eof:
+                    stdin_reader.read_available()
                 continue
 
             fds = []

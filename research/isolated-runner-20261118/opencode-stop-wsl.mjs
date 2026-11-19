@@ -52,6 +52,12 @@ export function digestIdentity(identity) {
   return createHash('sha256').update(canonicalJson(core)).digest('hex');
 }
 
+function freezeTree(value) {
+  if (!value || typeof value !== 'object') return value;
+  for (const key of Object.keys(value)) freezeTree(value[key]);
+  return Object.freeze(value);
+}
+
 export function validateOwnedIdentity(identity, expectedNonce) {
   if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return false;
   if (identity.schema !== SCHEMA) return false;
@@ -361,10 +367,11 @@ export function createOpenCodeStopWslAdapter({
           synthetic: true,
         };
 
-        session.identity = heldIdentity;
+        session.identity = freezeTree(structuredClone(heldIdentity));
         signal?.throwIfAborted();
         // Durable persistence happens BEFORE releasing the held namespace.
-        const recordResult = record(structuredClone(heldIdentity));
+        // The callback receives a copy. The private identity stays frozen.
+        const recordResult = record(structuredClone(session.identity));
         if (recordResult !== undefined) {
           Promise.resolve(recordResult).catch(() => {});
           throw Error('Durable identity record must complete synchronously.');
@@ -433,6 +440,15 @@ export function createOpenCodeStopWslAdapter({
         return existing;
       }
 
+      // Snapshot the private identity before any await. Later mutation of the
+      // caller's object, or of a getSession view, cannot retarget this Stop.
+      let stopIdentity;
+      try {
+        stopIdentity = structuredClone(session?.identity ?? identity);
+      } catch {
+        return {cleanup: 'unknown', reason: 'identity-unreadable', qualificationScope: QUALIFICATION_SCOPE};
+      }
+
       const runStop = (async () => {
         let sessionStopped = null;
         if (session) {
@@ -460,7 +476,7 @@ export function createOpenCodeStopWslAdapter({
         const outOfBand = await runOneshot(
           spawnGuest,
           'stop',
-          {identity, expectedNonce: nonce},
+          {identity: stopIdentity, expectedNonce: nonce},
           stopTimeoutMs,
         );
         if (!outOfBand || outOfBand.event !== 'stopped' || outOfBand.cleanup !== 'verified') {
@@ -480,7 +496,7 @@ export function createOpenCodeStopWslAdapter({
           };
         }
 
-        const confirmed = await this.confirmAbsent(identity, nonce);
+        const confirmed = await this.confirmAbsent(stopIdentity, nonce);
         if (!confirmed.absent) {
           return {
             cleanup: 'unknown',
@@ -539,7 +555,14 @@ export function createOpenCodeStopWslAdapter({
     },
 
     getSession(nonce) {
-      return activeSessions.get(nonce) ?? null;
+      const session = activeSessions.get(nonce);
+      if (!session) return null;
+      // Public view only. No child, stdin, stdout, or the private identity object.
+      return {
+        nonce: session.nonce,
+        qualificationScope: QUALIFICATION_SCOPE,
+        ...(session.identity ? {identity: structuredClone(session.identity)} : {}),
+      };
     },
   };
 }
