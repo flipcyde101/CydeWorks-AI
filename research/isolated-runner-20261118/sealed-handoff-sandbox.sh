@@ -34,11 +34,7 @@ cd /tmp/scratch
 export TMPDIR=/tmp/scratch PYTHONDONTWRITEBYTECODE=1
 case "$MODE" in
   test) exec python3 -I -B /tmp/src/test_sealed_handoff.py -v ;;
-  vector) exec python3 -I -B -c "import importlib.util,hashlib,json
-spec=importlib.util.spec_from_file_location(\"s\",\"/tmp/src/sealed_handoff.py\"); s=importlib.util.module_from_spec(spec); spec.loader.exec_module(s)
-d=lambda b: hashlib.sha256(b).digest()
-b=s.build_bundle([s.SealedEntry(2,\"limits.py\",6,d(b\"limit\n\"),b\"limit\n\"),s.SealedEntry(1,\"pkg\"),s.SealedEntry(2,\"pkg/m.py\",2,d(b\"m\n\"),b\"m\n\")])
-print(json.dumps({\"sealDigest\":b.seal_digest,\"hex\":s.encode_bundle(b).hex(),\"files\":{k:v.decode() for k,v in b.files().items()}}))" ;;
+  vector) exec python3 -I -B /tmp/src/test_sealed_handoff.py --emit-vectors ;;
   *) fail "unknown-mode" ;;
 esac
 ' sandbox "$SRC" "$MODE"

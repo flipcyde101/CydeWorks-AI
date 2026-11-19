@@ -1,9 +1,14 @@
 // Controller-side contract for the sealed project/artifact handoff (research, disconnected).
 //
 // The Linux reader in sealed_handoff.py owns the trusted directory handles and emits a
-// CWSEAL1 byte stream. This module independently re-verifies that stream, binds it to an
-// approved seal digest and exposes it to downstream consumers only as bytes. It never
+// CWSEAL1 byte stream. This module independently re-verifies that stream against an
+// expected seal digest and exposes it to downstream consumers only as bytes. It never
 // returns or accepts a filesystem path, so nothing downstream can re-resolve one.
+//
+// The seal digest is byte integrity only. It is not owner approval, host attestation, root
+// identity or replay protection. The expected digest is caller supplied here; a trusted host
+// must supply it independently before any authorization or provenance claim is made. The
+// bundle is not a whole-tree point-in-time filesystem snapshot.
 //
 // Not imported by harness/, the browser, production approval/auth code or the live runner.
 import {createHash} from 'node:crypto';
@@ -21,7 +26,14 @@ export const DEFAULT_LIMITS = Object.freeze({
 });
 
 const sealed = new WeakMap();
-const utf8 = new TextDecoder('utf-8', {fatal: true});
+// ignoreBOM keeps a leading U+FEFF instead of silently stripping it, so decoding preserves
+// the exact path bytes; validatePath then rejects U+FEFF, matching sealed_handoff.py.
+const utf8 = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
+const FILE_HEAD = 5 + 8 + DIGEST_LEN;
+
+export function maxFrameBytes(limits) {
+  return SEAL_MAGIC.length + 4 + limits.maxEntries * (FILE_HEAD + limits.maxPathBytes) + limits.maxTotalBytes + DIGEST_LEN;
+}
 
 export class SealError extends Error {
   constructor(code, message) {
@@ -37,7 +49,7 @@ function fail(code, message) {
 function validatePath(path, limits) {
   const parts = path.split('/');
   for (const part of parts) {
-    if (part === '' || part === '.' || part === '..' || /[\\:\u0000-\u001f\u007f]/.test(part) ||
+    if (part === '' || part === '.' || part === '..' || /[\\:\u0000-\u001f\u007f﻿]/.test(part) ||
         Buffer.byteLength(part) > 255) {
       fail('SEALED_PATH_INVALID', 'Sealed entry path is not a safe relative path.');
     }
@@ -50,17 +62,19 @@ const sha256 = data => createHash('sha256').update(data).digest();
 
 /**
  * Decode and fully verify a CWSEAL1 stream. Returns an opaque frozen handle that only this
- * module can unwrap. `expectedSealDigest` must be the digest recorded when the owner approved.
+ * module can unwrap. `expectedSealDigest` is caller supplied; matching it proves byte
+ * integrity, not approval or provenance.
  */
 export function decodeSealedBundle(raw, {expectedSealDigest, limits: overrides} = {}) {
   const limits = {...DEFAULT_LIMITS, ...overrides};
   if (typeof expectedSealDigest !== 'string' || !/^[0-9a-f]{64}$/.test(expectedSealDigest)) {
-    fail('SEALED_APPROVAL_REQUIRED', 'A sealed handoff must be bound to an approved seal digest.');
+    fail('SEALED_EXPECTED_DIGEST_REQUIRED', 'An independently supplied expected seal digest is required.');
   }
-  if (!(raw instanceof Uint8Array) || raw.length < SEAL_MAGIC.length + 4 + DIGEST_LEN) {
-    fail('SEALED_BUNDLE_INVALID', 'Sealed bundle is truncated.');
-  }
-  const buf = Buffer.from(raw); // private copy; later caller mutation cannot change it
+  if (!(raw instanceof Uint8Array)) fail('SEALED_BUNDLE_INVALID', 'Sealed bundle must be bytes.');
+  if (raw.length > maxFrameBytes(limits)) fail('SEALED_LIMIT_EXCEEDED', 'Sealed bundle exceeds the frame limit.');
+  if (raw.length < SEAL_MAGIC.length + 4 + DIGEST_LEN) fail('SEALED_BUNDLE_INVALID', 'Sealed bundle is truncated.');
+  // Bounded above; private copy so later caller mutation cannot change what was verified.
+  const buf = Buffer.from(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.length));
   if (!buf.subarray(0, SEAL_MAGIC.length).equals(SEAL_MAGIC)) fail('SEALED_BUNDLE_INVALID', 'Unknown sealed bundle format.');
   let pos = SEAL_MAGIC.length;
   const need = n => { if (pos + n > buf.length) fail('SEALED_BUNDLE_INVALID', 'Sealed bundle manifest is truncated.'); };
@@ -101,7 +115,7 @@ export function decodeSealedBundle(raw, {expectedSealDigest, limits: overrides} 
     fail('SEALED_DIGEST_MISMATCH', 'Sealed bundle framing or digest is wrong.');
   }
   if (sealDigest.toString('hex') !== expectedSealDigest) {
-    fail('SEALED_DIGEST_MISMATCH', 'Sealed bundle is not the approved seal.');
+    fail('SEALED_DIGEST_MISMATCH', 'Sealed bundle is not the expected seal.');
   }
   const kinds = new Map();
   const folded = new Set();
