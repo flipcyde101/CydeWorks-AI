@@ -175,6 +175,9 @@ test('controller owns an independent key snapshot and rejects shared memory', ()
     const backing = Buffer.alloc(SYNTHETIC_KEY.length + 8);
     SYNTHETIC_KEY.copy(backing, 4);
     const inputKey = backing.subarray(4, 4 + SYNTHETIC_KEY.length);
+    for (const property of ['buffer', 'byteOffset', 'byteLength']) {
+      Object.defineProperty(inputKey, property, {get() { throw Error('caller accessor invoked'); }});
+    }
     const controller = createVerifiedPatchController({
       attestationKey: inputKey,
       expectedInvocationNonce: SYNTHETIC_NONCE,
