@@ -2,6 +2,16 @@
 
 This plan establishes the architecture and execution sequence for browser staging of repository changes and the isolated runner. It is grounded in `docs/ROADMAP.md` (November 18, 2026 checkpoint), the detailed implementation plan (`docs/superpowers/plans/2026-11-18-cydeworks-ai-feature-and-reuse-plan.md`), and the current application codebase in `harness/`.
 
+## Current status
+
+The integration worktree passed 288 application tests and seven focused pilot tests. The Windows and Ubuntu WSL tests verified Stop and restart recovery for the inert fixture. The review held browser connection because the actual worker path, independent inference settlement, and the binding between checked bytes and the proposed patch still require evidence. Leave the pilot entry point closed until those checks pass.
+
+## T3 model assignments
+
+- Independent safety and code reviews use Codex GPT-6.2 Sol with High reasoning effort.
+- Antigravity uses Gemini 4 Neon for architecture, Gemini 4 Argon when a second planning approach is needed, and Gemini 4 Hydrogen for bounded implementation and tests.
+- The coordinator must specify the exact provider, model, and supported effort setting. Report unavailability or quota limits without switching to paid billing or silently substituting a model.
+
 ## 1. Context and Baseline
 
 The verified starting baseline includes:
