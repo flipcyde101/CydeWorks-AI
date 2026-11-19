@@ -1,9 +1,11 @@
-import {randomUUID} from 'node:crypto';
-import {lstatSync,realpathSync,statSync} from 'node:fs';
+import {createHash,randomUUID} from 'node:crypto';
+import {lstatSync,readdirSync,readFileSync,realpathSync,statSync} from 'node:fs';
 import {isAbsolute,join,parse,relative,resolve} from 'node:path';
 
 export const DEFAULT_PROJECT_ID='default-workspace';
 export const DEFAULT_PROJECT_LABEL='Default local workspace';
+export const DEFAULT_ROOT_MAX_ENTRIES=4096;
+export const DEFAULT_ROOT_MAX_BYTES=8*1024*1024;
 
 const ID_PATTERN=/^[A-Za-z0-9._:-]{1,80}$/;
 const REVISION_PATTERN=/^[a-f0-9]{40,64}$/;
@@ -184,11 +186,155 @@ export function verifyContainedRoot(projectRoot,candidateRoot,{useTime=false}={}
   return canonicalCandidate;
 }
 
+export function captureProjectRootIdentity(projectRoot,{useTime=false}={}) {
+  const canonical=resolveLocalRoot(projectRoot,{useTime});
+  let st;
+  try {
+    st=statSync(canonical,{bigint:true});
+  } catch {
+    fail(useTime?409:400,'PROJECT_ROOT_MISSING','The selected project root does not exist.');
+  }
+  if(!st.isDirectory()) {
+    fail(useTime?409:400,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
+  }
+  return Object.freeze({
+    path:canonical,
+    dev:String(st.dev),
+    ino:String(st.ino),
+  });
+}
+
+export function captureDirectoryIdentity(
+  rawDir,
+  {useTime=false,maxEntries=DEFAULT_ROOT_MAX_ENTRIES,maxBytes=DEFAULT_ROOT_MAX_BYTES}={}
+) {
+  const errStatus=useTime?409:400;
+  const canonical=resolveLocalRoot(rawDir,{useTime});
+  let rootStat;
+  try {
+    rootStat=statSync(canonical,{bigint:true});
+  } catch {
+    fail(errStatus,'APPROVED_ROOT_MISSING','Approved root does not exist on disk.');
+  }
+  if(!rootStat.isDirectory()) {
+    fail(errStatus,'APPROVED_ROOT_NOT_DIRECTORY','Approved root must be a directory.');
+  }
+
+  const treeHash=createHash('sha256').update('ROOT_TREE_V1\0');
+  let entryCount=0;
+  let totalBytes=0;
+
+  const walk=(currentDir,relPrefix)=>{
+    let entries;
+    try {
+      entries=readdirSync(currentDir,{withFileTypes:true});
+    } catch {
+      fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root directory could not be read.');
+    }
+    entries.sort((a,b)=>(a.name<b.name?-1:a.name>b.name?1:0));
+    for(const entry of entries) {
+      entryCount++;
+      if(entryCount>maxEntries) {
+        fail(errStatus,'ROOT_SNAPSHOT_LIMIT_EXCEEDED','Approved root exceeds maximum entry count for snapshot verification.');
+      }
+      const fullPath=join(currentDir,entry.name);
+      const relPath=relPrefix?`${relPrefix}/${entry.name}`:entry.name;
+      let lst;
+      try {
+        lst=lstatSync(fullPath,{bigint:true});
+      } catch {
+        fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root entry could not be inspected.');
+      }
+      if(lst.isSymbolicLink()||entry.isSymbolicLink()) {
+        fail(errStatus,'APPROVED_ROOT_SYMLINK','Approved root cannot contain symbolic links or junctions.');
+      }
+      let realEntry;
+      try {
+        realEntry=realpathSync(fullPath);
+      } catch {
+        fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root entry could not be resolved.');
+      }
+      if(!pathsEqual(realEntry,fullPath)) {
+        fail(errStatus,'APPROVED_ROOT_SYMLINK','Approved root entry resolves through a symbolic link or junction.');
+      }
+      if(lst.isDirectory()) {
+        treeHash.update(`D:${relPath}\0${String(lst.ino)}\0`);
+        walk(fullPath,relPath);
+      } else if(lst.isFile()) {
+        const size=Number(lst.size);
+        if(!Number.isSafeInteger(size)||size<0||totalBytes+size>maxBytes) {
+          fail(errStatus,'ROOT_SNAPSHOT_LIMIT_EXCEEDED','Approved root exceeds maximum byte size for snapshot verification.');
+        }
+        totalBytes+=size;
+        let fileDigest;
+        try {
+          fileDigest=createHash('sha256').update(readFileSync(fullPath)).digest('hex');
+        } catch {
+          fail(errStatus,'APPROVED_ROOT_UNREADABLE','Approved root file could not be read for snapshot verification.');
+        }
+        treeHash.update(`F:${relPath}\0${size}\0${fileDigest}\0`);
+      } else {
+        fail(errStatus,'INVALID_APPROVED_ROOT_ENTRY','Approved root contains an unsupported filesystem entry.');
+      }
+    }
+  };
+
+  walk(canonical,'');
+  return Object.freeze({
+    path:canonical,
+    dev:String(rootStat.dev),
+    ino:String(rootStat.ino),
+    treeDigest:treeHash.digest('hex'),
+    entryCount,
+    totalBytes,
+  });
+}
+
+export function verifyContainedRootIdentity(
+  projectRoot,
+  candidateRoot,
+  expectedIdentity=null,
+  {useTime=false,maxEntries=DEFAULT_ROOT_MAX_ENTRIES,maxBytes=DEFAULT_ROOT_MAX_BYTES}={}
+) {
+  let canonicalCandidate;
+  try {
+    canonicalCandidate=verifyContainedRoot(projectRoot,candidateRoot,{useTime});
+  } catch(error) {
+    if(useTime&&error.code==='PROJECT_ROOT_MISSING') {
+      fail(409,'APPROVED_ROOT_MISSING','Registered project root is missing on disk.');
+    }
+    throw error;
+  }
+  const identity=captureDirectoryIdentity(canonicalCandidate,{useTime,maxEntries,maxBytes});
+  if(expectedIdentity!==null) {
+    if(!isPlainObject(expectedIdentity)||
+       typeof expectedIdentity.path!=='string'||
+       typeof expectedIdentity.dev!=='string'||
+       typeof expectedIdentity.ino!=='string'||
+       typeof expectedIdentity.treeDigest!=='string') {
+      fail(409,'APPROVED_ROOT_IDENTITY_INVALID','Expected approved root identity is invalid.');
+    }
+    if(!pathsEqual(identity.path,expectedIdentity.path)||
+       identity.dev!==expectedIdentity.dev||
+       identity.ino!==expectedIdentity.ino) {
+      fail(409,'APPROVED_ROOT_REPLACED','Approved root directory identity changed on disk after approval.');
+    }
+    if(identity.treeDigest!==expectedIdentity.treeDigest||
+       identity.entryCount!==expectedIdentity.entryCount||
+       identity.totalBytes!==expectedIdentity.totalBytes) {
+      fail(409,'APPROVED_ROOT_CHANGED','Approved root directory snapshot changed on disk after approval.');
+    }
+  }
+  return identity;
+}
+
 function rowToProject(row) {
   return Object.freeze({
     id:row.id,
     label:row.label,
     root:row.root,
+    rootDev:row.root_dev??null,
+    rootIno:row.root_ino??null,
     revision:row.revision,
     isDefault:row.is_default===1,
     createdAt:row.created_at,
@@ -204,23 +350,42 @@ export class WorkspaceProjects {
     this.db=db;
     this.clock=clock;
     this.nonce=nonce;
-    db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS workspace_projects (
-        id TEXT PRIMARY KEY,
-        label TEXT NOT NULL,
-        root TEXT UNIQUE,
-        revision TEXT,
-        is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      )`);
-    const resolvedDefault=defaultRoot===null||defaultRoot===undefined?null:resolveLocalRoot(defaultRoot);
+    db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA recursive_triggers=ON;');
+    const defaultIdentity=defaultRoot===null||defaultRoot===undefined?null:captureProjectRootIdentity(defaultRoot);
     const nowIso=this.#nowIso();
     this.transaction(()=>{
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS workspace_projects (
+          id TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          root TEXT UNIQUE,
+          root_dev TEXT,
+          root_ino TEXT,
+          revision TEXT,
+          is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`);
+      const existingCols=new Set(this.db.prepare('PRAGMA table_info(workspace_projects)').all().map(c=>c.name));
+      if(!existingCols.has('root_dev')) {
+        this.db.exec('ALTER TABLE workspace_projects ADD COLUMN root_dev TEXT');
+      }
+      if(!existingCols.has('root_ino')) {
+        this.db.exec('ALTER TABLE workspace_projects ADD COLUMN root_ino TEXT');
+      }
       this.db.prepare(
-        `INSERT OR IGNORE INTO workspace_projects (id,label,root,revision,is_default,created_at,updated_at)
-         VALUES (?,?,?,?,1,?,?)`
-      ).run(DEFAULT_PROJECT_ID,DEFAULT_PROJECT_LABEL,resolvedDefault,null,nowIso,nowIso);
+        `INSERT OR IGNORE INTO workspace_projects (id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,1,?,?)`
+      ).run(
+        DEFAULT_PROJECT_ID,
+        DEFAULT_PROJECT_LABEL,
+        defaultIdentity?.path??null,
+        defaultIdentity?.dev??null,
+        defaultIdentity?.ino??null,
+        null,
+        nowIso,
+        nowIso
+      );
     });
   }
 
@@ -244,7 +409,7 @@ export class WorkspaceProjects {
 
   listProjects() {
     const rows=this.db.prepare(
-      'SELECT id,label,root,revision,is_default,created_at,updated_at FROM workspace_projects ORDER BY is_default DESC,created_at ASC,id ASC'
+      'SELECT id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at FROM workspace_projects ORDER BY is_default DESC,created_at ASC,id ASC'
     ).all();
     return Object.freeze({
       defaultProjectId:DEFAULT_PROJECT_ID,
@@ -255,7 +420,7 @@ export class WorkspaceProjects {
   getProject(id) {
     normalizeProjectId(id);
     const row=this.db.prepare(
-      'SELECT id,label,root,revision,is_default,created_at,updated_at FROM workspace_projects WHERE id=?'
+      'SELECT id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at FROM workspace_projects WHERE id=?'
     ).get(id);
     return row?rowToProject(row):null;
   }
@@ -266,18 +431,33 @@ export class WorkspaceProjects {
     return project;
   }
 
+  verifyProjectRootIdentity(project,{useTime=false}={}) {
+    if(!project||project.root===null)return null;
+    const current=captureProjectRootIdentity(project.root,{useTime});
+    if(project.rootDev!==null&&project.rootIno!==null&&
+       (current.dev!==project.rootDev||current.ino!==project.rootIno)) {
+      fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory identity changed on disk.');
+    }
+    return current;
+  }
+
   registerProject(input) {
     if(!isPlainObject(input)||Object.keys(input).some(key=>!ALLOWED_CREATE_FIELDS.has(key))) {
       fail(400,'INVALID_PROJECT_INPUT','Provide only label, root, and optional revision.');
     }
     const label=normalizeLabel(input.label);
-    const root=resolveLocalRoot(input.root);
+    const identity=captureProjectRootIdentity(input.root);
+    const root=identity.path;
     const revision=normalizeRevision(input.revision);
     return this.transaction(()=>{
       const existing=this.db.prepare(
-        'SELECT id,label,root,revision,is_default,created_at,updated_at FROM workspace_projects WHERE root=?'
+        'SELECT id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at FROM workspace_projects WHERE root=?'
       ).get(root);
       if(existing) {
+        if(existing.root_dev!==null&&existing.root_ino!==null&&
+           (existing.root_dev!==identity.dev||existing.root_ino!==identity.ino)) {
+          fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory at this path was replaced on disk.');
+        }
         if(existing.label===label&&existing.revision===revision) {
           return Object.freeze({created:false,project:rowToProject(existing)});
         }
@@ -287,12 +467,22 @@ export class WorkspaceProjects {
       normalizeProjectId(id);
       const nowIso=this.#nowIso();
       this.db.prepare(
-        `INSERT INTO workspace_projects (id,label,root,revision,is_default,created_at,updated_at)
-         VALUES (?,?,?,?,0,?,?)`
-      ).run(id,label,root,revision,nowIso,nowIso);
+        `INSERT INTO workspace_projects (id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,0,?,?)`
+      ).run(id,label,root,identity.dev,identity.ino,revision,nowIso,nowIso);
       return Object.freeze({
         created:true,
-        project:rowToProject({id,label,root,revision,is_default:0,created_at:nowIso,updated_at:nowIso}),
+        project:rowToProject({
+          id,
+          label,
+          root,
+          root_dev:identity.dev,
+          root_ino:identity.ino,
+          revision,
+          is_default:0,
+          created_at:nowIso,
+          updated_at:nowIso,
+        }),
       });
     });
   }
@@ -302,7 +492,7 @@ export class WorkspaceProjects {
     const nextRevision=normalizeRevision(revision);
     return this.transaction(()=>{
       const existing=this.db.prepare(
-        'SELECT id,label,root,revision,is_default,created_at,updated_at FROM workspace_projects WHERE id=?'
+        'SELECT id,label,root,root_dev,root_ino,revision,is_default,created_at,updated_at FROM workspace_projects WHERE id=?'
       ).get(id);
       if(!existing)fail(404,'PROJECT_NOT_FOUND','Project not found.');
       const nowIso=this.#nowIso();

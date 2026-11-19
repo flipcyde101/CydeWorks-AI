@@ -3,9 +3,8 @@ import {prepareRunSubmission,validSubmissionId,approvedRouteRevision} from './ru
 import {PERMISSION_SCOPES,classifyEndpointUrl,parseStrictIsoTimestamp} from './connection-contract.mjs';
 import {
   WorkspaceProjects,
-  resolveLocalRoot,
   validateLocalPathSyntax,
-  verifyContainedRoot,
+  verifyContainedRootIdentity,
 } from './workspace-projects.mjs';
 
 export const DEFAULT_POLICY_VERSION='approval-policy-v1';
@@ -109,19 +108,25 @@ function normalizeAccountRef(value) {
   return needText(value,120,'account reference');
 }
 
-function resolveAndVerifyRoots(project,roots,{useTime=false}={}) {
+function resolveAndVerifyRootIdentities(project,roots,{useTime=false}={}) {
   if(!Array.isArray(roots)||roots.length>64) {
     fail(400,'INVALID_APPROVED_ROOTS','Approved roots must be a bounded list.');
   }
-  if(useTime&&project.root!==null) {
-    resolveLocalRoot(project.root,{useTime:true});
-  }
-  if(roots.length===0)return [];
+  if(roots.length===0)return {approvedRoots:[],rootIdentities:[]};
   for(const root of roots) {
     validateLocalPathSyntax(root,'INVALID_APPROVED_ROOTS','approved root path');
   }
-  const canonical=roots.map(root=>verifyContainedRoot(project.root,root,{useTime}));
-  return [...new Set(canonical)].sort();
+  const byPath=new Map();
+  for(const root of roots) {
+    const identity=verifyContainedRootIdentity(project.root,root,null,{useTime});
+    const mapKey=process.platform==='win32'?identity.path.toLowerCase():identity.path;
+    if(!byPath.has(mapKey))byPath.set(mapKey,identity);
+  }
+  const sorted=[...byPath.values()].sort((a,b)=>(a.path<b.path?-1:a.path>b.path?1:0));
+  return {
+    approvedRoots:sorted.map(entry=>entry.path),
+    rootIdentities:sorted,
+  };
 }
 
 function normalizePermissions(permissions) {
@@ -197,6 +202,61 @@ function validateRemotePermission(destination,permissions) {
   }
 }
 
+function normalizeDispatchScope(rawScope,{missingStatus=400,missingCode='MISSING_CURRENT_SCOPE'}={}) {
+  if(!isPlainObject(rawScope)) {
+    fail(missingStatus,missingCode,'Current task and route scope is required before dispatch.');
+  }
+  for(const field of REQUIRED_DISPATCH_SCOPE_FIELDS) {
+    requireOwnField(rawScope,field,missingCode,'currentScope field');
+  }
+  const taskId=needUuid(rawScope.taskId,'scope task id');
+  if(!Number.isSafeInteger(rawScope.taskVersion)||rawScope.taskVersion<0) {
+    fail(400,'INVALID_TASK_VERSION','Current scope taskVersion must be a non-negative integer.');
+  }
+  const projectId=normalizeProjectId(rawScope.projectId);
+  const projectRevision=normalizeProjectRevision(rawScope.projectRevision);
+  if(typeof rawScope.sourceHash!=='string'||!DIGEST_PATTERN.test(rawScope.sourceHash)) {
+    fail(400,'INVALID_SOURCE_HASH','Current scope sourceHash must be a 64-character lowercase hex digest.');
+  }
+  if(typeof rawScope.routeRevision!=='string'||!DIGEST_PATTERN.test(rawScope.routeRevision)) {
+    fail(400,'INVALID_ROUTE_REVISION','Current scope routeRevision must be a 64-character lowercase hex digest.');
+  }
+  const model=needText(rawScope.model,100,'scope model');
+  const engine=needText(rawScope.engine,40,'scope engine');
+  const backend=needText(rawScope.backend,40,'scope backend');
+  const modelDigest=rawScope.modelDigest===null?null:needText(rawScope.modelDigest,64,'scope modelDigest');
+  const modelFingerprint=rawScope.modelFingerprint===null?null:needText(rawScope.modelFingerprint,64,'scope modelFingerprint');
+  const destination=normalizeDestination(rawScope.destination);
+  const accountRef=normalizeAccountRef(rawScope.accountRef);
+  if(!Array.isArray(rawScope.approvedRoots)||rawScope.approvedRoots.length>64) {
+    fail(400,'INVALID_APPROVED_ROOTS','Current scope approvedRoots must be a bounded list.');
+  }
+  for(const root of rawScope.approvedRoots) {
+    validateLocalPathSyntax(root,'INVALID_APPROVED_ROOTS','approved root path');
+  }
+  const permissions=normalizePermissions(rawScope.permissions);
+  const testPlan=normalizeTestPlan(rawScope.testPlan);
+  return Object.freeze({
+    taskId,
+    taskVersion:rawScope.taskVersion,
+    projectId,
+    projectRevision,
+    sourceHash:rawScope.sourceHash,
+    routeRevision:rawScope.routeRevision,
+    model,
+    engine,
+    backend,
+    modelDigest,
+    modelFingerprint,
+    destination,
+    accountRef,
+    approvedRoots:rawScope.approvedRoots,
+    permissions,
+    testPlan,
+    testPlanHash:sha256Json(testPlan),
+  });
+}
+
 function attemptBindingKey(grant) {
   return JSON.stringify({
     submissionFingerprint:grant.submissionFingerprint,
@@ -243,6 +303,10 @@ function rowToClaim(row) {
     recoveryState:row.recovery_state,
     outcome:row.outcome,
     workerId:row.worker_id??null,
+    controllerId:row.controller_id??null,
+    ownerGeneration:row.owner_generation??null,
+    reconciledAtMs:row.reconciled_at_ms??null,
+    reconciledGeneration:row.reconciled_generation??null,
     claimedAt:row.claimed_at,
     dispatchedAt:row.dispatched_at,
     settledAt:row.settled_at,
@@ -250,10 +314,27 @@ function rowToClaim(row) {
   });
 }
 
+function rowToDispatch(row) {
+  if(!row)return null;
+  return deepFreeze({
+    dispatchId:row.dispatch_id,
+    grantId:row.grant_id,
+    claimId:row.claim_id,
+    attemptId:row.attempt_id,
+    taskId:row.task_id,
+    controllerId:row.controller_id,
+    ownerGeneration:row.owner_generation,
+    workerId:row.worker_id??null,
+    scopeDigest:row.scope_digest,
+    dispatchedAt:row.dispatched_at,
+    dispatchedAtMs:row.dispatched_at_ms,
+  });
+}
+
 const LEGACY_GRANT_FIELDS=[
   'grantId','grantKind','claimId','attemptId','requestId','taskId','taskVersion',
-  'projectId','projectRevision','sourceHash','routeRevision','model','engine','backend',
-  'modelDigest','modelFingerprint','destination','accountRef','approvedRoots',
+  'projectId','projectRevision','projectRootIdentity','sourceHash','routeRevision','model','engine','backend',
+  'modelDigest','modelFingerprint','destination','accountRef','approvedRoots','rootIdentities',
   'permissions','testPlan','testPlanHash','submissionFingerprint','policyVersion',
   'action','target','targetHash','sessionId','issuedAt','expiresAt','grantHash',
 ];
@@ -274,15 +355,51 @@ export function projectGrantRecord(raw) {
   return deepFreeze(projected);
 }
 
+/**
+ * Offline transactional approval grant and audit store (RB-P02-A).
+ *
+ * Host integration contract for Wave 2 (RB-P02-B) and Wave 3 (RB-P03-A):
+ * - `scopeResolver({ grantId, claimId, attemptId, taskId, projectId, grantKind })`:
+ *   Must derive current dispatch scope from independent server task/route/project state
+ *   (never reconstructed from the grant). When absent, `beginDispatch` retains a fail-closed hold.
+ * - `hostVerifiers.verifyControllerStopped({ controllerId, ownerGeneration, acquiredAt, expiresAt })`:
+ *   Required to take over an active, unexpired controller lease on restart.
+ * - `hostVerifiers.verifyWorkerStopped({ claimId, grantId, attemptId, workerId, controllerId, ownerGeneration })`:
+ *   Must query the real runner/OS worker tree to confirm process exit and cleanup before releasing a hold.
+ * - `hostVerifiers.verifySettlementReceipt({ claimId, grantId, attemptId, workerId, controllerId, ownerGeneration })`:
+ *   Must verify a persisted v2/ledger settlement receipt before resolving a hold as `confirmed-settled`.
+ * - `hostVerifiers.resolveTargetDigest({ action, target, projectId, projectRoot, approvedRoots })`:
+ *   Must compute/look up the SHA-256 digest of the actual artifact used at action issue and consume time.
+ * - `hostVerifiers.verifySession({ sessionId })`:
+ *   Optional live session validator supplementing persisted `approval_revoked_sessions`.
+ */
 export class ApprovalAuditStore {
-  constructor(db,{clock=()=>Date.now(),nonce=randomUUID,policyVersion=DEFAULT_POLICY_VERSION,projects=null}={}) {
+  constructor(
+    db,
+    {
+      clock=()=>Date.now(),
+      nonce=randomUUID,
+      policyVersion=DEFAULT_POLICY_VERSION,
+      projects=null,
+      scopeResolver=null,
+      hostVerifiers=null,
+    }={}
+  ) {
     if(!db||typeof db.exec!=='function'||typeof db.prepare!=='function') {
       throw new TypeError('ApprovalAuditStore requires a SQLite DatabaseSync handle.');
+    }
+    if(scopeResolver!==null&&typeof scopeResolver!=='function') {
+      throw new TypeError('ApprovalAuditStore scopeResolver must be a function or null.');
+    }
+    if(hostVerifiers!==null&&!isPlainObject(hostVerifiers)) {
+      throw new TypeError('ApprovalAuditStore hostVerifiers must be a plain object or null.');
     }
     this.db=db;
     this.clock=clock;
     this.nonce=nonce;
     this.policyVersion=normalizePolicyVersion(policyVersion);
+    this.scopeResolver=scopeResolver;
+    this.hostVerifiers=hostVerifiers?Object.freeze({...hostVerifiers}):null;
     if(projects!==null) {
       if(typeof projects.requireProject!=='function'||typeof projects.getProject!=='function') {
         throw new TypeError('ApprovalAuditStore projects option must be a WorkspaceProjects instance.');
@@ -291,110 +408,261 @@ export class ApprovalAuditStore {
     } else {
       this.projects=new WorkspaceProjects(db,{clock:this.clock,nonce:this.nonce});
     }
-    db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS approval_grants (
-        grant_id TEXT PRIMARY KEY,
-        grant_kind TEXT NOT NULL CHECK(grant_kind IN ('attempt','action')),
-        task_id TEXT,
-        project_id TEXT NOT NULL,
-        request_id TEXT,
-        claim_id TEXT,
-        attempt_id TEXT,
-        session_id TEXT,
-        policy_version TEXT NOT NULL,
-        issued_at TEXT NOT NULL,
-        issued_at_ms INTEGER NOT NULL,
-        expires_at TEXT NOT NULL,
-        expires_at_ms INTEGER NOT NULL,
-        grant_hash TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        UNIQUE(task_id,request_id)
-      );
-      CREATE TRIGGER IF NOT EXISTS approval_grants_no_update
-        BEFORE UPDATE ON approval_grants
-        BEGIN SELECT RAISE(ABORT,'Approval grants are immutable.'); END;
-      CREATE TRIGGER IF NOT EXISTS approval_grants_no_delete
-        BEFORE DELETE ON approval_grants
-        BEGIN SELECT RAISE(ABORT,'Approval grants cannot be deleted.'); END;
 
-      CREATE TABLE IF NOT EXISTS approval_grant_revocations (
-        grant_id TEXT PRIMARY KEY REFERENCES approval_grants(grant_id),
-        revoked_at TEXT NOT NULL,
-        revoked_at_ms INTEGER NOT NULL,
-        reason TEXT NOT NULL
-      );
-      CREATE TRIGGER IF NOT EXISTS approval_grant_revocations_no_update
-        BEFORE UPDATE ON approval_grant_revocations
-        BEGIN SELECT RAISE(ABORT,'Approval grant revocations are immutable.'); END;
-      CREATE TRIGGER IF NOT EXISTS approval_grant_revocations_no_delete
-        BEFORE DELETE ON approval_grant_revocations
-        BEGIN SELECT RAISE(ABORT,'Approval grant revocations cannot be deleted.'); END;
+    db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA recursive_triggers=ON;');
+    this.transaction(()=>{
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS approval_grants (
+          grant_id TEXT PRIMARY KEY,
+          grant_kind TEXT NOT NULL CHECK(grant_kind IN ('attempt','action')),
+          task_id TEXT,
+          project_id TEXT NOT NULL,
+          request_id TEXT,
+          claim_id TEXT,
+          attempt_id TEXT,
+          session_id TEXT,
+          policy_version TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          issued_at_ms INTEGER NOT NULL,
+          expires_at TEXT NOT NULL,
+          expires_at_ms INTEGER NOT NULL,
+          grant_hash TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          UNIQUE(task_id,request_id)
+        );
+        DROP TRIGGER IF EXISTS approval_grants_no_update;
+        CREATE TRIGGER approval_grants_no_update
+          BEFORE UPDATE ON approval_grants
+          BEGIN SELECT RAISE(ABORT,'Approval grants are immutable.'); END;
+        DROP TRIGGER IF EXISTS approval_grants_no_delete;
+        CREATE TRIGGER approval_grants_no_delete
+          BEFORE DELETE ON approval_grants
+          BEGIN SELECT RAISE(ABORT,'Approval grants cannot be deleted.'); END;
 
-      CREATE TABLE IF NOT EXISTS approval_action_consumptions (
-        grant_id TEXT PRIMARY KEY REFERENCES approval_grants(grant_id),
-        consumed_at TEXT NOT NULL,
-        consumed_at_ms INTEGER NOT NULL
-      );
-      CREATE TRIGGER IF NOT EXISTS approval_action_consumptions_no_update
-        BEFORE UPDATE ON approval_action_consumptions
-        BEGIN SELECT RAISE(ABORT,'Action grant consumptions are immutable.'); END;
-      CREATE TRIGGER IF NOT EXISTS approval_action_consumptions_no_delete
-        BEFORE DELETE ON approval_action_consumptions
-        BEGIN SELECT RAISE(ABORT,'Action grant consumptions cannot be deleted.'); END;
+        CREATE TABLE IF NOT EXISTS approval_grant_revocations (
+          grant_id TEXT PRIMARY KEY REFERENCES approval_grants(grant_id),
+          revoked_at TEXT NOT NULL,
+          revoked_at_ms INTEGER NOT NULL,
+          reason TEXT NOT NULL
+        );
+        DROP TRIGGER IF EXISTS approval_grant_revocations_no_update;
+        CREATE TRIGGER approval_grant_revocations_no_update
+          BEFORE UPDATE ON approval_grant_revocations
+          BEGIN SELECT RAISE(ABORT,'Approval grant revocations are immutable.'); END;
+        DROP TRIGGER IF EXISTS approval_grant_revocations_no_delete;
+        CREATE TRIGGER approval_grant_revocations_no_delete
+          BEFORE DELETE ON approval_grant_revocations
+          BEGIN SELECT RAISE(ABORT,'Approval grant revocations cannot be deleted.'); END;
 
-      CREATE TABLE IF NOT EXISTS approval_claims (
-        claim_id TEXT PRIMARY KEY,
-        grant_id TEXT NOT NULL UNIQUE REFERENCES approval_grants(grant_id),
-        attempt_id TEXT NOT NULL UNIQUE,
-        task_id TEXT NOT NULL,
-        task_version INTEGER NOT NULL,
-        request_id TEXT NOT NULL,
-        phase TEXT NOT NULL CHECK(phase IN ('claimed','dispatching','settled','crash-held','aborted')),
-        recovery_state TEXT CHECK(recovery_state IN ('retry-safe','unresolved')),
-        outcome TEXT,
-        worker_id TEXT,
-        reconciled_at_ms INTEGER,
-        claimed_at TEXT NOT NULL,
-        dispatched_at TEXT,
-        settled_at TEXT,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TRIGGER IF NOT EXISTS approval_claims_immutable_identity
-        BEFORE UPDATE ON approval_claims
-        WHEN NEW.claim_id!=OLD.claim_id OR NEW.grant_id!=OLD.grant_id OR NEW.attempt_id!=OLD.attempt_id OR
-             NEW.task_id!=OLD.task_id OR NEW.task_version!=OLD.task_version OR NEW.request_id!=OLD.request_id OR
-             NEW.claimed_at!=OLD.claimed_at
-        BEGIN SELECT RAISE(ABORT,'Approval claim identity is immutable.'); END;
-      CREATE TRIGGER IF NOT EXISTS approval_claims_no_delete
-        BEFORE DELETE ON approval_claims
-        BEGIN SELECT RAISE(ABORT,'Approval claims cannot be deleted.'); END;
+        CREATE TABLE IF NOT EXISTS approval_action_consumptions (
+          grant_id TEXT PRIMARY KEY REFERENCES approval_grants(grant_id),
+          consumed_at TEXT NOT NULL,
+          consumed_at_ms INTEGER NOT NULL
+        );
+        DROP TRIGGER IF EXISTS approval_action_consumptions_no_update;
+        CREATE TRIGGER approval_action_consumptions_no_update
+          BEFORE UPDATE ON approval_action_consumptions
+          BEGIN SELECT RAISE(ABORT,'Action grant consumptions are immutable.'); END;
+        DROP TRIGGER IF EXISTS approval_action_consumptions_no_delete;
+        CREATE TRIGGER approval_action_consumptions_no_delete
+          BEFORE DELETE ON approval_action_consumptions
+          BEGIN SELECT RAISE(ABORT,'Action grant consumptions cannot be deleted.'); END;
 
-      CREATE TABLE IF NOT EXISTS approval_controller_state (
-        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-        controller_id TEXT NOT NULL,
-        owner_generation INTEGER NOT NULL CHECK(owner_generation>=1),
-        lease_token_hash TEXT NOT NULL,
-        active INTEGER NOT NULL CHECK(active IN (0,1)),
-        acquired_at TEXT NOT NULL,
-        acquired_at_ms INTEGER NOT NULL,
-        expires_at TEXT NOT NULL,
-        expires_at_ms INTEGER NOT NULL
-      );
+        CREATE TABLE IF NOT EXISTS approval_revoked_sessions (
+          session_id TEXT PRIMARY KEY,
+          revoked_at TEXT NOT NULL,
+          revoked_at_ms INTEGER NOT NULL,
+          reason TEXT NOT NULL
+        );
+        DROP TRIGGER IF EXISTS approval_revoked_sessions_no_update;
+        CREATE TRIGGER approval_revoked_sessions_no_update
+          BEFORE UPDATE ON approval_revoked_sessions
+          BEGIN SELECT RAISE(ABORT,'Revoked sessions are immutable.'); END;
+        DROP TRIGGER IF EXISTS approval_revoked_sessions_no_delete;
+        CREATE TRIGGER approval_revoked_sessions_no_delete
+          BEFORE DELETE ON approval_revoked_sessions
+          BEGIN SELECT RAISE(ABORT,'Revoked sessions cannot be deleted.'); END;
 
-      CREATE TABLE IF NOT EXISTS approval_audit_log (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        grant_id TEXT NOT NULL REFERENCES approval_grants(grant_id),
-        claim_id TEXT,
-        event_type TEXT NOT NULL,
-        at TEXT NOT NULL,
-        detail TEXT NOT NULL
-      );
-      CREATE TRIGGER IF NOT EXISTS approval_audit_no_update
-        BEFORE UPDATE ON approval_audit_log
-        BEGIN SELECT RAISE(ABORT,'Approval audit log is append-only.'); END;
-      CREATE TRIGGER IF NOT EXISTS approval_audit_no_delete
-        BEFORE DELETE ON approval_audit_log
-        BEGIN SELECT RAISE(ABORT,'Approval audit log is append-only.'); END;`);
+        CREATE TABLE IF NOT EXISTS approval_claims (
+          claim_id TEXT PRIMARY KEY,
+          grant_id TEXT NOT NULL UNIQUE REFERENCES approval_grants(grant_id),
+          attempt_id TEXT NOT NULL UNIQUE,
+          task_id TEXT NOT NULL,
+          task_version INTEGER NOT NULL,
+          request_id TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK(phase IN ('claimed','dispatching','settled','crash-held','aborted')),
+          recovery_state TEXT CHECK(recovery_state IN ('retry-safe','unresolved')),
+          outcome TEXT,
+          worker_id TEXT,
+          controller_id TEXT,
+          owner_generation INTEGER,
+          reconciled_at_ms INTEGER,
+          reconciled_generation INTEGER,
+          claimed_at TEXT NOT NULL,
+          dispatched_at TEXT,
+          settled_at TEXT,
+          updated_at TEXT NOT NULL
+        );`);
+
+      // Migrate pre-hardening f741151 / f1efdfa approval_claims schemas before creating claim triggers.
+      const claimColumns=new Set(this.db.prepare('PRAGMA table_info(approval_claims)').all().map(col=>col.name));
+      for(const [colName,colType] of [
+        ['worker_id','TEXT'],
+        ['controller_id','TEXT'],
+        ['owner_generation','INTEGER'],
+        ['reconciled_at_ms','INTEGER'],
+        ['reconciled_generation','INTEGER'],
+      ]) {
+        if(!claimColumns.has(colName)) {
+          this.db.exec(`ALTER TABLE approval_claims ADD COLUMN ${colName} ${colType}`);
+        }
+      }
+
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS approval_claims_immutable_identity;
+        CREATE TRIGGER approval_claims_immutable_identity
+          BEFORE UPDATE ON approval_claims
+          WHEN NEW.claim_id!=OLD.claim_id OR NEW.grant_id!=OLD.grant_id OR NEW.attempt_id!=OLD.attempt_id OR
+               NEW.task_id!=OLD.task_id OR NEW.task_version!=OLD.task_version OR NEW.request_id!=OLD.request_id OR
+               NEW.claimed_at!=OLD.claimed_at
+          BEGIN SELECT RAISE(ABORT,'Approval claim identity is immutable.'); END;
+
+        DROP TRIGGER IF EXISTS approval_claims_terminal_immutable;
+        CREATE TRIGGER approval_claims_terminal_immutable
+          BEFORE UPDATE ON approval_claims
+          WHEN OLD.phase IN ('settled','aborted')
+          BEGIN SELECT RAISE(ABORT,'Terminal approval claims are immutable.'); END;
+
+        DROP TRIGGER IF EXISTS approval_claims_valid_transitions;
+        CREATE TRIGGER approval_claims_valid_transitions
+          BEFORE UPDATE ON approval_claims
+          WHEN OLD.phase NOT IN ('settled','aborted') AND
+               NEW.claim_id IS OLD.claim_id AND NEW.grant_id IS OLD.grant_id AND NEW.attempt_id IS OLD.attempt_id AND
+               NEW.task_id IS OLD.task_id AND NEW.task_version IS OLD.task_version AND NEW.request_id IS OLD.request_id AND
+               NEW.claimed_at IS OLD.claimed_at AND
+               NOT (
+                 (OLD.phase='claimed' AND NEW.phase='dispatching' AND
+                  NEW.recovery_state IS NULL AND NEW.outcome IS NULL AND
+                  NEW.dispatched_at IS NOT NULL AND NEW.settled_at IS NULL AND
+                  NEW.reconciled_at_ms IS NULL AND NEW.reconciled_generation IS NULL)
+                 OR
+                 (OLD.phase='claimed' AND NEW.phase='aborted' AND
+                  NEW.recovery_state IS NULL AND NEW.dispatched_at IS NULL AND NEW.settled_at IS NULL AND
+                  NEW.worker_id IS NULL AND NEW.controller_id IS NULL AND NEW.owner_generation IS NULL AND
+                  NEW.reconciled_at_ms IS NULL AND NEW.reconciled_generation IS NULL)
+                 OR
+                 (OLD.phase='claimed' AND NEW.phase='crash-held' AND
+                  NEW.recovery_state='retry-safe' AND NEW.outcome IS NULL AND
+                  NEW.dispatched_at IS NULL AND NEW.settled_at IS NULL AND
+                  NEW.reconciled_at_ms IS NOT NULL)
+                 OR
+                 (OLD.phase='dispatching' AND NEW.phase='settled' AND
+                  NEW.recovery_state IS NULL AND NEW.outcome IN ('succeeded','failed','cancelled') AND
+                  NEW.dispatched_at IS OLD.dispatched_at AND NEW.settled_at IS NOT NULL AND
+                  NEW.worker_id IS OLD.worker_id AND NEW.controller_id IS OLD.controller_id AND
+                  NEW.owner_generation IS OLD.owner_generation AND
+                  NEW.reconciled_at_ms IS NULL AND NEW.reconciled_generation IS NULL)
+                 OR
+                 (OLD.phase='dispatching' AND NEW.phase='crash-held' AND
+                  NEW.recovery_state='unresolved' AND NEW.outcome IS NULL AND
+                  NEW.dispatched_at IS OLD.dispatched_at AND NEW.settled_at IS NULL AND
+                  NEW.worker_id IS OLD.worker_id AND NEW.controller_id IS OLD.controller_id AND
+                  NEW.owner_generation IS OLD.owner_generation AND
+                  NEW.reconciled_at_ms IS NOT NULL)
+                 OR
+                 (OLD.phase='crash-held' AND NEW.phase='aborted' AND
+                  NEW.recovery_state IS OLD.recovery_state AND NEW.outcome='confirmed-stopped' AND
+                  NEW.dispatched_at IS OLD.dispatched_at AND NEW.settled_at IS OLD.settled_at AND
+                  NEW.worker_id IS OLD.worker_id AND NEW.controller_id IS OLD.controller_id AND
+                  NEW.owner_generation IS OLD.owner_generation AND
+                  NEW.reconciled_at_ms IS OLD.reconciled_at_ms AND
+                  NEW.reconciled_generation IS OLD.reconciled_generation)
+                 OR
+                 (OLD.phase='crash-held' AND OLD.recovery_state='unresolved' AND OLD.dispatched_at IS NOT NULL AND
+                  NEW.phase='settled' AND NEW.recovery_state IS OLD.recovery_state AND NEW.outcome='confirmed-settled' AND
+                  NEW.dispatched_at IS OLD.dispatched_at AND NEW.settled_at IS NOT NULL AND
+                  NEW.worker_id IS OLD.worker_id AND NEW.controller_id IS OLD.controller_id AND
+                  NEW.owner_generation IS OLD.owner_generation AND
+                  NEW.reconciled_at_ms IS OLD.reconciled_at_ms AND
+                  NEW.reconciled_generation IS OLD.reconciled_generation)
+               )
+          BEGIN SELECT RAISE(ABORT,'Invalid approval claim state transition.'); END;
+
+        DROP TRIGGER IF EXISTS approval_claims_no_delete;
+        CREATE TRIGGER approval_claims_no_delete
+          BEFORE DELETE ON approval_claims
+          BEGIN SELECT RAISE(ABORT,'Approval claims cannot be deleted.'); END;
+
+        CREATE TABLE IF NOT EXISTS approval_dispatches (
+          dispatch_id TEXT PRIMARY KEY,
+          grant_id TEXT NOT NULL UNIQUE REFERENCES approval_grants(grant_id),
+          claim_id TEXT NOT NULL UNIQUE REFERENCES approval_claims(claim_id),
+          attempt_id TEXT NOT NULL UNIQUE,
+          task_id TEXT NOT NULL,
+          controller_id TEXT NOT NULL,
+          owner_generation INTEGER NOT NULL,
+          worker_id TEXT,
+          scope_digest TEXT NOT NULL,
+          dispatched_at TEXT NOT NULL,
+          dispatched_at_ms INTEGER NOT NULL
+        );
+        DROP TRIGGER IF EXISTS approval_dispatches_no_update;
+        CREATE TRIGGER approval_dispatches_no_update
+          BEFORE UPDATE ON approval_dispatches
+          BEGIN SELECT RAISE(ABORT,'Approval dispatches are immutable.'); END;
+        DROP TRIGGER IF EXISTS approval_dispatches_no_delete;
+        CREATE TRIGGER approval_dispatches_no_delete
+          BEFORE DELETE ON approval_dispatches
+          BEGIN SELECT RAISE(ABORT,'Approval dispatches cannot be deleted.'); END;
+
+        CREATE TABLE IF NOT EXISTS approval_controller_state (
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          controller_id TEXT NOT NULL,
+          owner_generation INTEGER NOT NULL CHECK(owner_generation>=1),
+          lease_token_hash TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK(active IN (0,1)),
+          acquired_at TEXT NOT NULL,
+          acquired_at_ms INTEGER NOT NULL,
+          expires_at TEXT NOT NULL,
+          expires_at_ms INTEGER NOT NULL
+        );
+        DROP TRIGGER IF EXISTS approval_controller_state_no_delete;
+        CREATE TRIGGER approval_controller_state_no_delete
+          BEFORE DELETE ON approval_controller_state
+          BEGIN SELECT RAISE(ABORT,'Controller lease state cannot be deleted.'); END;
+        DROP TRIGGER IF EXISTS approval_controller_state_monotonic;
+        CREATE TRIGGER approval_controller_state_monotonic
+          BEFORE UPDATE ON approval_controller_state
+          WHEN NOT (
+            (NEW.active=0 AND NEW.owner_generation=OLD.owner_generation AND
+             NEW.controller_id=OLD.controller_id AND NEW.lease_token_hash=OLD.lease_token_hash)
+            OR
+            (NEW.active=1 AND NEW.owner_generation=OLD.owner_generation+1)
+            OR
+            (OLD.active=1 AND NEW.active=1 AND NEW.owner_generation=OLD.owner_generation AND
+             NEW.controller_id=OLD.controller_id AND NEW.lease_token_hash=OLD.lease_token_hash AND
+             NEW.acquired_at=OLD.acquired_at AND NEW.acquired_at_ms=OLD.acquired_at_ms)
+          )
+          BEGIN SELECT RAISE(ABORT,'Controller owner generation must increase monotonically.'); END;
+
+        CREATE TABLE IF NOT EXISTS approval_audit_log (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          grant_id TEXT NOT NULL REFERENCES approval_grants(grant_id),
+          claim_id TEXT,
+          event_type TEXT NOT NULL,
+          at TEXT NOT NULL,
+          detail TEXT NOT NULL
+        );
+        DROP TRIGGER IF EXISTS approval_audit_no_update;
+        CREATE TRIGGER approval_audit_no_update
+          BEFORE UPDATE ON approval_audit_log
+          BEGIN SELECT RAISE(ABORT,'Approval audit log is append-only.'); END;
+        DROP TRIGGER IF EXISTS approval_audit_no_delete;
+        CREATE TRIGGER approval_audit_no_delete
+          BEFORE DELETE ON approval_audit_log
+          BEGIN SELECT RAISE(ABORT,'Approval audit log is append-only.'); END;
+      `);
+    });
   }
 
   #nowMs() {
@@ -487,6 +755,22 @@ export class ApprovalAuditStore {
        parseStrictIsoTimestamp(claim.claimed_at)===null) {
       fail(409,'CLAIM_INTEGRITY_ERROR','Stored approval claim failed grant-to-claim verification.');
     }
+    if(claim.phase==='claimed'&&(claim.recovery_state!==null||claim.dispatched_at!==null||claim.settled_at!==null)) {
+      fail(409,'CLAIM_INTEGRITY_ERROR','Stored claimed row has inconsistent phase metadata.');
+    }
+    if(claim.phase==='dispatching'&&(claim.recovery_state!==null||claim.dispatched_at===null||claim.settled_at!==null)) {
+      fail(409,'CLAIM_INTEGRITY_ERROR','Stored dispatching row has inconsistent phase metadata.');
+    }
+    if(claim.phase==='crash-held') {
+      if(!['retry-safe','unresolved'].includes(claim.recovery_state)||
+         (claim.recovery_state==='retry-safe'&&claim.dispatched_at!==null)||
+         (claim.recovery_state==='unresolved'&&claim.dispatched_at===null)) {
+        fail(409,'CLAIM_INTEGRITY_ERROR','Stored crash-held row has inconsistent recovery metadata.');
+      }
+    }
+    if(claim.phase==='settled'&&claim.settled_at===null) {
+      fail(409,'CLAIM_INTEGRITY_ERROR','Stored settled row is missing settled timestamp.');
+    }
     return claim;
   }
 
@@ -495,6 +779,172 @@ export class ApprovalAuditStore {
     if(revoked)fail(409,'GRANT_REVOKED','This approval grant has been revoked.');
     if(nowMs<row.issued_at_ms)fail(409,'GRANT_NOT_YET_VALID','Approval grant issue time is in the future.');
     if(nowMs>=row.expires_at_ms)fail(409,'GRANT_EXPIRED','This approval grant has expired.');
+  }
+
+  #checkSessionActive(sessionId) {
+    const revoked=this.db.prepare('SELECT revoked_at,reason FROM approval_revoked_sessions WHERE session_id=?').get(sessionId);
+    if(revoked) {
+      fail(409,'SESSION_REVOKED','This authenticated session has been locked or revoked.');
+    }
+    if(typeof this.hostVerifiers?.verifySession==='function') {
+      const verdict=this.hostVerifiers.verifySession({sessionId});
+      if(!isPlainObject(verdict)||verdict.active!==true) {
+        fail(409,'SESSION_REVOKED','Host session verifier reports this session is locked or inactive.');
+      }
+    }
+  }
+
+  #verifyTargetDigest(action,target,project,approvedRoots) {
+    if(typeof this.hostVerifiers?.resolveTargetDigest!=='function') {
+      fail(
+        409,
+        'UNVERIFIED_ACTION_TARGET',
+        'Action target digest cannot be verified against the actual artifact without a trusted host artifact verifier.'
+      );
+    }
+    const resolved=this.hostVerifiers.resolveTargetDigest({
+      action,
+      target:Object.freeze({kind:target.kind,id:target.id}),
+      projectId:project.id,
+      projectRoot:project.root,
+      approvedRoots,
+    });
+    if(!isPlainObject(resolved)||typeof resolved.digest!=='string'||!DIGEST_PATTERN.test(resolved.digest)) {
+      fail(409,'UNVERIFIED_ACTION_TARGET','Trusted host artifact verifier did not return a valid target digest.');
+    }
+    if(resolved.digest!==target.digest) {
+      fail(409,'TARGET_MISMATCH','The actual target artifact digest does not match the approved target digest.');
+    }
+    return resolved.digest;
+  }
+
+  #verifyControllerOwnership(ownership,nowMs,{minGeneration=null}={}) {
+    if(!isPlainObject(ownership)||
+       typeof ownership.controllerId!=='string'||!OPAQUE_ID_PATTERN.test(ownership.controllerId)||
+       !Number.isSafeInteger(ownership.ownerGeneration)||ownership.ownerGeneration<1||
+       typeof ownership.leaseToken!=='string'||CONTROL_CHARS_PATTERN.test(ownership.leaseToken)||
+       ownership.leaseToken.length<16||ownership.leaseToken.length>200) {
+      fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','Verifiable current controller ownership is required.');
+    }
+    const controller=this.db.prepare('SELECT * FROM approval_controller_state WHERE singleton=1').get();
+    if(!controller||controller.active!==1) {
+      fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','No active controller lease is registered.');
+    }
+    if(nowMs>=controller.expires_at_ms) {
+      fail(409,'CONTROLLER_LEASE_EXPIRED','The controller lease has expired.');
+    }
+    if(controller.controller_id!==ownership.controllerId||
+       controller.owner_generation!==ownership.ownerGeneration||
+       controller.lease_token_hash!==sha256Text(ownership.leaseToken)) {
+      fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','Controller ownership proof does not match the current active controller lease.');
+    }
+    if(minGeneration!==null&&controller.owner_generation<minGeneration) {
+      fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','Controller generation predates the reconciled hold.');
+    }
+    return controller;
+  }
+
+  #verifyGrantProjectAndRoots(project,grant) {
+    if(grant.projectRootIdentity!==null&&grant.projectRootIdentity!==undefined) {
+      if(project.root===null) {
+        fail(409,'PROJECT_ROOT_REPLACED','Registered project root is missing after approval.');
+      }
+      const currentProjectRoot=this.projects.verifyProjectRootIdentity(project,{useTime:true});
+      const expectedPath=grant.projectRootIdentity.path;
+      const samePath=process.platform==='win32'
+        ?currentProjectRoot.path.toLowerCase()===expectedPath.toLowerCase()
+        :currentProjectRoot.path===expectedPath;
+      if(!samePath||
+         currentProjectRoot.dev!==grant.projectRootIdentity.dev||
+         currentProjectRoot.ino!==grant.projectRootIdentity.ino) {
+        fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory identity changed after approval.');
+      }
+    } else if(project.root!==null) {
+      fail(409,'GRANT_INTEGRITY_ERROR','Approval grant lacks a project root identity binding.');
+    }
+
+    if(!Array.isArray(grant.rootIdentities)) {
+      fail(409,'GRANT_INTEGRITY_ERROR','Approval grant lacks directory identity bindings.');
+    }
+    if(grant.rootIdentities.length!==grant.approvedRoots.length) {
+      fail(409,'GRANT_INTEGRITY_ERROR','Approval grant root identities do not match approved roots.');
+    }
+    const verifiedPaths=[];
+    for(const expected of grant.rootIdentities) {
+      const checked=verifyContainedRootIdentity(project.root,expected.path,expected,{useTime:true});
+      verifiedPaths.push(checked.path);
+    }
+    return verifiedPaths;
+  }
+
+  acquireControllerLease({controllerId,leaseToken=this.nonce(),ttlMs=CONTROLLER_LEASE_TTL_MS,takeover=false}={}) {
+    const cleanControllerId=needText(controllerId,80,'controller id','INVALID_CONTROLLER_ID');
+    if(!OPAQUE_ID_PATTERN.test(cleanControllerId)) {
+      fail(400,'INVALID_CONTROLLER_ID','Controller id must be an opaque identifier.');
+    }
+    if(typeof leaseToken!=='string'||CONTROL_CHARS_PATTERN.test(leaseToken)||leaseToken.length<16||leaseToken.length>200) {
+      fail(400,'INVALID_LEASE_TOKEN','Controller lease token must be between 16 and 200 characters.');
+    }
+    if(!Number.isSafeInteger(ttlMs)||ttlMs<1||ttlMs>MAX_ATTEMPT_GRANT_TTL_MS) {
+      fail(400,'INVALID_TTL','Controller lease lifetime must be between 1 ms and 1 hour.');
+    }
+    const tokenHash=sha256Text(leaseToken);
+    return this.transaction(()=>{
+      const nowMs=this.#nowMs();
+      const nowIso=new Date(nowMs).toISOString();
+      const expiresAtMs=nowMs+ttlMs;
+      const expiresAt=new Date(expiresAtMs).toISOString();
+      const existing=this.db.prepare('SELECT * FROM approval_controller_state WHERE singleton=1').get();
+      if(existing&&existing.active===1&&nowMs<existing.expires_at_ms) {
+        if(takeover!==true||typeof this.hostVerifiers?.verifyControllerStopped!=='function') {
+          fail(409,'CONTROLLER_LEASE_ACTIVE','Another controller currently holds an active lease.');
+        }
+        const stopped=this.hostVerifiers.verifyControllerStopped({
+          controllerId:existing.controller_id,
+          ownerGeneration:existing.owner_generation,
+          acquiredAt:existing.acquired_at,
+          expiresAt:existing.expires_at,
+        });
+        if(!isPlainObject(stopped)||
+           stopped.stopped!==true||
+           stopped.controllerId!==existing.controller_id||
+           stopped.ownerGeneration!==existing.owner_generation) {
+          fail(409,'CONTROLLER_LEASE_ACTIVE','Existing controller could not be verified stopped before takeover.');
+        }
+      }
+      const ownerGeneration=existing?existing.owner_generation+1:1;
+      if(existing) {
+        this.db.prepare(
+          `UPDATE approval_controller_state
+           SET controller_id=?,owner_generation=?,lease_token_hash=?,active=1,
+               acquired_at=?,acquired_at_ms=?,expires_at=?,expires_at_ms=?
+           WHERE singleton=1`
+        ).run(cleanControllerId,ownerGeneration,tokenHash,nowIso,nowMs,expiresAt,expiresAtMs);
+      } else {
+        this.db.prepare(
+          `INSERT INTO approval_controller_state (
+             singleton,controller_id,owner_generation,lease_token_hash,active,
+             acquired_at,acquired_at_ms,expires_at,expires_at_ms
+           ) VALUES (1,?,?,?,1,?,?,?,?)`
+        ).run(cleanControllerId,ownerGeneration,tokenHash,nowIso,nowMs,expiresAt,expiresAtMs);
+      }
+      return Object.freeze({
+        controllerId:cleanControllerId,
+        ownerGeneration,
+        leaseToken,
+        acquiredAt:nowIso,
+        expiresAt,
+      });
+    });
+  }
+
+  releaseControllerLease(ownership) {
+    return this.transaction(()=>{
+      const nowMs=this.#nowMs();
+      this.#verifyControllerOwnership(ownership,nowMs);
+      this.db.prepare('UPDATE approval_controller_state SET active=0 WHERE singleton=1').run();
+      return Object.freeze({released:true,ownerGeneration:ownership.ownerGeneration});
+    });
   }
 
   issueAttemptGrant(input) {
@@ -514,12 +964,10 @@ export class ApprovalAuditStore {
       }
     }
     const projectRevision=project.revision;
-    if(project.root!==null) {
-      resolveLocalRoot(project.root,{useTime:false});
-    }
+    const projectRootIdentity=this.projects.verifyProjectRootIdentity(project,{useTime:false});
     const destination=normalizeDestination(input.destination);
     const accountRef=input.accountRef===undefined||input.accountRef===null?null:normalizeAccountRef(input.accountRef);
-    const approvedRoots=resolveAndVerifyRoots(project,input.approvedRoots,{useTime:false});
+    const {approvedRoots,rootIdentities}=resolveAndVerifyRootIdentities(project,input.approvedRoots,{useTime:false});
     const permissions=normalizePermissions(input.permissions);
     validateRemotePermission(destination,permissions);
     const testPlan=normalizeTestPlan(input.testPlan);
@@ -540,6 +988,9 @@ export class ApprovalAuditStore {
     return this.transaction(()=>{
       const nowMs=this.#nowMs();
       const nowIso=new Date(nowMs).toISOString();
+      if(sessionId!==null) {
+        this.#checkSessionActive(sessionId);
+      }
 
       const existingRow=this.db.prepare(
         'SELECT grant_id FROM approval_grants WHERE task_id=? AND request_id=?'
@@ -615,6 +1066,7 @@ export class ApprovalAuditStore {
         taskVersion:input.submission.version,
         projectId,
         projectRevision,
+        projectRootIdentity,
         sourceHash:input.submission.sourceHash,
         routeRevision,
         model:input.submission.model,
@@ -625,6 +1077,7 @@ export class ApprovalAuditStore {
         destination,
         accountRef,
         approvedRoots,
+        rootIdentities,
         permissions,
         testPlan,
         testPlanHash,
@@ -650,11 +1103,12 @@ export class ApprovalAuditStore {
       this.db.prepare(
         `INSERT INTO approval_claims (
            claim_id,grant_id,attempt_id,task_id,task_version,request_id,
-           phase,recovery_state,outcome,worker_id,reconciled_at_ms,claimed_at,dispatched_at,settled_at,updated_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+           phase,recovery_state,outcome,worker_id,controller_id,owner_generation,
+           reconciled_at_ms,reconciled_generation,claimed_at,dispatched_at,settled_at,updated_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       ).run(
         claimId,grantId,attemptId,taskId,input.submission.version,submission.requestId,
-        'claimed',null,null,null,null,nowIso,null,null,nowIso
+        'claimed',null,null,null,null,null,null,null,nowIso,null,null,nowIso
       );
 
       this.#audit(grantId,claimId,'grant.issued_and_claimed',nowIso,{
@@ -666,47 +1120,21 @@ export class ApprovalAuditStore {
     });
   }
 
-  beginDispatch({grantId,claimId,currentScope,policyVersion=this.policyVersion,workerId=null}) {
+  beginDispatch({grantId,claimId,ownership,currentScope=undefined,policyVersion=this.policyVersion,workerId=null}) {
     needUuid(grantId,'grant id');
     needUuid(claimId,'claim id');
-    if(!isPlainObject(currentScope))fail(400,'MISSING_CURRENT_SCOPE','Current task and route scope is required before dispatch.');
-    for(const field of REQUIRED_DISPATCH_SCOPE_FIELDS) {
-      requireOwnField(currentScope,field,'MISSING_CURRENT_SCOPE','currentScope field');
-    }
     const checkedPolicy=normalizePolicyVersion(policyVersion);
     const normalizedWorkerId=workerId===null||workerId===undefined?null:needText(workerId,120,'worker id');
-
-    const scopeTaskId=needUuid(currentScope.taskId,'scope task id');
-    if(!Number.isSafeInteger(currentScope.taskVersion)||currentScope.taskVersion<0) {
-      fail(400,'INVALID_TASK_VERSION','Current scope taskVersion must be a non-negative integer.');
-    }
-    const scopeProjectId=normalizeProjectId(currentScope.projectId);
-    const scopeProjectRevision=normalizeProjectRevision(currentScope.projectRevision);
-    if(typeof currentScope.sourceHash!=='string'||!DIGEST_PATTERN.test(currentScope.sourceHash)) {
-      fail(400,'INVALID_SOURCE_HASH','Current scope sourceHash must be a 64-character lowercase hex digest.');
-    }
-    if(typeof currentScope.routeRevision!=='string'||!DIGEST_PATTERN.test(currentScope.routeRevision)) {
-      fail(400,'INVALID_ROUTE_REVISION','Current scope routeRevision must be a 64-character lowercase hex digest.');
-    }
-    const scopeModel=needText(currentScope.model,100,'scope model');
-    const scopeEngine=needText(currentScope.engine,40,'scope engine');
-    const scopeBackend=needText(currentScope.backend,40,'scope backend');
-    const scopeModelDigest=currentScope.modelDigest===null?null:needText(currentScope.modelDigest,64,'scope modelDigest');
-    const scopeModelFingerprint=currentScope.modelFingerprint===null?null:needText(currentScope.modelFingerprint,64,'scope modelFingerprint');
-    const scopeDestination=normalizeDestination(currentScope.destination);
-    const scopeAccountRef=normalizeAccountRef(currentScope.accountRef);
-    if(!Array.isArray(currentScope.approvedRoots)||currentScope.approvedRoots.length>64) {
-      fail(400,'INVALID_APPROVED_ROOTS','Current scope approvedRoots must be a bounded list.');
-    }
-    for(const root of currentScope.approvedRoots) {
-      validateLocalPathSyntax(root,'INVALID_APPROVED_ROOTS','approved root path');
-    }
-    const scopePermissions=normalizePermissions(currentScope.permissions);
-    const scopeTestPlan=normalizeTestPlan(currentScope.testPlan);
+    const callerScope=currentScope===undefined?null:normalizeDispatchScope(currentScope,{
+      missingStatus:400,
+      missingCode:'MISSING_CURRENT_SCOPE',
+    });
 
     return this.transaction(()=>{
       const nowMs=this.#nowMs();
       const nowIso=new Date(nowMs).toISOString();
+      const controller=this.#verifyControllerOwnership(ownership,nowMs);
+
       const loaded=this.#loadVerifiedGrant(grantId);
       if(!loaded||loaded.grant.grantKind!=='attempt')fail(404,'GRANT_NOT_FOUND','Approval grant not found.');
       const {row,grant}=loaded;
@@ -723,70 +1151,143 @@ export class ApprovalAuditStore {
       if(claim.phase==='dispatching')fail(409,'ALREADY_DISPATCHED','This claim has already begun dispatch.');
       if(claim.phase!=='claimed')fail(409,'CLAIM_NOT_DISPATCHABLE','This claim is no longer eligible for dispatch.');
 
+      if(typeof this.scopeResolver!=='function') {
+        fail(
+          409,
+          'UNVERIFIED_DISPATCH_SCOPE',
+          'Dispatch scope cannot be verified without a trusted host scopeResolver bound to server state.'
+        );
+      }
+
+      const rawServerScope=this.scopeResolver({
+        grantId:grant.grantId,
+        claimId:claim.claim_id,
+        attemptId:grant.attemptId,
+        taskId:grant.taskId,
+        projectId:grant.projectId,
+        grantKind:'attempt',
+      });
+      const serverScope=normalizeDispatchScope(rawServerScope,{
+        missingStatus:409,
+        missingCode:'UNVERIFIED_DISPATCH_SCOPE',
+      });
+
       const project=this.projects.getProject(grant.projectId);
       if(!project)fail(409,'PROJECT_NOT_FOUND','Registered project no longer exists.');
-      if(project.revision!==grant.projectRevision||scopeProjectRevision!==grant.projectRevision) {
-        fail(409,'PROJECT_REVISION_CHANGED','The project revision changed after approval.');
-      }
 
-      if(scopeTaskId!==grant.taskId||currentScope.taskVersion!==grant.taskVersion) {
-        fail(409,'SCOPE_CHANGED','The task or task version changed after approval.');
-      }
-      if(scopeProjectId!==grant.projectId) {
-        fail(409,'SCOPE_CHANGED','The task project changed after approval.');
-      }
-      if(currentScope.sourceHash!==grant.sourceHash) {
-        fail(409,'SCOPE_CHANGED','The approved source snapshot changed after approval.');
-      }
-      if(currentScope.routeRevision!==grant.routeRevision) {
-        fail(409,'ROUTE_CHANGED','The selected route revision changed after approval.');
-      }
-      if(scopeModel!==grant.model||scopeEngine!==grant.engine||scopeBackend!==grant.backend||
-         scopeModelDigest!==grant.modelDigest||scopeModelFingerprint!==grant.modelFingerprint) {
-        fail(409,'ROUTE_CHANGED','The approved model or engine identity changed.');
-      }
-      if(JSON.stringify(scopeDestination)!==JSON.stringify(grant.destination)) {
-        fail(409,'DESTINATION_CHANGED','The provider destination changed after approval.');
-      }
-      if(scopeAccountRef!==grant.accountRef) {
-        fail(409,'SCOPE_CHANGED','The account reference changed after approval.');
-      }
+      const assertMatchesGrant=(scope)=>{
+        if(project.revision!==grant.projectRevision||scope.projectRevision!==grant.projectRevision) {
+          fail(409,'PROJECT_REVISION_CHANGED','The project revision changed after approval.');
+        }
+        if(scope.taskId!==grant.taskId||scope.taskVersion!==grant.taskVersion) {
+          fail(409,'SCOPE_CHANGED','The task or task version changed after approval.');
+        }
+        if(scope.projectId!==grant.projectId) {
+          fail(409,'SCOPE_CHANGED','The task project changed after approval.');
+        }
+        if(scope.sourceHash!==grant.sourceHash) {
+          fail(409,'SCOPE_CHANGED','The approved source snapshot changed after approval.');
+        }
+        if(scope.routeRevision!==grant.routeRevision) {
+          fail(409,'ROUTE_CHANGED','The selected route revision changed after approval.');
+        }
+        if(scope.model!==grant.model||scope.engine!==grant.engine||scope.backend!==grant.backend||
+           scope.modelDigest!==grant.modelDigest||scope.modelFingerprint!==grant.modelFingerprint) {
+          fail(409,'ROUTE_CHANGED','The approved model or engine identity changed.');
+        }
+        if(JSON.stringify(scope.destination)!==JSON.stringify(grant.destination)) {
+          fail(409,'DESTINATION_CHANGED','The provider destination changed after approval.');
+        }
+        if(scope.accountRef!==grant.accountRef) {
+          fail(409,'SCOPE_CHANGED','The account reference changed after approval.');
+        }
+        const {approvedRoots:scopeRoots}=resolveAndVerifyRootIdentities(project,scope.approvedRoots,{useTime:true});
+        if(JSON.stringify(scopeRoots)!==JSON.stringify(grant.approvedRoots)) {
+          fail(409,'SCOPE_CHANGED','The approved project roots changed after approval.');
+        }
+        if(JSON.stringify(scope.permissions)!==JSON.stringify(grant.permissions)) {
+          fail(409,'SCOPE_CHANGED','The approved permissions changed after approval.');
+        }
+        if(scope.testPlanHash!==grant.testPlanHash) {
+          fail(409,'SCOPE_CHANGED','The approved test plan changed after approval.');
+        }
+      };
 
-      const verifiedGrantRoots=resolveAndVerifyRoots(project,grant.approvedRoots,{useTime:true});
-      const verifiedScopeRoots=resolveAndVerifyRoots(project,currentScope.approvedRoots,{useTime:true});
-      if(JSON.stringify(verifiedScopeRoots)!==JSON.stringify(grant.approvedRoots)||
-         JSON.stringify(verifiedGrantRoots)!==JSON.stringify(grant.approvedRoots)) {
+      assertMatchesGrant(serverScope);
+      if(callerScope!==null)assertMatchesGrant(callerScope);
+      const verifiedGrantRoots=this.#verifyGrantProjectAndRoots(project,grant);
+      if(JSON.stringify(verifiedGrantRoots)!==JSON.stringify(grant.approvedRoots)) {
         fail(409,'SCOPE_CHANGED','The approved project roots changed after approval.');
       }
-      if(JSON.stringify(scopePermissions)!==JSON.stringify(grant.permissions)) {
-        fail(409,'SCOPE_CHANGED','The approved permissions changed after approval.');
-      }
-      if(sha256Json(scopeTestPlan)!==grant.testPlanHash) {
-        fail(409,'SCOPE_CHANGED','The approved test plan changed after approval.');
-      }
+
+      const dispatchId=needUuid(this.nonce(),'dispatch id');
+      const verifiedScope={
+        taskId:serverScope.taskId,
+        taskVersion:serverScope.taskVersion,
+        projectId:serverScope.projectId,
+        projectRevision:serverScope.projectRevision,
+        sourceHash:serverScope.sourceHash,
+        routeRevision:serverScope.routeRevision,
+        model:serverScope.model,
+        engine:serverScope.engine,
+        backend:serverScope.backend,
+        modelDigest:serverScope.modelDigest,
+        modelFingerprint:serverScope.modelFingerprint,
+        destination:serverScope.destination,
+        accountRef:serverScope.accountRef,
+        approvedRoots:grant.approvedRoots,
+        permissions:serverScope.permissions,
+        testPlan:serverScope.testPlan,
+      };
+      const scopeDigest=sha256Json(verifiedScope);
+
+      this.db.prepare(
+        `INSERT INTO approval_dispatches (
+           dispatch_id,grant_id,claim_id,attempt_id,task_id,
+           controller_id,owner_generation,worker_id,scope_digest,dispatched_at,dispatched_at_ms
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+      ).run(
+        dispatchId,grantId,claimId,grant.attemptId,grant.taskId,
+        controller.controller_id,controller.owner_generation,normalizedWorkerId,scopeDigest,nowIso,nowMs
+      );
 
       const updated=this.db.prepare(
-        "UPDATE approval_claims SET phase='dispatching',worker_id=?,dispatched_at=?,updated_at=? WHERE claim_id=? AND phase='claimed'"
-      ).run(normalizedWorkerId,nowIso,nowIso,claimId);
+        `UPDATE approval_claims
+         SET phase='dispatching',worker_id=?,controller_id=?,owner_generation=?,dispatched_at=?,updated_at=?
+         WHERE claim_id=? AND phase='claimed'`
+      ).run(normalizedWorkerId,controller.controller_id,controller.owner_generation,nowIso,nowIso,claimId);
       if(updated.changes!==1)fail(409,'CLAIM_NOT_DISPATCHABLE','The claim state changed concurrently.');
 
       this.#audit(grantId,claimId,'claim.dispatching',nowIso,{
+        dispatchId,
         attemptId:grant.attemptId,
         workerId:normalizedWorkerId,
+        controllerId:controller.controller_id,
+        ownerGeneration:controller.owner_generation,
+        scopeDigest,
       });
       const updatedClaim=this.db.prepare('SELECT * FROM approval_claims WHERE claim_id=?').get(claimId);
-      return Object.freeze({dispatched:true,grant,claim:rowToClaim(updatedClaim)});
+      const dispatchRow=this.db.prepare('SELECT * FROM approval_dispatches WHERE dispatch_id=?').get(dispatchId);
+      return Object.freeze({
+        dispatched:true,
+        grant,
+        claim:rowToClaim(updatedClaim),
+        dispatch:rowToDispatch(dispatchRow),
+        verifiedOperation:deepFreeze(verifiedScope),
+      });
     });
   }
 
-  completeDispatch({grantId,claimId,outcome}) {
+  completeDispatch({grantId,claimId,ownership,outcome}) {
     needUuid(grantId,'grant id');
     needUuid(claimId,'claim id');
     if(!['succeeded','failed','cancelled'].includes(outcome)) {
       fail(400,'INVALID_OUTCOME','Unsupported dispatch settlement outcome.');
     }
     return this.transaction(()=>{
-      const nowIso=new Date(this.#nowMs()).toISOString();
+      const nowMs=this.#nowMs();
+      const nowIso=new Date(nowMs).toISOString();
+      const controller=this.#verifyControllerOwnership(ownership,nowMs);
       const loaded=this.#loadVerifiedGrant(grantId);
       if(!loaded||loaded.grant.grantKind!=='attempt')fail(404,'CLAIM_NOT_FOUND','Approval claim not found.');
       const claim=this.#loadVerifiedClaim(claimId,loaded.grant);
@@ -796,10 +1297,17 @@ export class ApprovalAuditStore {
         fail(409,'SETTLEMENT_CONFLICT','This claim was already settled with a different outcome.');
       }
       if(claim.phase!=='dispatching')fail(409,'CLAIM_NOT_DISPATCHING','Only dispatching claims can be settled.');
+      if(claim.owner_generation!==null&&claim.owner_generation!==controller.owner_generation) {
+        fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','Dispatching controller generation no longer owns this attempt.');
+      }
       this.db.prepare(
         "UPDATE approval_claims SET phase='settled',outcome=?,settled_at=?,updated_at=? WHERE claim_id=?"
       ).run(outcome,nowIso,nowIso,claimId);
-      this.#audit(grantId,claimId,'claim.settled',nowIso,{outcome});
+      this.#audit(grantId,claimId,'claim.settled',nowIso,{
+        outcome,
+        controllerId:controller.controller_id,
+        ownerGeneration:controller.owner_generation,
+      });
       return Object.freeze({
         duplicate:false,
         claim:rowToClaim(this.db.prepare('SELECT * FROM approval_claims WHERE claim_id=?').get(claimId)),
@@ -807,56 +1315,11 @@ export class ApprovalAuditStore {
     });
   }
 
-  acquireControllerLease({controllerId,leaseToken=this.nonce(),ttlMs=CONTROLLER_LEASE_TTL_MS}={}) {
-    const cleanControllerId=needText(controllerId,80,'controller id','INVALID_CONTROLLER_ID');
-    if(!OPAQUE_ID_PATTERN.test(cleanControllerId)) {
-      fail(400,'INVALID_CONTROLLER_ID','Controller id must be an opaque identifier.');
-    }
-    if(typeof leaseToken!=='string'||CONTROL_CHARS_PATTERN.test(leaseToken)||leaseToken.length<16||leaseToken.length>200) {
-      fail(400,'INVALID_LEASE_TOKEN','Controller lease token must be between 16 and 200 characters.');
-    }
-    if(!Number.isSafeInteger(ttlMs)||ttlMs<1||ttlMs>MAX_ATTEMPT_GRANT_TTL_MS) {
-      fail(400,'INVALID_TTL','Controller lease lifetime must be between 1 ms and 1 hour.');
-    }
-    const tokenHash=sha256Text(leaseToken);
+  reconcileInterrupted({ownership}={}={}) {
     return this.transaction(()=>{
       const nowMs=this.#nowMs();
       const nowIso=new Date(nowMs).toISOString();
-      const expiresAtMs=nowMs+ttlMs;
-      const expiresAt=new Date(expiresAtMs).toISOString();
-      const existing=this.db.prepare('SELECT owner_generation FROM approval_controller_state WHERE singleton=1').get();
-      const ownerGeneration=existing?existing.owner_generation+1:1;
-      this.db.prepare(
-        `INSERT INTO approval_controller_state (
-           singleton,controller_id,owner_generation,lease_token_hash,active,
-           acquired_at,acquired_at_ms,expires_at,expires_at_ms
-         ) VALUES (1,?,?,?,1,?,?,?,?)
-         ON CONFLICT(singleton) DO UPDATE SET
-           controller_id=excluded.controller_id,
-           owner_generation=excluded.owner_generation,
-           lease_token_hash=excluded.lease_token_hash,
-           active=1,
-           acquired_at=excluded.acquired_at,
-           acquired_at_ms=excluded.acquired_at_ms,
-           expires_at=excluded.expires_at,
-           expires_at_ms=excluded.expires_at_ms`
-      ).run(cleanControllerId,ownerGeneration,tokenHash,nowIso,nowMs,expiresAt,expiresAtMs);
-      return Object.freeze({
-        controllerId:cleanControllerId,
-        ownerGeneration,
-        leaseToken,
-        acquiredAt:nowIso,
-        expiresAt,
-      });
-    });
-  }
-
-  reconcileInterrupted() {
-    return this.transaction(()=>{
-      const nowMs=this.#nowMs();
-      const nowIso=new Date(nowMs).toISOString();
-      // Invalidate any pre-restart controller lease so stale controllers cannot resolve crash holds.
-      this.db.prepare('UPDATE approval_controller_state SET active=0 WHERE singleton=1').run();
+      const controller=this.#verifyControllerOwnership(ownership,nowMs);
 
       const inFlight=this.db.prepare(
         "SELECT * FROM approval_claims WHERE phase IN ('claimed','dispatching') ORDER BY claimed_at ASC"
@@ -872,15 +1335,25 @@ export class ApprovalAuditStore {
         if(recoveryState==='retry-safe')retrySafeCount++;
         else unresolvedCount++;
         this.db.prepare(
-          "UPDATE approval_claims SET phase='crash-held',recovery_state=?,reconciled_at_ms=?,updated_at=? WHERE claim_id=?"
-        ).run(recoveryState,nowMs,nowIso,row.claim_id);
+          `UPDATE approval_claims
+           SET phase='crash-held',recovery_state=?,reconciled_at_ms=?,reconciled_generation=?,updated_at=?
+           WHERE claim_id=?`
+        ).run(recoveryState,nowMs,controller.owner_generation,nowIso,row.claim_id);
         this.#audit(row.grant_id,row.claim_id,'claim.crash_held',nowIso,{
           previousPhase:row.phase,
           recoveryState,
+          controllerId:controller.controller_id,
+          ownerGeneration:controller.owner_generation,
         });
         claims.push(rowToClaim(this.db.prepare('SELECT * FROM approval_claims WHERE claim_id=?').get(row.claim_id)));
       }
-      return Object.freeze({retrySafeCount,unresolvedCount,claims:Object.freeze(claims)});
+      return Object.freeze({
+        retrySafeCount,
+        unresolvedCount,
+        controllerId:controller.controller_id,
+        ownerGeneration:controller.owner_generation,
+        claims:Object.freeze(claims),
+      });
     });
   }
 
@@ -902,61 +1375,106 @@ export class ApprovalAuditStore {
       const claim=this.#loadVerifiedClaim(claimId,loaded.grant);
       if(claim.phase!=='crash-held')fail(409,'CLAIM_NOT_HELD','This claim is not in a crash-held state.');
 
-      // 1. Verify current active controller ownership against persisted host lease state.
-      const ownership=input.ownership;
-      if(!isPlainObject(ownership)||
-         typeof ownership.controllerId!=='string'||!OPAQUE_ID_PATTERN.test(ownership.controllerId)||
-         !Number.isSafeInteger(ownership.ownerGeneration)||ownership.ownerGeneration<1||
-         typeof ownership.leaseToken!=='string'||CONTROL_CHARS_PATTERN.test(ownership.leaseToken)||
-         ownership.leaseToken.length<16||ownership.leaseToken.length>200) {
-        fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','Verifiable current controller ownership is required to release a crash hold.');
-      }
-      const controller=this.db.prepare('SELECT * FROM approval_controller_state WHERE singleton=1').get();
-      if(!controller||controller.active!==1) {
-        fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','No active controller lease is registered to authorize crash-hold release.');
-      }
-      if(nowMs>=controller.expires_at_ms) {
-        fail(409,'CONTROLLER_LEASE_EXPIRED','The controller lease has expired.');
-      }
-      if(controller.controller_id!==ownership.controllerId||
-         controller.owner_generation!==ownership.ownerGeneration||
-         controller.lease_token_hash!==sha256Text(ownership.leaseToken)||
-         (claim.reconciled_at_ms!==null&&controller.acquired_at_ms<claim.reconciled_at_ms)) {
-        fail(409,'UNVERIFIED_CONTROLLER_OWNERSHIP','Controller ownership proof does not match the current active controller lease.');
-      }
+      // 1. Verify current active fenced controller ownership.
+      const controller=this.#verifyControllerOwnership(input.ownership,nowMs,{
+        minGeneration:claim.reconciled_generation??1,
+      });
 
-      // 2. Verify positive termination or settlement evidence for the held attempt.
-      const evidence=input.evidence;
-      if(!isPlainObject(evidence)||evidence.attemptId!==claim.attempt_id) {
-        fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Crash-hold release requires positive recovery evidence matching the held attemptId.');
-      }
-      if(claim.worker_id!==null&&evidence.workerId!==claim.worker_id) {
-        fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Recovery evidence workerId does not match the dispatched worker.');
-      }
       const claimedAtMs=parseStrictIsoTimestamp(claim.claimed_at);
-
-      if(resolution==='confirmed-stopped') {
-        const hasValidWorker=typeof evidence.workerId==='string'&&!CONTROL_CHARS_PATTERN.test(evidence.workerId)&&evidence.workerId.trim().length>0;
-        const exitedAtMs=parseStrictIsoTimestamp(evidence.exitedAt);
-        const hasExitIndicator=Number.isSafeInteger(evidence.exitCode)||
-          (typeof evidence.signal==='string'&&!CONTROL_CHARS_PATTERN.test(evidence.signal)&&evidence.signal.trim().length>0);
-        if(!hasValidWorker||
-           evidence.processExited!==true||
-           evidence.cleanup!=='confirmed'||
-           !hasExitIndicator||
-           exitedAtMs===null||exitedAtMs<claimedAtMs||exitedAtMs>nowMs) {
-          fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Positive worker exit and confirmed cleanup evidence are required before releasing a crash hold.');
+      const callerEvidence=input.evidence;
+      if(callerEvidence!==undefined) {
+        if(!isPlainObject(callerEvidence)||callerEvidence.attemptId!==claim.attempt_id) {
+          fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Crash-hold evidence attemptId does not match the held claim.');
         }
+        if(claim.worker_id!==null&&callerEvidence.workerId!==undefined&&callerEvidence.workerId!==claim.worker_id) {
+          fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Crash-hold evidence workerId does not match the dispatched worker.');
+        }
+      }
+
+      let verifiedWorkerId=claim.worker_id??null;
+      let auditExtra={};
+
+      // 2. Query trusted host worker or receipt verifier (never trust caller flags or raw digests alone).
+      if(resolution==='confirmed-stopped') {
+        if(typeof this.hostVerifiers?.verifyWorkerStopped!=='function') {
+          fail(
+            409,
+            'UNVERIFIED_WORKER_STOP',
+            'Crash hold cannot be released without a trusted host worker-stop verifier.'
+          );
+        }
+        const verdict=this.hostVerifiers.verifyWorkerStopped({
+          claimId:claim.claim_id,
+          grantId:claim.grant_id,
+          attemptId:claim.attempt_id,
+          workerId:claim.worker_id??null,
+          controllerId:controller.controller_id,
+          ownerGeneration:controller.owner_generation,
+        });
+        if(!isPlainObject(verdict)||verdict.stopped!==true||verdict.cleanupConfirmed!==true) {
+          fail(409,'UNVERIFIED_WORKER_STOP','Trusted host verifier could not confirm worker exit and cleanup; crash hold remains active.');
+        }
+        const workerOk=typeof verdict.workerId==='string'&&!CONTROL_CHARS_PATTERN.test(verdict.workerId)&&verdict.workerId.trim().length>0;
+        if(!workerOk||(claim.worker_id!==null&&verdict.workerId!==claim.worker_id)) {
+          fail(409,'UNVERIFIED_WORKER_STOP','Verified worker identity does not match the dispatched worker.');
+        }
+        const hasExitIndicator=Number.isSafeInteger(verdict.exitCode)||
+          (typeof verdict.signal==='string'&&!CONTROL_CHARS_PATTERN.test(verdict.signal)&&verdict.signal.trim().length>0);
+        const exitedAtMs=parseStrictIsoTimestamp(verdict.exitedAt);
+        if(!hasExitIndicator||exitedAtMs===null||exitedAtMs<claimedAtMs||exitedAtMs>nowMs) {
+          fail(409,'UNVERIFIED_WORKER_STOP','Verified worker exit timestamp or termination status is invalid.');
+        }
+        if(callerEvidence!==undefined) {
+          if(callerEvidence.processExited===false||
+             (callerEvidence.cleanup!==undefined&&callerEvidence.cleanup!=='confirmed')||
+             (callerEvidence.workerId!==undefined&&callerEvidence.workerId!==verdict.workerId)) {
+            fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Caller recovery evidence conflicts with verified worker stop state.');
+          }
+        }
+        verifiedWorkerId=verdict.workerId;
+        auditExtra={exitedAt:verdict.exitedAt,exitCode:verdict.exitCode??null,signal:verdict.signal??null};
       } else {
         const dispatchedAtMs=parseStrictIsoTimestamp(claim.dispatched_at);
-        const settledAtMs=parseStrictIsoTimestamp(evidence.settledAt);
-        if(dispatchedAtMs===null||
-           evidence.settled!==true||
-           !['succeeded','failed','cancelled'].includes(evidence.settlementOutcome)||
-           typeof evidence.receiptDigest!=='string'||!DIGEST_PATTERN.test(evidence.receiptDigest)||
-           settledAtMs===null||settledAtMs<dispatchedAtMs||settledAtMs>nowMs) {
-          fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Verified settlement receipt evidence is required for confirmed-settled resolution.');
+        if(dispatchedAtMs===null||claim.recovery_state!=='unresolved') {
+          fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Only dispatched unresolved holds can be settled via confirmed-settled.');
         }
+        if(typeof this.hostVerifiers?.verifySettlementReceipt!=='function') {
+          fail(
+            409,
+            'UNVERIFIED_SETTLEMENT_RECEIPT',
+            'Crash hold cannot be settled without a trusted host settlement receipt verifier.'
+          );
+        }
+        const verdict=this.hostVerifiers.verifySettlementReceipt({
+          claimId:claim.claim_id,
+          grantId:claim.grant_id,
+          attemptId:claim.attempt_id,
+          workerId:claim.worker_id??null,
+          controllerId:controller.controller_id,
+          ownerGeneration:controller.owner_generation,
+        });
+        const settledAtMs=isPlainObject(verdict)?parseStrictIsoTimestamp(verdict.settledAt):null;
+        if(!isPlainObject(verdict)||
+           verdict.settled!==true||
+           !['succeeded','failed','cancelled'].includes(verdict.outcome)||
+           typeof verdict.receiptDigest!=='string'||!DIGEST_PATTERN.test(verdict.receiptDigest)||
+           settledAtMs===null||settledAtMs<dispatchedAtMs||settledAtMs>nowMs||
+           (claim.worker_id!==null&&verdict.workerId!==undefined&&verdict.workerId!==claim.worker_id)) {
+          fail(409,'UNVERIFIED_SETTLEMENT_RECEIPT','Trusted host receipt verifier could not confirm a valid settlement receipt.');
+        }
+        if(callerEvidence!==undefined) {
+          if(callerEvidence.settled===false||
+             (callerEvidence.settlementOutcome!==undefined&&callerEvidence.settlementOutcome!==verdict.outcome)||
+             (callerEvidence.receiptDigest!==undefined&&callerEvidence.receiptDigest!==verdict.receiptDigest)) {
+            fail(409,'INSUFFICIENT_RECOVERY_EVIDENCE','Caller settlement evidence conflicts with verified receipt state.');
+          }
+        }
+        verifiedWorkerId=verdict.workerId??claim.worker_id??null;
+        auditExtra={
+          settlementOutcome:verdict.outcome,
+          receiptDigest:verdict.receiptDigest,
+          settledAt:verdict.settledAt,
+        };
       }
 
       const nextPhase=resolution==='confirmed-settled'?'settled':'aborted';
@@ -967,10 +1485,11 @@ export class ApprovalAuditStore {
       this.#audit(claim.grant_id,claimId,'claim.crash_hold_resolved',nowIso,{
         resolution,
         nextPhase,
-        controllerId:ownership.controllerId,
-        ownerGeneration:ownership.ownerGeneration,
+        controllerId:controller.controller_id,
+        ownerGeneration:controller.owner_generation,
         attemptId:claim.attempt_id,
-        workerId:evidence.workerId??claim.worker_id??null,
+        workerId:verifiedWorkerId,
+        ...auditExtra,
       });
       return rowToClaim(this.db.prepare('SELECT * FROM approval_claims WHERE claim_id=?').get(claimId));
     });
@@ -999,9 +1518,7 @@ export class ApprovalAuditStore {
       }
     }
     const projectRevision=project.revision;
-    if(project.root!==null) {
-      resolveLocalRoot(project.root,{useTime:false});
-    }
+    const projectRootIdentity=this.projects.verifyProjectRootIdentity(project,{useTime:false});
     const sourceHash=input.sourceHash;
     if(typeof sourceHash!=='string'||!DIGEST_PATTERN.test(sourceHash)) {
       fail(400,'INVALID_SOURCE_HASH','Source hash must be a 64-character lowercase hex digest.');
@@ -1012,7 +1529,7 @@ export class ApprovalAuditStore {
     }
     requireOwnField(input,'accountRef','INVALID_TEXT','action grant accountRef');
     const accountRef=normalizeAccountRef(input.accountRef);
-    const approvedRoots=resolveAndVerifyRoots(project,input.approvedRoots,{useTime:false});
+    const {approvedRoots,rootIdentities}=resolveAndVerifyRootIdentities(project,input.approvedRoots,{useTime:false});
     const permissions=normalizePermissions(input.permissions);
     validateRemotePermission(destination,permissions);
     const requestedPolicy=input.policyVersion===undefined?this.policyVersion:normalizePolicyVersion(input.policyVersion);
@@ -1028,6 +1545,9 @@ export class ApprovalAuditStore {
     return this.transaction(()=>{
       const nowMs=this.#nowMs();
       const nowIso=new Date(nowMs).toISOString();
+
+      this.#checkSessionActive(sessionId);
+      this.#verifyTargetDigest(input.action,target,project,approvedRoots);
 
       if(requestId!==null) {
         const existing=this.db.prepare(
@@ -1072,10 +1592,12 @@ export class ApprovalAuditStore {
         taskVersion,
         projectId,
         projectRevision,
+        projectRootIdentity,
         sourceHash,
         routeRevision,
         accountRef,
         approvedRoots,
+        rootIdentities,
         permissions,
         requestId,
         sessionId,
@@ -1154,6 +1676,8 @@ export class ApprovalAuditStore {
       if(sessionId!==grant.sessionId) {
         fail(409,'SESSION_MISMATCH','Action grant session does not match the current authenticated session.');
       }
+      this.#checkSessionActive(sessionId);
+
       if(input.action!==grant.action)fail(409,'ACTION_MISMATCH','Grant action does not match the requested operation.');
       if(targetHash!==grant.targetHash) {
         fail(409,'TARGET_MISMATCH','The target or target digest changed after the action grant was issued.');
@@ -1172,12 +1696,15 @@ export class ApprovalAuditStore {
          JSON.stringify(permissions)!==JSON.stringify(grant.permissions)) {
         fail(409,'SCOPE_CHANGED','The approved scope changed after the action grant was issued.');
       }
-      const verifiedGrantRoots=resolveAndVerifyRoots(project,grant.approvedRoots,{useTime:true});
-      const verifiedInputRoots=resolveAndVerifyRoots(project,input.approvedRoots,{useTime:true});
-      if(JSON.stringify(verifiedInputRoots)!==JSON.stringify(grant.approvedRoots)||
+
+      const {approvedRoots:inputRoots}=resolveAndVerifyRootIdentities(project,input.approvedRoots,{useTime:true});
+      const verifiedGrantRoots=this.#verifyGrantProjectAndRoots(project,grant);
+      if(JSON.stringify(inputRoots)!==JSON.stringify(grant.approvedRoots)||
          JSON.stringify(verifiedGrantRoots)!==JSON.stringify(grant.approvedRoots)) {
         fail(409,'SCOPE_CHANGED','The approved roots changed after the action grant was issued.');
       }
+
+      this.#verifyTargetDigest(input.action,target,project,grant.approvedRoots);
 
       this.db.prepare(
         'INSERT INTO approval_action_consumptions (grant_id,consumed_at,consumed_at_ms) VALUES (?,?,?)'
@@ -1195,6 +1722,10 @@ export class ApprovalAuditStore {
     return this.transaction(()=>{
       const nowMs=this.#nowMs();
       const nowIso=new Date(nowMs).toISOString();
+      this.db.prepare(
+        'INSERT OR IGNORE INTO approval_revoked_sessions (session_id,revoked_at,revoked_at_ms,reason) VALUES (?,?,?,?)'
+      ).run(cleanSessionId,nowIso,nowMs,cleanReason);
+
       const pending=this.db.prepare(
         `SELECT g.grant_id
          FROM approval_grants g
@@ -1208,7 +1739,7 @@ export class ApprovalAuditStore {
         ).run(row.grant_id,nowIso,nowMs,cleanReason);
         this.#audit(row.grant_id,null,'grant.revoked',nowIso,{reason:cleanReason,sessionId:cleanSessionId});
       }
-      return Object.freeze({sessionId:cleanSessionId,revokedCount:pending.length});
+      return Object.freeze({sessionId:cleanSessionId,revokedCount:pending.length,sessionLocked:true});
     });
   }
 
@@ -1256,9 +1787,11 @@ export class ApprovalAuditStore {
     }
     const revocation=this.db.prepare('SELECT revoked_at,reason FROM approval_grant_revocations WHERE grant_id=?').get(grantId);
     const consumption=this.db.prepare('SELECT consumed_at FROM approval_action_consumptions WHERE grant_id=?').get(grantId);
+    const dispatch=this.db.prepare('SELECT * FROM approval_dispatches WHERE grant_id=?').get(grantId);
     return deepFreeze({
       grant:loaded.grant,
       claim:rowToClaim(claim),
+      dispatch:rowToDispatch(dispatch),
       revoked:revocation?{at:revocation.revoked_at,reason:revocation.reason}:null,
       consumedAt:consumption?.consumed_at??null,
     });
