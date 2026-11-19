@@ -1,0 +1,52 @@
+/* CydeWorks AI design tokens. Every hex is PROPOSED, not an approved brand value. */
+:root {
+  color-scheme: dark;
+
+  /* Gunmetal surfaces, darkest to lightest */
+  --surface-0: #0f1215;   /* window */
+  --surface-1: #151a1f;   /* sidebar, bars */
+  --surface-2: #1b2127;   /* panels */
+  --surface-3: #242b33;   /* raised controls, hover */
+  --surface-4: #2f3842;   /* pressed, selected fill */
+  --line: #303943;
+  --line-strong: #4a5663;
+
+  /* Bone white type scale */
+  --text: #ece8df;
+  --text-2: #bdc4cb;
+  --text-3: #98a2ac;
+
+  /* One cool accent for selection, focus and primary action */
+  --accent: #9cc4e8;
+  --accent-ink: #0d1318;
+  --accent-wash: rgba(156, 196, 232, .13);
+  --accent-glow: rgba(156, 196, 232, .22);
+  --focus: #d4e8fb;
+
+  /* Black Flag red: the mark and destructive actions only */
+  --flag: #d9483b;
+  --danger: #ff9f92;
+  --danger-fill: #b3372b;
+
+  /* Status. Always paired with a word or symbol, never color alone. */
+  --ok: #93d1a3;
+  --warn: #e8b968;
+  --ok-wash: rgba(147, 209, 163, .12);
+  --warn-wash: rgba(232, 185, 104, .13);
+  --danger-wash: rgba(255, 159, 146, .12);
+
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+
+  --text-xs: .8125rem;   /* 13px floor */
+  --text-sm: .875rem;
+  --text-md: .9375rem;   /* 15px working text */
+  --text-lg: 1.0625rem;
+  --text-xl: 1.375rem;
+
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 24px; --space-6: 32px;
+  --radius-sm: 6px; --radius: 10px; --radius-lg: 14px;
+  --control-h: 34px;
+  --shadow-raise: 0 1px 0 rgba(255, 255, 255, .04) inset, 0 1px 2px rgba(0, 0, 0, .35);
+  --shadow-dialog: 0 24px 60px rgba(0, 0, 0, .55), 0 0 0 1px rgba(255, 255, 255, .05);
+}

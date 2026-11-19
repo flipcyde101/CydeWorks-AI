@@ -1,5 +1,7 @@
 # CydeWorks AI
 
+> The sections below describe an earlier public-preview checkpoint. For the newer local source, test evidence, and remaining gates, see [the roadmap checkpoint](docs/ROADMAP.md). The default `npm start` selects the legacy interface; the Dell experience preview uses `BFE_UI=experience`.
+
 **Your AI. Your agents. Your work.**
 
 CydeWorks AI is an experimental, open-source AI workspace. The goal is to bring models, agents, workflows, permissions and usage information together while keeping the user in control. The current version is an early preview for scoped briefs and single-file change proposals, not a stable release or a finished autonomous coding product.

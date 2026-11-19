@@ -1,0 +1,3 @@
+# Preserve source bytes across checkouts. Asset verification and line-ending
+# regression fixtures depend on the exact content stored in Git.
+* -text

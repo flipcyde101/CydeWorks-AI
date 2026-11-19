@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="cydeworks-adapter" content="http">
+  <title>CydeWorks AI</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles/tokens.css">
+  <link rel="stylesheet" href="/styles/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="demo-bar" role="note" aria-label="Workspace notice">
+    <span class="demo-tag">Local workspace</span>
+    <span class="demo-text">Review the route and scope before you approve work.</span>
+    <button type="button" id="demo-open" class="btn btn-quiet">Demo controls</button>
+  </div>
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar" hidden></aside>
+    <div class="content">
+      <div id="banner" class="banner-slot"></div>
+      <main id="main" tabindex="-1"><p class="loading" role="status">Loading your workspace.</p></main>
+    </div>
+  </div>
+  <p id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+  <p id="alert" class="sr-only" role="alert"></p>
+  <noscript><p class="panel">Enable JavaScript to use the local workspace.</p></noscript>
+</body>
+</html>

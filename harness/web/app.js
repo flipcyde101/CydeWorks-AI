@@ -1,9 +1,12 @@
 import {createObserver} from './observer.js';
 import {bindExportDialog} from './export-dialog.js';
-import {summarizeUsage} from './usage.js';
+import {summarizeUsage,describeStepReceipt} from './usage.js';
 import {describeProgress,progressAnnouncement} from './progress.js';
 import {bindRemovalDialog} from './removal-dialog.js';
 import {diagnosticMessages} from './route-diagnostics.js';
+import {bindProposalEditor} from './proposal-editor.js';
+import {terminalRequest,ownsTerminal} from './terminal-request.js';
+import {bindDraftCopyDialog} from './draft-copy-dialog.js';
 const $ = id => document.getElementById(id);
 const form = $('create');
 const field = name => form.elements.namedItem(name);
@@ -13,7 +16,8 @@ let actionRevision=0;
 const resumeKey='bfe-last-task';
 const remember=id=>{try { if (id) sessionStorage.setItem(resumeKey,id); else sessionStorage.removeItem(resumeKey); } catch { /* Storage may be disabled. */ }};
 const remembered=()=>{try { return sessionStorage.getItem(resumeKey); } catch { return null; }};
-const routeKey=model=>model.engine+'/'+model.id;
+const routeBackend=model=>model.engine==='fixture'?'fixture':model.backend??'ollama';
+const routeKey=model=>JSON.stringify([model.engine,routeBackend(model),model.id]);
 
 function element(tag,text) {
   const node=document.createElement(tag);
@@ -81,9 +85,10 @@ const observer=createObserver({
     if (busy) return false;
     const id=task?.id, stamp=selection, actionStamp=actionRevision;
     if (latest.id!==id || latest.version<task.version) return false;
+    if(lease&&!ownsTerminal(latest,lease))lease=undefined;
     if (lease && active(latest.status)) {
       const held=lease;
-      try { await api('/api/tasks/'+id+'/terminal',{command:'heartbeat',lease:held}); }
+      try { await api('/api/tasks/'+id+'/terminal',terminalRequest(latest,held,'heartbeat')); }
       catch { if (lease===held && isCurrent()) lease=undefined; }
     }
     if (!isCurrent() || busy || actionStamp!==actionRevision || stamp!==selection || task?.id!==id || latest.version<task.version) return false;
@@ -139,18 +144,20 @@ function watchList() {
 }
 function showRoute() {
   const model=models.find(item=>routeKey(item)===$('model').value);
-  const destination=model?.id==='fixture'
+  const destination=model?.engine==='fixture'
     ? 'Synthetic fixture. This route generates a sample without contacting a model.'
+    : model?.backend==='llamacpp' ? 'OpenCode sends the approved request and source to llama.cpp on this computer ('+model.endpoint+'). The server controls model execution; network isolation is not verified.'
     : model ? (model.engine==='opencode'?'OpenCode → ':'')+'Ollama endpoint on this computer ('+model.endpoint+') receives the approved request and source. The server controls model execution; its settings may change, and network isolation is not verified.'
       : 'No eligible route is selected.';
-  $('destination').textContent=destination+(model?.digest?' Ollama reported this digest at preflight: '+model.digest.slice(0,12)+
+  $('destination').textContent=destination+(model?.fingerprint?' The fingerprint represents server-reported metadata, not the model weights.':
+    model?.digest?' Ollama reported this digest at preflight: '+model.digest.slice(0,12)+
     '… The model tag could change before execution.':'')+
     (model?.readiness?.reason?' '+model.readiness.reason:'');
 }
 function populateRoutes(inventory,preferred) {
   models=inventory.models;
   $('model').replaceChildren(...models.map(model=>{
-    const label=model.engine==='opencode'?'OpenCode · ':model.engine==='ollama'?'Ollama · ':'';
+    const label=model.backend==='llamacpp'?'OpenCode · llama.cpp · ':model.engine==='opencode'?'OpenCode · ':model.engine==='ollama'?'Ollama · ':'';
     const option=element('option',label+model.label+(model.quantization?' · '+model.quantization:'')+
       (model.readiness?.eligible?'':' (not ready)'));
     option.value=routeKey(model);
@@ -158,19 +165,20 @@ function populateRoutes(inventory,preferred) {
     return option;
   }));
   const unavailable=models.filter(model=>!model.readiness?.eligible).map(model=>
-    element('li',(model.engine==='opencode'?'OpenCode · ':model.engine==='ollama'?'Ollama · ':'')+
+    element('li',(model.backend==='llamacpp'?'OpenCode · llama.cpp · ':model.engine==='opencode'?'OpenCode · ':model.engine==='ollama'?'Ollama · ':'')+
       model.label+': '+(model.readiness?.reason??'Availability is unknown.')));
   const diagnosticRows=diagnosticMessages(inventory).map(message=>element('li',message));
   $('route-exclusions').replaceChildren(...diagnosticRows,...unavailable);
   const selected=models.find(model=>routeKey(model)===preferred&&model.readiness?.eligible) ??
-    models.find(model=>model.id===task?.model&&model.engine===task.attempts.at(-1)?.provider&&model.readiness?.eligible) ??
+    models.find(model=>model.id===task?.model&&model.engine===task.attempts.at(-1)?.provider&&
+      routeBackend(model)===(task.attempts.at(-1)?.backend??(task.attempts.at(-1)?.provider==='fixture'?'fixture':'ollama'))&&model.readiness?.eligible) ??
     [...models].filter(model=>model.bytes&&model.readiness?.eligible).sort((a,b)=>a.bytes-b.bytes)[0] ??
     models.find(model=>model.readiness?.eligible);
   $('model').value=selected?routeKey(selected):'';
   $('approve').checked=false;
   showRoute();
 }
-async function openTask(id) {
+async function openTask(id,{chooseRoute=false}={}) {
   releaseView();
   observer.stop();
   const stamp=++selection;
@@ -185,6 +193,7 @@ async function openTask(id) {
   lease=undefined;
   detached=false;
   populateRoutes(inventory);
+  if(chooseRoute&&task.status==='draft'){$('model').value='';$('approve').checked=false;showRoute();}
   $('compose').hidden=true;
   $('detail').hidden=false;
   render();
@@ -240,28 +249,40 @@ $('progress').after(cancel);
 
 function renderUsage() {
   const box=$('usage');
-  const expanded=new Map([...box.querySelectorAll('details')].map(node=>[node.dataset.attempt,node.open]));
-  const focused=document.activeElement?.closest('#usage details')?.dataset.attempt;
+  const expanded=new Map([...box.querySelectorAll('details[data-attempt]')].map(node=>[node.dataset.attempt,node.open]));
+  const expandedSteps=new Set([...box.querySelectorAll('details[data-steps]')].filter(node=>node.open).map(node=>node.dataset.steps));
+  const focused=document.activeElement?.closest('#usage details[data-attempt]')?.dataset.attempt;
+  const focusedSteps=document.activeElement?.closest('#usage details[data-steps]')?.dataset.steps;
   box.replaceChildren();
   if (!task.attempts.length) box.append(element('p','Usage appears after a run.'));
   const complete=task.attempts.filter(attempt=>['provider reported','OpenCode reported'].includes(attempt.usage?.evidence));
   const coverage=summarizeUsage(task.attempts);
   if (coverage.attempts) {
     box.append(element('p',coverage.attempts+' attempt(s): '+coverage.finished+' with a recorded outcome, '+coverage.unresolved+
-      ' unresolved, '+coverage.active+' active. '+coverage.reported+' have provider-reported usage.'));
+      ' unresolved, '+coverage.active+' active. '+coverage.observed+' have usage events and '+coverage.reported+' have numeric fields.'));
     if (coverage.totalElapsedMs!==null) box.append(element('p','Recorded local attempt time: '+seconds(coverage.totalElapsedMs)+
       ' across '+coverage.timed+' of '+coverage.ended+' locally ended attempt(s), including failures and retries. Unresolved work may continue beyond the recorded time.'));
-    if (coverage.missing) box.append(element('p',coverage.missing+' attempt(s) have no provider usage receipt. Missing values are not counted as zero.'));
+    if (coverage.missing) box.append(element('p',coverage.missing+' ended attempt(s) have no usable numeric usage fields. Missing values are not counted as zero.'));
     if (coverage.pending) box.append(element('p',coverage.pending+' active attempt(s) are still awaiting a final usage receipt.'));
-    const counters=element('dl');
-    definition(counters,[['Reported input tokens',coverage.counters.input],['Reported output tokens',coverage.counters.output],
-      ['Reported cached input tokens',coverage.counters.cached],['Reported reasoning tokens',coverage.counters.reasoning]].map(([label,item])=>{
-      const amount=item.overflow?'Unavailable: reported counts exceed the safe display range'
-        :item.value===null?'Unavailable':item.value.toLocaleString()+' reported';
-      return [label,amount+' across '+item.reported+' of '+item.attempts+' attempts'+
-        (item.partial?' ('+item.partial+' partial OpenCode step'+(item.partial===1?'':'s')+')':'')];
-    }));
-    box.append(counters);
+    for(const [key,title] of [['provider','Direct provider reporting'],['opencode','OpenCode engine reporting']]) {
+      const group=coverage.groups[key];
+      if(!group.attempts)continue;
+      box.append(element('h3',title));
+      const counters=element('dl');
+      const labels=key==='opencode'
+        ?[['OpenCode input, engine-defined','input'],['OpenCode output, engine-defined','output'],
+          ['OpenCode cache read','cached'],['OpenCode cache write','cacheWrite'],['OpenCode reasoning','reasoning']]
+        :[['Provider input','input'],['Provider output','output'],['Provider cache read','cached'],['Provider reasoning','reasoning']];
+      definition(counters,labels.map(([label,field])=>{
+        const item=group.counters[field];
+        const amount=item.overflow?'Unavailable: reported counts exceed the safe display range'
+          :item.value===null?'Unavailable':item.value.toLocaleString()+' reported';
+        return [label,amount+' across '+item.reported+' of '+item.attempts+' attempts'+
+          (item.partial?' ('+item.partial+' OpenCode attempt'+(item.partial===1?'':'s')+' with partial coverage)':'')];
+      }));
+      box.append(counters);
+    }
+    box.append(element('p','OpenCode can normalize token categories and use zero for missing provider values. Its figures are engine-reported, not a provider invoice, and are not combined with direct provider figures.'));
     box.append(element('p','Cache and reasoning values are provider-reported categories. They may overlap other token counts and should not be added together.'));
     box.append(element('p','The endpoint is on this computer, but any upstream destination and provider charges are not independently verified. Electricity and hardware costs are not included.'));
   }
@@ -280,27 +301,52 @@ function renderUsage() {
     detail.open=expanded.get(attempt.id) ?? i===task.attempts.length-1;
     detail.append(element('summary','Attempt '+(i+1)+' · '+attempt.model+' · '+(labels[attempt.status]??attempt.status)));
     const usage=attempt.usage;
+    const openCodeUsage=usage?.evidence==='OpenCode reported';
     const dl=element('dl');
+    const stepReceipt=describeStepReceipt(usage);
     definition(dl,[['Evidence',usage?.evidence],['Receipt coverage',usage?.evidence==='OpenCode reported'
-      ? 'Last reported OpenCode step. Earlier or missing steps are not included.'
+      ? stepReceipt?'Totals cover recorded steps only when identity and the relevant counts allow. Missing events are not known.'
+        :'Last reported OpenCode step. Earlier or missing steps are not included.'
       : usage?.evidence==='provider reported'?'Final provider response; missing fields remain unavailable.':null],
-      ['Route',attempt.provider==='fixture'?'Synthetic fixture':attempt.provider==='opencode'?'OpenCode → loopback Ollama':'Loopback Ollama endpoint'],
-      ['Quantization',attempt.quantization],['Input tokens',usage?.input],['Cached input tokens',usage?.cached],
-      ['Output tokens',usage?.output],['Model load',seconds(usage?.loadMs)],['Prompt evaluation',seconds(usage?.promptMs)],
+      ['Route',attempt.provider==='fixture'?'Synthetic fixture':attempt.backend==='llamacpp'?'OpenCode → loopback llama.cpp':
+        attempt.provider==='opencode'?'OpenCode → loopback Ollama':'Loopback Ollama endpoint'],
+      [attempt.backend==='llamacpp'?'Quantization (server reported)':'Quantization',attempt.quantization],
+      [openCodeUsage?'OpenCode input, engine-defined':'Input tokens',usage?.input],
+      ['Cached input tokens',usage?.cached],[openCodeUsage?'OpenCode cache write':'Cache write tokens',usage?.cacheWrite],
+      [openCodeUsage?'OpenCode output, engine-defined':'Output tokens',usage?.output],['Model load',seconds(usage?.loadMs)],['Prompt evaluation',seconds(usage?.promptMs)],
       ['Reported reasoning tokens',usage?.reasoning],
       ['Generation',seconds(usage?.generationMs)],['Attempt wall time',seconds(attempt.elapsedMs)],
       ['Provider reported total',seconds(usage?.providerMs)],
       ['Generation rate',usage?.generationMs && usage.output!=null?(usage.output*1000/usage.generationMs).toFixed(2)+' tokens/s':null],
       ['Provider charge',usage?.providerCharge===0?'Legacy zero value; provider charge not independently verified':null]]);
     detail.append(dl);
+    if(stepReceipt) {
+      const steps=element('details');
+      steps.dataset.steps=attempt.id;
+      steps.open=expandedSteps.has(attempt.id);
+      steps.append(element('summary','Observed OpenCode steps ('+stepReceipt.items.length+' recorded)'));
+      for(const message of stepReceipt.notes)steps.append(element('p',message));
+      const list=element('ol');
+      for(const item of stepReceipt.items) {
+        const row=element('li');
+        const metrics=element('dl');
+        definition(metrics,[['OpenCode input, engine-defined',item.input],['OpenCode output, engine-defined',item.output],
+          ['Cache read tokens',item.cached],['Cache write tokens',item.cacheWrite],['Reasoning tokens',item.reasoning]]);
+        row.append(metrics);
+        list.append(row);
+      }
+      steps.append(list);
+      detail.append(steps);
+    }
     box.append(detail);
-    if (focused===attempt.id) detail.querySelector('summary').focus({preventScroll:true});
+    if (focusedSteps===attempt.id) detail.querySelector('details[data-steps] summary')?.focus({preventScroll:true});
+    else if (focused===attempt.id) detail.querySelector('summary').focus({preventScroll:true});
   }
 }
 function renderTerminal(attempt) {
   const openCode=attempt?.provider==='opencode';
   const running=openCode && active(task.status);
-  if (!running) lease=undefined;
+  if (!running||!ownsTerminal(task,lease)) lease=undefined;
   $('terminal').hidden=!openCode;
   $('terminal-owner').textContent=connection!=='connected' ? 'Read-only · connection unverified'
     : lease ? 'You have control' : (task.live?.owner==='Operator' ? 'Another view has control' : 'Read-only');
@@ -317,7 +363,7 @@ function renderTerminal(attempt) {
   $('terminal-detach').hidden=detached;
   $('terminal-attach').hidden=!detached;
 }
-const control=(command,confirm=false)=>api(path()+'/terminal',{command,lease,confirm});
+const control=(command,confirm=false)=>api(path()+'/terminal',terminalRequest(task,lease,command,confirm));
 function releaseView() {
   if (!task || !lease) return;
   void control('detach').catch(()=>{});
@@ -326,7 +372,9 @@ function releaseView() {
 $('terminal-take').onclick=()=>act(async()=>{
   const takeover=task.live?.owner==='Operator';
   if (takeover && !window.confirm('Move terminal control from the other view to this view?')) return;
-  lease=(await control('take',takeover)).lease;
+  lease=await control('take',takeover);
+  task.live.control={attemptId:lease.attemptId,generation:lease.generation,owner:'Operator',closed:false};
+  task.live.owner='Operator';
   render();
 });
 $('terminal-release').onclick=()=>act(async()=>{
@@ -344,12 +392,15 @@ $('terminal-stop').onclick=()=>act(async()=>{
   render();
 });
 $('terminal-detach').onclick=()=>act(async()=>{
-  if (lease) await control('detach');
+  const held=lease;
   lease=undefined;
   detached=true;
-  task=await api(path());
   render();
   $('terminal-attach').focus({preventScroll:true});
+  // Detach is local observation state even if releasing the old lease fails.
+  if(held)await api(path()+'/terminal',terminalRequest(task,held,'detach'));
+  task=await api(path());
+  render();
 });
 $('terminal-attach').onclick=()=>{detached=false;render();$('terminal-detach').focus({preventScroll:true});};
 function render() {
@@ -368,6 +419,11 @@ function render() {
   $('result').hidden=!attempt?.artifact;
   if (attempt?.artifact) {
     $('summary').textContent=attempt.artifact.summary;
+    const originalRaw=attempt.originalArtifact?.rawContent??attempt.artifact.rawContent;
+    $('raw-proposal').hidden=!originalRaw;
+    $('raw-proposal-content').textContent=originalRaw??'';
+    $('original-proposal').hidden=!attempt.originalArtifact?.content;
+    $('original-proposal-content').textContent=attempt.originalArtifact?.content??'';
     $('before').textContent=task.source;
     $('artifact').textContent=attempt.artifact.content;
     $('patch-review').hidden=!attempt.artifact.patch;
@@ -379,13 +435,14 @@ function render() {
       return li;
     }));
     $('accept').hidden=$('reject').hidden=task.status!=='review';
+    $('edit-proposal').hidden=task.status!=='review';
     $('accept').disabled=attempt.checks.some(check=>!check.pass);
     $('download').hidden=task.status!=='accepted';
     $('download-patch').hidden=task.status!=='accepted'||!attempt.artifact.patch;
   }
   renderUsage();
   $('events').replaceChildren(...task.events.map(event=>element('li',new Date(event.at).toLocaleString()+' · '+event.event.replaceAll('.',' / ').replaceAll('_',' '))));
-  for (const id of ['run-button','terminal-take','terminal-release','terminal-status','terminal-stop','edit','reject']) {
+  for (const id of ['run-button','terminal-take','terminal-release','terminal-status','terminal-stop','edit','edit-proposal','reject','copy-task']) {
     $(id).disabled=connection!=='connected'||needsReconcile;
   }
   cancel.disabled=connection!=='connected'||needsReconcile;
@@ -453,7 +510,7 @@ $('run').onsubmit=event=>{
     const route=models.find(model=>routeKey(model)===$('model').value);
     if (!route?.readiness?.eligible) throw Error('Select an eligible route or refresh the route list.');
     task=await api(path()+'/run',{version:task.version,sourceHash:task.sourceHash,model:route.id,engine:route.engine,
-      modelDigest:route.digest??null,approve:$('approve').checked});
+      backend:routeBackend(route),modelDigest:route.digest??null,modelFingerprint:route.fingerprint??null,approve:$('approve').checked});
     detached=false;
     $('approve').checked=false;
     render();
@@ -466,8 +523,22 @@ for (const [id,decision] of [['accept','accepted'],['reject','rejected']]) $(id)
   render();
   await refreshList();
 });
+bindProposalEditor({openButton:$('edit-proposal'),dialog:$('proposal-dialog'),form:$('proposal-form'),
+  content:$('proposal-content'),status:$('proposal-status'),saveButton:$('proposal-save'),cancelButton:$('proposal-cancel'),
+  normalizeChoice:$('proposal-normalize'),normalizeGroup:$('proposal-normalize-group'),
+  current:()=>task?{id:task.id,version:task.version,status:task.status,artifact:task.attempts.at(-1)?.artifact}:null,
+  submit:(id,body)=>api('/api/tasks/'+id+'/revise',body),onSaved:(id,result)=>{
+    if(task?.id===id && result.version>=task.version) {task=result;render();note('Edited proposal saved for review.');}
+    void refreshList().catch(()=>note('Edited proposal saved, but the task list could not be refreshed.'));
+  }});
 $('download').onclick=()=>download(task.kind==='change'?'proposed-'+task.filename:'brief.md',task.attempts.at(-1).artifact.content);
 $('download-patch').onclick=()=>download('proposal.patch',task.attempts.at(-1).artifact.patch);
+bindDraftCopyDialog({openButton:$('copy-task'),dialog:$('copy-dialog'),target:$('copy-target'),status:$('copy-status'),
+  copyButton:$('copy-submit'),checkButton:$('copy-check'),retryButton:$('copy-retry'),closeButton:$('copy-close'),current:()=>task,
+  submit:(id,body)=>api('/api/tasks/'+id+'/copy-draft',body),
+  lookup:requestId=>api('/api/draft-copies/'+requestId),onCopied:id=>{
+    void act(async()=>{await openTask(id,{chooseRoute:true});note('Opened the saved copy. Review its scope and select a route before approving a run.');});
+  }});
 bindExportDialog({openButton:$('export'),dialog:$('export-dialog'),mode:$('export-mode'),
   description:$('export-description'),status:$('export-status'),preview:$('export-preview'),
   saveButton:$('export-save'),closeButton:$('export-close'),currentTaskId:()=>task?.id,
@@ -482,7 +553,7 @@ bindRemovalDialog({openButton:$('remove-task'),dialog:$('removal-dialog'),target
       form.reset();
       for(const name of ['title','request','source','filename','expected'])field(name).value='';
       field('kind').onchange();
-      for(const name of ['task-title','status','scope-meta','source','before','artifact','summary','checks','patch','events','usage','progress'])
+      for(const name of ['task-title','status','scope-meta','source','before','artifact','summary','checks','patch','events','usage','progress','original-proposal-content','raw-proposal-content'])
         $(name).replaceChildren();
       $('detail').hidden=true;$('compose').hidden=false;
     }

@@ -1,3 +1,5 @@
+import {sanitizeOpenCodeUsage} from './opencode-usage.mjs';
+
 // An uncertain external run must never become retryable merely because the
 // local service restarted or its connection closed.
 export function retryHold(task) {
@@ -45,10 +47,9 @@ export function recordOutcomeUncertainty(attempt,at) {
 }
 
 export function recordObservedUsage(attempt,error) {
-  const usage=error?.partialUsage;
-  if (attempt.provider!=='opencode' || usage?.evidence!=='OpenCode reported') return false;
-  const count=value=>Number.isSafeInteger(value)&&value>=0?value:null;
-  attempt.usage={evidence:'OpenCode reported',input:count(usage.input),output:count(usage.output),
-    cached:count(usage.cached),reasoning:count(usage.reasoning),generationMs:null,loadMs:null,providerCharge:null};
+  if (attempt.provider!=='opencode') return false;
+  const usage=sanitizeOpenCodeUsage(error?.partialUsage);
+  if(!usage)return false;
+  attempt.usage=usage;
   return true;
 }

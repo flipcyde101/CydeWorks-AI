@@ -1,0 +1,440 @@
+{
+  "routerId": "synthetic-example-router-with-deliberate-flaws",
+  "evaluatedAt": "2026-11-16T12:00:00Z",
+  "decisions": [
+    {
+      "caseId": "CASE-001",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-local-fast",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-002",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-demanding-verified",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-003",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-cap-full",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-004",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "MISSING_CAPABILITY"
+      ]
+    },
+    {
+      "caseId": "CASE-005",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-remote-cheap",
+      "reasonCodes": [
+        "LOWEST_COST"
+      ],
+      "notes": "Deliberately flawed example: cheap remote route chosen for local_only task."
+    },
+    {
+      "caseId": "CASE-006",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "LOCAL_ONLY_BLOCKED"
+      ]
+    },
+    {
+      "caseId": "CASE-007",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-remote-ok",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-008",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-true-local",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-009",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "BACKEND_LOCALITY_MISMATCH"
+      ]
+    },
+    {
+      "caseId": "CASE-010",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-ready",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-011",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "STALE_READINESS"
+      ]
+    },
+    {
+      "caseId": "CASE-012",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-verified-ready",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-013",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-sub-available",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-014",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "UNKNOWN_QUOTA"
+      ]
+    },
+    {
+      "caseId": "CASE-015",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-metered-fallback",
+      "reasonCodes": [
+        "FALLBACK_USED"
+      ],
+      "notes": "Deliberately flawed example: unapproved metered fallback selected."
+    },
+    {
+      "caseId": "CASE-016",
+      "decisionType": "request_approval",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "SPENDING_APPROVAL_REQUIRED"
+      ]
+    },
+    {
+      "caseId": "CASE-017",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-within-budget",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-018",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-exact-limit",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-019",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-local-zero",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-020",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-readwrite",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-021",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-readonly-fast",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-022",
+      "decisionType": "request_approval",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "APPROVAL_EXPIRED"
+      ]
+    },
+    {
+      "caseId": "CASE-023",
+      "decisionType": "request_approval",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "APPROVAL_EXPIRED"
+      ]
+    },
+    {
+      "caseId": "CASE-024",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-unchanged",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-025",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-drifted-model",
+      "reasonCodes": [
+        "LABEL_MATCHED"
+      ],
+      "notes": "Deliberately flawed example: drifted model identity selected."
+    },
+    {
+      "caseId": "CASE-026",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "MODEL_IDENTITY_DRIFT"
+      ]
+    },
+    {
+      "caseId": "CASE-027",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-unknown-cost",
+      "reasonCodes": [
+        "ASSUMED_FREE"
+      ],
+      "recordedCost": {
+        "amountMicros": 0,
+        "currency": "USD",
+        "basis": "explicit_zero"
+      },
+      "notes": "Deliberately flawed example: unknown cost coerced to 0."
+    },
+    {
+      "caseId": "CASE-028",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-sub-zero",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-029",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "UNKNOWN_COST"
+      ]
+    },
+    {
+      "caseId": "CASE-030",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-billed",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-031",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-est-under",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-032",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-usd",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-033",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "CURRENCY_MISMATCH"
+      ]
+    },
+    {
+      "caseId": "CASE-034",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-healthy",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-035",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-clean",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-036",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "UNKNOWN_READINESS"
+      ]
+    },
+    {
+      "caseId": "CASE-037",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-tie-a",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-038",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "NO_ELIGIBLE_ROUTE"
+      ],
+      "notes": "Valid hold when zero routes qualify."
+    },
+    {
+      "caseId": "CASE-039",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-fast",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-040",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-verified",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-041",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "INSUFFICIENT_QUALITY_EVIDENCE"
+      ]
+    },
+    {
+      "caseId": "CASE-042",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-seq-1",
+      "reasonCodes": [
+        "SEQUENTIAL_EXECUTION_ENFORCED"
+      ]
+    },
+    {
+      "caseId": "CASE-043",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-writer",
+      "reasonCodes": [
+        "SEQUENTIAL_EXECUTION_ENFORCED"
+      ]
+    },
+    {
+      "caseId": "CASE-044",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-exact-ttl",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-045",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "UNKNOWN_BACKEND_LOCALITY"
+      ]
+    },
+    {
+      "caseId": "CASE-046",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-verified-loc",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-047",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "MISSING_IDENTITY_EVIDENCE"
+      ]
+    },
+    {
+      "caseId": "CASE-048",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "CONTRADICTORY_IDENTITY_EVIDENCE"
+      ]
+    },
+    {
+      "caseId": "CASE-049",
+      "decisionType": "request_approval",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "APPROVAL_EXPIRED"
+      ]
+    },
+    {
+      "caseId": "CASE-050",
+      "decisionType": "request_approval",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "SPENDING_APPROVAL_REQUIRED"
+      ]
+    },
+    {
+      "caseId": "CASE-051",
+      "decisionType": "hold",
+      "selectedRouteId": null,
+      "reasonCodes": [
+        "UNKNOWN_COST"
+      ]
+    },
+    {
+      "caseId": "CASE-052",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-local-a",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    },
+    {
+      "caseId": "CASE-053",
+      "decisionType": "select_route",
+      "selectedRouteId": "route-uncapped-unknown-usd",
+      "reasonCodes": [
+        "ELIGIBLE_ROUTE"
+      ]
+    }
+  ]
+}

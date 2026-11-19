@@ -1,0 +1,45 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import {terminalWorkspace} from './test-support/terminal-workspace.mjs';
+import {validateEvaluationResult} from './router-evaluation-contract.mjs';
+
+test('authenticated readiness and evaluation HTTP flows preserve a running task',{timeout:20000},async t=>{
+  const {request,path}=await terminalWorkspace(t);
+  const before=await (await request(path)).json();
+  const baselineEvents=JSON.stringify(before.events),version=before.version;
+  assert.equal((await request(path+'/readiness',undefined,{authenticated:false})).status,401);
+  assert.equal((await request(path+'/readiness',undefined,{originHeader:'https://untrusted.invalid'})).status,403);
+  const response=await request(path+'/readiness');assert.equal(response.status,200);
+  const readiness=await response.json();
+  assert.equal(readiness.executionAuthorized,false);assert.equal(readiness.taskVersion,version);
+  assert.equal(readiness.connections.length,2);
+  assert.ok(readiness.connections.every(row=>row.qualification.productionEligible===false));
+  assert.doesNotMatch(JSON.stringify(readiness),/Synthetic terminal contention|Return After/);
+  assert.equal((await request('/api/tasks/00000000-0000-0000-0000-000000000000/readiness')).status,404);
+  const dataset=JSON.parse(await readFile(new URL('./test-support/router-evaluation-v04/routing-cases.json',import.meta.url)));
+  const decisionsPayload=JSON.parse(await readFile(new URL('./test-support/router-evaluation-v04/example-decisions.json',import.meta.url)));
+  dataset.cases=dataset.cases.slice(0,1);decisionsPayload.decisions=decisionsPayload.decisions.slice(0,1);
+  const body={dataset,decisionsPayload};
+  assert.equal((await request('/api/router/evaluate',body,{authenticated:false})).status,401);
+  assert.equal((await request('/api/router/evaluate',body,{originHeader:'https://untrusted.invalid'})).status,403);
+  const start=Date.now();
+  const evaluation=await request('/api/router/evaluate',body);assert.equal(evaluation.status,200);
+  const result=await evaluation.json();
+  assert.equal(result.executionAuthorized,false);assert.equal(result.report.ok,true);
+  assert.equal(result.report.authoritativeAuthorization,false);
+  assert.equal(validateEvaluationResult(result.report).valid,true);
+  assert.ok(Date.parse(result.report.evaluatedAt)>=start);
+  assert.ok(Date.parse(result.report.evaluatedAt)<=Date.now());
+  assert.equal((await request('/api/router/evaluate',{...body,evaluatedAt:'2020-01-01T00:00:00Z'})).status,400);
+  assert.equal((await request('/api/router/evaluate',{padding:'x'.repeat(48001)})).status,413);
+  // A valid failure report still completes evaluation. It cannot dispatch work.
+  const duplicate={...body,decisionsPayload:{...decisionsPayload,decisions:[...decisionsPayload.decisions,...decisionsPayload.decisions]}};
+  const failed=await (await request('/api/router/evaluate',duplicate)).json();
+  assert.equal(failed.ok,true);assert.equal(failed.report.overallVerdict,'fail_integrity');
+  assert.equal(failed.executionAuthorized,false);
+  const after=await (await request(path)).json();
+  assert.equal(after.version,version);assert.equal(JSON.stringify(after.events),baselineEvents);
+  assert.equal(after.attempts.length,before.attempts.length);
+  assert.equal(after.status,'running');
+});

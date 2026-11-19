@@ -26,7 +26,7 @@ export function previewRemoval(task,{secret,now=Date.now(),active=false}) {
   const preview={scope,title:task.title,allowed:!hold,reason:hold,
     removes:['The task record, including its title, request, source snapshot, proposals, checks, usage and task history, from the active workspace database.'],
     retains:['Possible OpenCode working files in the local state folder.',
-      'Other tasks, the access file, backups, provider copies and a minimal pseudonymous removal audit.'],
+      'Other tasks (including saved copies), the access file, backups, provider copies, a minimal pseudonymous removal audit and draft-copy request references containing task IDs and source versions but no task content.'],
     limitations:['Database pages, journals and backups may retain recoverable copies. This action is not secure erasure.',
       'Local removal does not delete data held by a model provider.'],version:task.version};
   if(!hold) {

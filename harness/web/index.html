@@ -61,6 +61,7 @@ The team has not decided who will approve the final checklist.</textarea></label
           <dl id="scope-meta"></dl>
           <p>Source snapshot</p><pre id="source"></pre>
           <button id="edit" type="button">Edit draft scope</button>
+          <button id="copy-task" type="button">Copy as new draft</button>
           <form id="run">
             <label>Route<select id="model" required></select></label>
             <button id="refresh-routes" type="button">Refresh routes</button>
@@ -73,6 +74,8 @@ The team has not decided who will approve the final checklist.</textarea></label
         <section id="result" class="panel" hidden>
           <h2>Review proposal</h2>
           <p id="summary"></p>
+          <details id="raw-proposal" hidden><summary>Original OpenCode output</summary><pre id="raw-proposal-content"></pre></details>
+          <details id="original-proposal" hidden><summary>Original proposal before your edits</summary><pre id="original-proposal-content"></pre></details>
           <div id="comparison">
             <div><h3>Approved source</h3><pre id="before"></pre></div>
             <div><h3 id="proposal-label">Proposed result</h3><pre id="artifact"></pre></div>
@@ -81,6 +84,7 @@ The team has not decided who will approve the final checklist.</textarea></label
           <p id="review-guidance" class="muted">These are structural checks only. Review accuracy, source support and whether the result actually completes your request before accepting.</p>
           <details id="patch-review" hidden><summary>Unified patch</summary><pre id="patch"></pre></details>
           <div class="actions">
+            <button id="edit-proposal" type="button">Edit proposal</button>
             <button id="accept" class="primary">Accept proposal</button><button id="reject">Reject</button>
             <button id="download" hidden>Download accepted result</button>
             <button id="download-patch" hidden>Download patch</button>
@@ -91,6 +95,26 @@ The team has not decided who will approve the final checklist.</textarea></label
       </section>
     </main>
   </div>
+  <dialog id="copy-dialog" aria-labelledby="copy-title">
+    <h2 id="copy-title">Copy as new draft</h2>
+    <p id="copy-target"></p>
+    <p>Copies the original request, source snapshot, workflow, filename and expected text into a separate local task. It does not use the generated proposal as the new source.</p>
+    <p>Model routes, approvals, attempts, results, checks, usage and terminal control are not copied. Nothing runs until you select a route and approve the new draft.</p>
+    <p id="copy-status" role="status" aria-live="polite"></p>
+    <p>Pending request identifiers are kept in this tab to recover a lost response after reload. They contain no request or source text.</p>
+    <div class="actions"><button id="copy-submit" class="primary">Save new draft</button><button id="copy-check" hidden>Check copy result</button><button id="copy-retry" hidden>Retry same request</button><button id="copy-close">Cancel</button></div>
+  </dialog>
+  <dialog id="proposal-dialog" aria-labelledby="proposal-dialog-title">
+    <form id="proposal-form">
+      <h2 id="proposal-dialog-title">Edit proposal</h2>
+      <p>The original proposal stays in this local task. Saving updates the review candidate and reruns basic checks. It does not modify a file on your computer.</p>
+      <label>Edited proposal<textarea id="proposal-content" rows="14" maxlength="12000" required></textarea></label>
+      <p>The 12,000-character limit includes restored line endings.</p>
+      <label id="proposal-normalize-group" class="check" hidden><input id="proposal-normalize" type="checkbox"> Normalize mixed line endings to LF when saving this edit.</label>
+      <p id="proposal-status" role="status" aria-live="polite"></p>
+      <div class="actions"><button id="proposal-save" class="primary" type="submit">Save for review</button><button id="proposal-cancel" type="button">Cancel</button></div>
+    </form>
+  </dialog>
   <dialog id="export-dialog" aria-labelledby="export-title">
     <h2 id="export-title">Preview metadata export</h2>
     <p class="muted">Review exactly what will be downloaded. This does not remove data from your workspace or provider.</p>

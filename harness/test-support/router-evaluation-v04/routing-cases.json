@@ -1,0 +1,5379 @@
+{
+  "contractStatus": "provisional",
+  "datasetVersion": "0.4.0-provisional",
+  "defaultEvaluatedAt": "2026-11-16T12:00:00Z",
+  "isSynthetic": true,
+  "cases": [
+    {
+      "caseId": "CASE-001",
+      "category": "task_complexity",
+      "description": "Simple formatting task prefers fast zero-cost local route over heavy remote route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-001",
+        "title": "Format synthetic config file",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-local-fast",
+          "adapterLabel": "local-fast-adapter",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 180,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-remote-heavy",
+          "adapterLabel": "remote-heavy-adapter",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-frontier-v2",
+          "expectedModelId": "synth-frontier-v2",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 250000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 2200,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-local-fast",
+          "route-remote-heavy"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-local-fast"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "low",
+        "rationale": "Both routes are safe; the fast local zero-cost route is preferred for a simple task."
+      }
+    },
+    {
+      "caseId": "CASE-002",
+      "category": "task_complexity",
+      "description": "Demanding multi-file refactor requires architecture_reasoning capability absent from simple route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-002",
+        "title": "Refactor multi-module synthetic state machine",
+        "complexity": "demanding",
+        "requiredCapabilities": [
+          "code_edit",
+          "architecture_reasoning"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "sufficient",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-simple-only",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 150,
+          "qualityEvidence": "insufficient",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-demanding-verified",
+          "adapterLabel": "remote-architect-adapter",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-architect-v3",
+          "expectedModelId": "synth-architect-v3",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "architecture_reasoning"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 400000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 1900,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-demanding-verified"
+        ],
+        "disallowedRouteIds": [
+          "route-simple-only"
+        ],
+        "preferredRouteIds": [
+          "route-demanding-verified"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Simple route lacks architecture_reasoning and verified quality evidence."
+      }
+    },
+    {
+      "caseId": "CASE-003",
+      "category": "capabilities",
+      "description": "Task requires structured_json and tool_use; only route-cap-full qualifies.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-003",
+        "title": "Emit structured JSON patch plan",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit",
+          "structured_json",
+          "tool_use"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-cap-partial",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-cap-full",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json",
+            "tool_use"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-cap-full"
+        ],
+        "disallowedRouteIds": [
+          "route-cap-partial"
+        ],
+        "preferredRouteIds": [
+          "route-cap-full"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Route missing tool_use cannot satisfy task requirements."
+      }
+    },
+    {
+      "caseId": "CASE-004",
+      "category": "capabilities",
+      "description": "No candidate supports required long_context_128k capability; router must hold.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-004",
+        "title": "Analyze large synthetic monorepo trace",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit",
+          "long_context_128k"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-a",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-b",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-a",
+          "route-b"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "MISSING_CAPABILITY"
+        ],
+        "severity": "high",
+        "rationale": "No candidate satisfies long_context_128k, so holding is required."
+      }
+    },
+    {
+      "caseId": "CASE-005",
+      "category": "local_only_boundary",
+      "description": "Local-only task must reject cheap remote route and select local route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-005",
+        "title": "Audit internal synthetic compliance rules",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-remote-cheap",
+          "adapterLabel": "remote-economy-adapter",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-remote-mini",
+          "expectedModelId": "synth-remote-mini",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 10000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 120,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-local-compliant",
+          "adapterLabel": "local-workstation-adapter",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 650,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-local-compliant"
+        ],
+        "disallowedRouteIds": [
+          "route-remote-cheap"
+        ],
+        "preferredRouteIds": [
+          "route-local-compliant"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "critical",
+        "rationale": "Cheap remote route violates local_only data boundary."
+      }
+    },
+    {
+      "caseId": "CASE-006",
+      "category": "local_only_boundary",
+      "description": "Local-only task with only remote routes available must hold.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-006",
+        "title": "Summarize private synthetic incident log",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-remote-1",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 50000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-remote-1"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "LOCAL_ONLY_BLOCKED"
+        ],
+        "severity": "critical",
+        "rationale": "No local route exists for local_only task."
+      }
+    },
+    {
+      "caseId": "CASE-007",
+      "category": "local_only_boundary",
+      "description": "Remote-allowed task may use remote route when local route is unavailable.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-007",
+        "title": "Draft public synthetic changelog",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-local-down",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "failed",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-remote-ok",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 80000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-remote-ok"
+        ],
+        "disallowedRouteIds": [
+          "route-local-down"
+        ],
+        "preferredRouteIds": [
+          "route-remote-ok"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "medium",
+        "rationale": "Remote data boundary is permitted and local route is down."
+      }
+    },
+    {
+      "caseId": "CASE-008",
+      "category": "adapter_locality_mismatch",
+      "description": "Adapter declares local locality but actually proxies to a remote backend on local_only task.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-008",
+        "title": "Inspect local-only synthetic key-rotation script",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-spoofed-local",
+          "adapterLabel": "local-bridge-proxy",
+          "declaredLocality": "local",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-true-local",
+          "adapterLabel": "native-local-runtime",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-true-local"
+        ],
+        "disallowedRouteIds": [
+          "route-spoofed-local"
+        ],
+        "preferredRouteIds": [
+          "route-true-local"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "critical",
+        "rationale": "Actual backend locality takes precedence over adapter label."
+      }
+    },
+    {
+      "caseId": "CASE-009",
+      "category": "adapter_locality_mismatch",
+      "description": "Only candidate is a local-labeled adapter forwarding to remote backend; hold required.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-009",
+        "title": "Process local-only synthetic fixture",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-spoofed-only",
+          "adapterLabel": "local-shim-v1",
+          "declaredLocality": "local",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-spoofed-only"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "BACKEND_LOCALITY_MISMATCH"
+        ],
+        "severity": "critical",
+        "rationale": "Spoofed local adapter cannot be used for local_only data."
+      }
+    },
+    {
+      "caseId": "CASE-010",
+      "category": "readiness_evidence",
+      "description": "Route with missing readiness timestamp must not be selected.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-010",
+        "title": "Run synthetic lint check",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-missing-readiness",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "missing",
+            "checkedAt": null,
+            "maxAgeSeconds": 600,
+            "source": "none"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-ready",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-ready"
+        ],
+        "disallowedRouteIds": [
+          "route-missing-readiness"
+        ],
+        "preferredRouteIds": [
+          "route-ready"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Missing readiness evidence disqualifies route-missing-readiness."
+      }
+    },
+    {
+      "caseId": "CASE-011",
+      "category": "readiness_evidence",
+      "description": "Route with stale readiness evidence (older than maxAgeSeconds) must be rejected.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-011",
+        "title": "Generate synthetic test stub",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-stale",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T10:00:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-stale"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "STALE_READINESS"
+        ],
+        "severity": "high",
+        "rationale": "Readiness probe is 7200s old, exceeding maxAgeSeconds of 600s."
+      }
+    },
+    {
+      "caseId": "CASE-012",
+      "category": "readiness_evidence",
+      "description": "Contradictory readiness evidence between probes must be rejected.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-012",
+        "title": "Parse synthetic AST",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-contradictory",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "contradictory",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "dual_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-verified-ready",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-verified-ready"
+        ],
+        "disallowedRouteIds": [
+          "route-contradictory"
+        ],
+        "preferredRouteIds": [
+          "route-verified-ready"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Contradictory readiness must not be trusted."
+      }
+    },
+    {
+      "caseId": "CASE-013",
+      "category": "subscription_quota",
+      "description": "Exhausted subscription quota disqualifies route even if readiness is ready.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-013",
+        "title": "Review synthetic PR diff",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-sub-exhausted",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "subscription",
+            "status": "exhausted"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-sub-available",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "subscription",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-sub-available"
+        ],
+        "disallowedRouteIds": [
+          "route-sub-exhausted"
+        ],
+        "preferredRouteIds": [
+          "route-sub-available"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Exhausted subscription route cannot accept new work."
+      }
+    },
+    {
+      "caseId": "CASE-014",
+      "category": "subscription_quota",
+      "description": "Unknown subscription quota must not be assumed available when no other route qualifies.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-014",
+        "title": "Generate synthetic migration notes",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-sub-unknown",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "subscription",
+            "status": "unknown"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-sub-unknown"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "UNKNOWN_QUOTA"
+        ],
+        "severity": "medium",
+        "rationale": "Unknown quota status cannot be treated as available."
+      }
+    },
+    {
+      "caseId": "CASE-015",
+      "category": "metered_fallback",
+      "description": "Exhausted subscription with metered fallback and unapproved budget must request approval or hold.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-015",
+        "title": "Refactor synthetic helper module",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": null,
+          "currency": "USD",
+          "approvalStatus": "unapproved",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-sub-empty",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "subscription",
+            "status": "exhausted"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-metered-fallback",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 150000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "request_approval",
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-sub-empty",
+          "route-metered-fallback"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "SPENDING_APPROVAL_REQUIRED"
+        ],
+        "severity": "critical",
+        "rationale": "Metered fallback requires explicit spending approval."
+      }
+    },
+    {
+      "caseId": "CASE-016",
+      "category": "metered_fallback",
+      "description": "Metered fallback with unknown cost and unapproved budget must not proceed.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-016",
+        "title": "Build synthetic API client",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": null,
+          "currency": "USD",
+          "approvalStatus": "unapproved",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-metered-unknown-cost",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": null,
+            "currency": "USD",
+            "basis": "unknown",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "request_approval",
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-metered-unknown-cost"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "SPENDING_APPROVAL_REQUIRED"
+        ],
+        "severity": "critical",
+        "rationale": "Unapproved metered route with unknown cost cannot be selected."
+      }
+    },
+    {
+      "caseId": "CASE-017",
+      "category": "budget_limits",
+      "description": "Route exceeding approvedMaxMicros is rejected in favor of route within budget.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-017",
+        "title": "Generate synthetic benchmark harness",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 500000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-over-budget",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 750000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-within-budget",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 350000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-within-budget"
+        ],
+        "disallowedRouteIds": [
+          "route-over-budget"
+        ],
+        "preferredRouteIds": [
+          "route-within-budget"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Route costing 750000 micros exceeds approved limit of 500000 micros."
+      }
+    },
+    {
+      "caseId": "CASE-018",
+      "category": "budget_limits",
+      "description": "Boundary case: route cost exactly equal to approvedMaxMicros is permitted.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-018",
+        "title": "Verify exact budget ceiling boundary",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 500000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-exact-limit",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 500000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-exact-limit"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-exact-limit"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "medium",
+        "rationale": "Cost equal to approvedMaxMicros is within the approved limit."
+      }
+    },
+    {
+      "caseId": "CASE-019",
+      "category": "budget_limits",
+      "description": "Unapproved budget still allows explicitly zero-cost local route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-019",
+        "title": "Run local synthetic formatter without spend approval",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 0,
+          "currency": "USD",
+          "approvalStatus": "unapproved",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-local-zero",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-paid",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 50000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-local-zero"
+        ],
+        "disallowedRouteIds": [
+          "route-paid"
+        ],
+        "preferredRouteIds": [
+          "route-local-zero"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Explicit zero-cost local route needs no spend approval."
+      }
+    },
+    {
+      "caseId": "CASE-020",
+      "category": "repo_access",
+      "description": "Task requiring repo_write must reject read-only route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-020",
+        "title": "Apply synthetic patch to repository",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "repo_write",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-readonly",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": false,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-readwrite",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-readwrite"
+        ],
+        "disallowedRouteIds": [
+          "route-readonly"
+        ],
+        "preferredRouteIds": [
+          "route-readwrite"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Read-only route cannot execute repo_write tasks."
+      }
+    },
+    {
+      "caseId": "CASE-021",
+      "category": "repo_access",
+      "description": "Read-only task can safely use a read-only route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-021",
+        "title": "Explain synthetic module exports",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-readonly-fast",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": false,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 140,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-readwrite-slow",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 900,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-readonly-fast",
+          "route-readwrite-slow"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-readonly-fast"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "low",
+        "rationale": "Both routes are eligible for read_only; faster route is preferred."
+      }
+    },
+    {
+      "caseId": "CASE-022",
+      "category": "approvals_and_drift",
+      "description": "Expired approval timestamp (before evaluatedAt) blocks paid route until re-approved.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-022",
+        "title": "Run paid synthetic migration check",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-16T11:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-paid-expired",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 200000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "request_approval",
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-paid-expired"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "APPROVAL_EXPIRED"
+        ],
+        "severity": "critical",
+        "rationale": "Approval expired prior to evaluatedAt."
+      }
+    },
+    {
+      "caseId": "CASE-023",
+      "category": "approvals_and_drift",
+      "description": "Explicit approvalStatus=expired blocks paid route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-023",
+        "title": "Execute synthetic paid review",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 2000000,
+          "currency": "USD",
+          "approvalStatus": "expired",
+          "approvalExpiresAt": "2026-11-16T11:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-paid-a",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 100000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "request_approval",
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-paid-a"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "APPROVAL_EXPIRED"
+        ],
+        "severity": "critical",
+        "rationale": "Expired approval status cannot authorize paid spend."
+      }
+    },
+    {
+      "caseId": "CASE-024",
+      "category": "approvals_and_drift",
+      "description": "Material route change since approval invalidates prior approval.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-024",
+        "title": "Run approved synthetic workflow",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-material-changed",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 250000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": true
+        },
+        {
+          "routeId": "route-unchanged",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 300000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-unchanged"
+        ],
+        "disallowedRouteIds": [
+          "route-material-changed"
+        ],
+        "preferredRouteIds": [
+          "route-unchanged"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Material change since approval requires re-approval before use."
+      }
+    },
+    {
+      "caseId": "CASE-025",
+      "category": "model_identity",
+      "description": "Actual model ID drifted from expectedModelId under the same adapter label.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-025",
+        "title": "Verify deterministic synthetic output",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-drifted-model",
+          "adapterLabel": "pinned-coder-label",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v2-unverified",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "drifted",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-pinned-model",
+          "adapterLabel": "backup-coder-label",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-pinned-model"
+        ],
+        "disallowedRouteIds": [
+          "route-drifted-model"
+        ],
+        "preferredRouteIds": [
+          "route-pinned-model"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "critical",
+        "rationale": "Silent model identity drift under a label must be rejected."
+      }
+    },
+    {
+      "caseId": "CASE-026",
+      "category": "model_identity",
+      "description": "Only candidate has model identity drift; router must hold or request clarification.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-026",
+        "title": "Run pinned synthetic regression",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-drifted-only",
+          "adapterLabel": "pinned-coder-label",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-8b-beta",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "drifted",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-drifted-only"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "MODEL_IDENTITY_DRIFT"
+        ],
+        "severity": "critical",
+        "rationale": "Model identity mismatch must not be silently accepted."
+      }
+    },
+    {
+      "caseId": "CASE-027",
+      "category": "cost_accounting",
+      "description": "Unknown cost must not be treated as zero or free.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-027",
+        "title": "Select route with honest cost accounting",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 500000,
+          "currency": "USD",
+          "approvalStatus": "unapproved",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-unknown-cost",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": null,
+            "currency": "USD",
+            "basis": "unknown",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-explicit-zero",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-explicit-zero"
+        ],
+        "disallowedRouteIds": [
+          "route-unknown-cost"
+        ],
+        "preferredRouteIds": [
+          "route-explicit-zero"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Unknown cost is not free; explicit_zero local route is safe."
+      }
+    },
+    {
+      "caseId": "CASE-028",
+      "category": "cost_accounting",
+      "description": "Explicitly recorded zero-cost subscription route is valid when quota is available.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-028",
+        "title": "Use included subscription route",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 0,
+          "currency": "USD",
+          "approvalStatus": "not_required",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-sub-zero",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "subscription",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-sub-zero"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-sub-zero"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "medium",
+        "rationale": "Explicit zero with available subscription quota is valid."
+      }
+    },
+    {
+      "caseId": "CASE-029",
+      "category": "cost_accounting",
+      "description": "Only route has unknown cost and unknown quota; router must hold.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-029",
+        "title": "Evaluate route with missing cost and quota",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 0,
+          "currency": "USD",
+          "approvalStatus": "unapproved",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-double-unknown",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "unknown"
+          },
+          "cost": {
+            "amountMicros": null,
+            "currency": null,
+            "basis": "unknown",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-double-unknown"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "UNKNOWN_COST"
+        ],
+        "severity": "high",
+        "rationale": "Unknown cost and unknown quota cannot be coerced to zero."
+      }
+    },
+    {
+      "caseId": "CASE-030",
+      "category": "cost_basis",
+      "description": "Both estimated_synthetic and provider_billed_synthetic within budget are eligible; lower billed cost preferred.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-030",
+        "title": "Compare estimated vs provider-billed synthetic cost",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-estimated",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 400000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-billed",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 250000,
+            "currency": "USD",
+            "basis": "provider_billed_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-billed",
+          "route-estimated"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-billed"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "low",
+        "rationale": "Both are within budget; provider-billed lower cost is preferred."
+      }
+    },
+    {
+      "caseId": "CASE-031",
+      "category": "cost_basis",
+      "description": "Provider-billed synthetic cost exceeds budget even though estimated cost was lower.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-031",
+        "title": "Respect billed ceiling over optimistic estimate",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 300000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-billed-over",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 450000,
+            "currency": "USD",
+            "basis": "provider_billed_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-est-under",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 200000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-est-under"
+        ],
+        "disallowedRouteIds": [
+          "route-billed-over"
+        ],
+        "preferredRouteIds": [
+          "route-est-under"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Route with billed cost 450000 micros exceeds 300000 micros budget."
+      }
+    },
+    {
+      "caseId": "CASE-032",
+      "category": "currency_and_validation",
+      "description": "Route priced in EUR must not be compared directly against USD budget without conversion.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-032",
+        "title": "Prevent unverified currency mismatch",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-eur",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 500000,
+            "currency": "EUR",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-usd",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 600000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-usd"
+        ],
+        "disallowedRouteIds": [
+          "route-eur"
+        ],
+        "preferredRouteIds": [
+          "route-usd"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "EUR cost cannot be checked against USD budget without conversion."
+      }
+    },
+    {
+      "caseId": "CASE-033",
+      "category": "currency_and_validation",
+      "description": "Only candidate has currency mismatch; router must hold or request clarification.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-033",
+        "title": "Hold on currency mismatch",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-jpy-only",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 120000000,
+            "currency": "JPY",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-jpy-only"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "CURRENCY_MISMATCH"
+        ],
+        "severity": "high",
+        "rationale": "Currency mismatch prevents safe budget comparison."
+      }
+    },
+    {
+      "caseId": "CASE-034",
+      "category": "attempt_history",
+      "description": "Route whose last known attempt failed is disqualified in favor of healthy route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-034",
+        "title": "Recover from failed synthetic attempt",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-failed-last",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "failed"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-healthy",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-healthy"
+        ],
+        "disallowedRouteIds": [
+          "route-failed-last"
+        ],
+        "preferredRouteIds": [
+          "route-healthy"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Route with failed last attempt must be avoided."
+      }
+    },
+    {
+      "caseId": "CASE-035",
+      "category": "attempt_history",
+      "description": "Route with incomplete last attempt must not be selected.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-035",
+        "title": "Avoid incomplete route",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-incomplete",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "incomplete"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-clean",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "none"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-clean"
+        ],
+        "disallowedRouteIds": [
+          "route-incomplete"
+        ],
+        "preferredRouteIds": [
+          "route-clean"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "medium",
+        "rationale": "Incomplete attempt indicates unresolved route instability."
+      }
+    },
+    {
+      "caseId": "CASE-036",
+      "category": "attempt_history",
+      "description": "Route with unknown last attempt outcome requires hold or clarification when no verified alternative exists.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-036",
+        "title": "Handle unknown prior attempt outcome",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-unknown-attempt",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "unknown",
+            "checkedAt": null,
+            "maxAgeSeconds": 600,
+            "source": "none"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "unknown"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-unknown-attempt"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "UNKNOWN_READINESS"
+        ],
+        "severity": "medium",
+        "rationale": "Unknown attempt coupled with unknown readiness requires abstention."
+      }
+    },
+    {
+      "caseId": "CASE-037",
+      "category": "ties_and_abstention",
+      "description": "Two equally eligible local routes tie; either is acceptable.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-037",
+        "title": "Pick any eligible local route on tie",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-tie-a",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 300,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-tie-b",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 300,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-tie-a",
+          "route-tie-b"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-tie-a",
+          "route-tie-b"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "low",
+        "rationale": "Both routes are equally valid; benchmark allows multiple acceptable choices."
+      }
+    },
+    {
+      "caseId": "CASE-038",
+      "category": "ties_and_abstention",
+      "description": "Justified abstention: no route qualifies (one remote on local_only, one stale local).",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-038",
+        "title": "Abstain when zero routes qualify",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-remote-blocked",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-local-stale",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "stale",
+            "checkedAt": "2026-11-16T10:00:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-remote-blocked",
+          "route-local-stale"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "NO_ELIGIBLE_ROUTE"
+        ],
+        "severity": "critical",
+        "rationale": "Holding is the only safe decision when zero routes qualify."
+      }
+    },
+    {
+      "caseId": "CASE-039",
+      "category": "ties_and_abstention",
+      "description": "Multiple eligible routes with different latency; slower valid route is a preference miss, not a safety failure.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-039",
+        "title": "Distinguish preference miss from safety failure",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-fast",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 150,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-slow",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 2400,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-fast",
+          "route-slow"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-fast"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "low",
+        "rationale": "Both routes are safe; choosing route-slow is a preference miss only."
+      }
+    },
+    {
+      "caseId": "CASE-040",
+      "category": "quality_evidence",
+      "description": "Cheapest route has insufficient quality evidence for a task requiring sufficient quality evidence.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-040",
+        "title": "Perform critical synthetic security review",
+        "complexity": "demanding",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "sufficient",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-cheap-unverified",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 10000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "insufficient",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-verified",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 350000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-verified"
+        ],
+        "disallowedRouteIds": [
+          "route-cheap-unverified"
+        ],
+        "preferredRouteIds": [
+          "route-verified"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Insufficient quality evidence disqualifies the cheapest route."
+      }
+    },
+    {
+      "caseId": "CASE-041",
+      "category": "quality_evidence",
+      "description": "All routes have qualityEvidence=none when sufficient evidence is required; hold required.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-041",
+        "title": "Require verified quality evidence",
+        "complexity": "demanding",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "sufficient",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-no-evidence",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "none",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-no-evidence"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "INSUFFICIENT_QUALITY_EVIDENCE"
+        ],
+        "severity": "high",
+        "rationale": "Cannot proceed without verified quality evidence."
+      }
+    },
+    {
+      "caseId": "CASE-042",
+      "category": "sequential_dependencies",
+      "description": "Task with dependsOnStepIds and sequential_only must select a single route without parallel batching.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-042",
+        "title": "Apply schema migration after step-1 validation",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "sequential_only",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": [
+          "step-1-validate"
+        ]
+      },
+      "candidates": [
+        {
+          "routeId": "route-seq-1",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-seq-2",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-seq-1",
+          "route-seq-2"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-seq-1",
+          "route-seq-2"
+        ],
+        "requiredReasonCodes": [
+          "SEQUENTIAL_EXECUTION_ENFORCED"
+        ],
+        "severity": "high",
+        "rationale": "Sequential dependency prevents parallel dispatch across multiple routes."
+      }
+    },
+    {
+      "caseId": "CASE-043",
+      "category": "sequential_dependencies",
+      "description": "Sequential repo_write task must select single write-capable route without parallel fan-out.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-043",
+        "title": "Commit synthetic lockfile after build step",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "repo_write",
+        "executionMode": "sequential_only",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": [
+          "step-build"
+        ]
+      },
+      "candidates": [
+        {
+          "routeId": "route-writer",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-reader",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": false,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-writer"
+        ],
+        "disallowedRouteIds": [
+          "route-reader"
+        ],
+        "preferredRouteIds": [
+          "route-writer"
+        ],
+        "requiredReasonCodes": [
+          "SEQUENTIAL_EXECUTION_ENFORCED"
+        ],
+        "severity": "high",
+        "rationale": "Must enforce sequential execution and repo_write support."
+      }
+    },
+    {
+      "caseId": "CASE-044",
+      "category": "readiness_boundary",
+      "description": "Boundary case: readiness checkedAt exactly maxAgeSeconds old (600s) is still valid.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-044",
+        "title": "Verify exact readiness TTL boundary",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-exact-ttl",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:50:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-exact-ttl"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-exact-ttl"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "medium",
+        "rationale": "At 12:00:00Z, 11:50:00Z is exactly 600s old and within maxAgeSeconds."
+      }
+    },
+    {
+      "caseId": "CASE-045",
+      "category": "unknown_locality",
+      "description": "Unknown backend locality cannot satisfy local_only policy; safe router must hold or clarify.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-045",
+        "title": "Evaluate unknown backend locality on local_only task",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-unknown-locality",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "unknown",
+          "actualBackendLocality": "unknown",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-unknown-locality"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "UNKNOWN_BACKEND_LOCALITY"
+        ],
+        "severity": "critical",
+        "rationale": "Unknown backend locality cannot guarantee local_only compliance."
+      }
+    },
+    {
+      "caseId": "CASE-046",
+      "category": "unknown_locality",
+      "description": "Local-only task prefers verified local route over unknown-locality route.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-046",
+        "title": "Choose verified local over unknown locality",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-unknown-loc",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "unknown",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-verified-loc",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-verified-loc"
+        ],
+        "disallowedRouteIds": [
+          "route-unknown-loc"
+        ],
+        "preferredRouteIds": [
+          "route-verified-loc"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "critical",
+        "rationale": "Verified local route is safe; unknown locality is disallowed."
+      }
+    },
+    {
+      "caseId": "CASE-047",
+      "category": "identity_uncertainty",
+      "description": "Missing model identity evidence requires hold or clarification.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-047",
+        "title": "Handle missing model identity evidence",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-missing-id",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": null,
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "missing",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-missing-id"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "MISSING_IDENTITY_EVIDENCE"
+        ],
+        "severity": "high",
+        "rationale": "Cannot verify model identity when actualModelId is missing."
+      }
+    },
+    {
+      "caseId": "CASE-048",
+      "category": "identity_uncertainty",
+      "description": "Contradictory model identity evidence requires hold or clarification.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-048",
+        "title": "Handle contradictory model identity evidence",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 1000000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-contradictory-id",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "contradictory",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 0,
+            "currency": "USD",
+            "basis": "explicit_zero",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-contradictory-id"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "CONTRADICTORY_IDENTITY_EVIDENCE"
+        ],
+        "severity": "high",
+        "rationale": "Contradictory identity evidence prevents safe route selection."
+      }
+    },
+    {
+      "caseId": "CASE-049",
+      "category": "spending_authorization",
+      "description": "Metered route with unknown cost and expired approval must request approval or hold.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-049",
+        "title": "Block unknown-cost metered route with expired approval",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 500000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-16T11:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-metered-unknown-expired",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": null,
+            "currency": "USD",
+            "basis": "unknown",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "request_approval",
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-metered-unknown-expired"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "APPROVAL_EXPIRED"
+        ],
+        "severity": "critical",
+        "rationale": "Spending authorization must be checked even when cost amount is unknown."
+      }
+    },
+    {
+      "caseId": "CASE-050",
+      "category": "spending_authorization",
+      "description": "Positive metered charge cannot bypass authorization via approvalStatus=not_required.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-050",
+        "title": "Reject chargeable metered route when approvalStatus is not_required",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 500000,
+          "currency": "USD",
+          "approvalStatus": "not_required",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-metered-charge",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 120000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "request_approval",
+          "hold"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-metered-charge"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "SPENDING_APPROVAL_REQUIRED"
+        ],
+        "severity": "critical",
+        "rationale": "not_required cannot authorize a positive metered charge."
+      }
+    },
+    {
+      "caseId": "CASE-051",
+      "category": "spending_authorization",
+      "description": "Local route with unknown cost cannot be inferred free.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-051",
+        "title": "Do not assume local route is free when cost basis is unknown",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 0,
+          "currency": "USD",
+          "approvalStatus": "unapproved",
+          "approvalExpiresAt": null
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-local-unknown-cost",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": null,
+            "currency": null,
+            "basis": "unknown",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "hold",
+          "request_clarification"
+        ],
+        "acceptableRouteIds": [],
+        "disallowedRouteIds": [
+          "route-local-unknown-cost"
+        ],
+        "preferredRouteIds": [],
+        "requiredReasonCodes": [
+          "UNKNOWN_COST"
+        ],
+        "severity": "high",
+        "rationale": "Local locality does not prove zero cost when cost basis is unknown."
+      }
+    },
+    {
+      "caseId": "CASE-052",
+      "category": "parallel_batch_safety",
+      "description": "Parallel execution on local_only task must only include compliant local routes within aggregate budget.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-052",
+        "title": "Parallel batch must enforce local_only and aggregate budget on every route",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "local_only",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": 300000,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-local-a",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 200000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-local-b",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "local",
+          "actualBackendLocality": "local",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 200000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        },
+        {
+          "routeId": "route-remote-bad",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "local_free",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": 50000,
+            "currency": "USD",
+            "basis": "estimated_synthetic",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-local-a",
+          "route-local-b"
+        ],
+        "disallowedRouteIds": [
+          "route-remote-bad"
+        ],
+        "preferredRouteIds": [
+          "route-local-a",
+          "route-local-b"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "critical",
+        "rationale": "Each individual local route fits 300000 micros, while batching both exceeds 300000 micros and remote route violates local_only."
+      }
+    },
+    {
+      "caseId": "CASE-053",
+      "category": "cost_accounting",
+      "description": "Approved uncapped route with unknown cost amount and explicit USD currency preserves currency without fabrication.",
+      "isSynthetic": true,
+      "task": {
+        "taskId": "task-053",
+        "title": "Preserve source currency on approved uncapped unknown-cost route",
+        "complexity": "simple",
+        "requiredCapabilities": [
+          "code_edit"
+        ],
+        "dataBoundary": "remote_allowed",
+        "repoAccess": "read_only",
+        "executionMode": "parallel_ok",
+        "budget": {
+          "approvedMaxMicros": null,
+          "currency": "USD",
+          "approvalStatus": "approved",
+          "approvalExpiresAt": "2026-11-17T00:00:00Z"
+        },
+        "minimumQualityEvidence": "none_required",
+        "dependsOnStepIds": []
+      },
+      "candidates": [
+        {
+          "routeId": "route-uncapped-unknown-usd",
+          "adapterLabel": "synthetic-adapter-a",
+          "declaredLocality": "remote",
+          "actualBackendLocality": "remote",
+          "actualModelId": "synth-coder-7b-v1",
+          "expectedModelId": "synth-coder-7b-v1",
+          "identityEvidenceStatus": "verified",
+          "capabilities": [
+            "code_edit",
+            "structured_json"
+          ],
+          "supportsRepoWrite": true,
+          "readiness": {
+            "status": "ready",
+            "checkedAt": "2026-11-16T11:55:00Z",
+            "maxAgeSeconds": 600,
+            "source": "synthetic_probe"
+          },
+          "quota": {
+            "type": "metered",
+            "status": "available"
+          },
+          "cost": {
+            "amountMicros": null,
+            "currency": "USD",
+            "basis": "unknown",
+            "isSynthetic": true
+          },
+          "latencyMsSynthetic": 450,
+          "qualityEvidence": "verified_synthetic",
+          "lastKnownAttempt": {
+            "status": "succeeded"
+          },
+          "materialChangedSinceApproval": false
+        }
+      ],
+      "expected": {
+        "acceptableDecisionTypes": [
+          "select_route"
+        ],
+        "acceptableRouteIds": [
+          "route-uncapped-unknown-usd"
+        ],
+        "disallowedRouteIds": [],
+        "preferredRouteIds": [
+          "route-uncapped-unknown-usd"
+        ],
+        "requiredReasonCodes": [],
+        "severity": "high",
+        "rationale": "Approved uncapped route is eligible, and any submitted recordedCost must preserve amountMicros=null and currency=USD."
+      }
+    }
+  ]
+}

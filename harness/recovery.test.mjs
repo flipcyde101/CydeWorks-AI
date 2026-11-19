@@ -9,6 +9,9 @@ import {dirname,join,sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {DatabaseSync} from 'node:sqlite';
 import {recordInterruption,recordOutcomeUncertainty,retryHold} from './recovery.mjs';
+import {prepareRunSubmission} from './run-submission.mjs';
+import {routeRevision as revisionForRoute} from './route-inventory.mjs';
+import {assessRoute} from './route.mjs';
 
 const stamp='2026-11-14T00:00:00.000Z';
 const workspace=dirname(fileURLToPath(import.meta.url));
@@ -71,10 +74,10 @@ test('a restarted workspace holds uncertain retries and preserves safe attempts'
   await mkdir(join(scratch,'.state'));
   await mkdir(join(scratch,'desktop'));
   await copyFile(join(workspace,'desktop','utility-test-child.cjs'),join(scratch,'desktop','utility-test-child.cjs'));
-  for (const file of ['server.mjs','opencode.mjs','providers.mjs','direct-local-fetch.mjs','readiness.mjs','patch.mjs','recovery.mjs','workspace-lock.mjs','export.mjs','attention.mjs','route.mjs','owner-lease.mjs','removal.mjs']) {
+  for (const file of ['browser-assets.mjs','receipt-analytics.mjs','receipt-analytics-contract.mjs','contributor-api.mjs','cost-presentation.mjs','portable-import-review-planner.mjs','portable-handoff-validator.mjs','portable-manifest-contract.mjs','portable-sha256.mjs','artifact-download.mjs','route-inventory.mjs','run-submission.mjs','router-evaluation-api.mjs','router-evaluator.mjs','router-evaluation-contract.mjs','connection-host.mjs','connection-readiness.mjs','connection-contract.mjs','receipt-export.mjs','receipt-adapter.mjs','receipt-contract.mjs','server.mjs','opencode.mjs','opencode-usage.mjs','providers.mjs','llamacpp.mjs','inference-broker.mjs','direct-local-fetch.mjs','readiness.mjs','patch.mjs','recovery.mjs','workspace-lock.mjs','export.mjs','attention.mjs','route.mjs','owner-lease.mjs','removal.mjs','terminal-control.mjs','draft-copy.mjs']) {
     await copyFile(join(workspace,file),join(scratch,file));
   }
-  for (const file of ['app.js','index.html','style.css','observer.js','export-dialog.js','usage.js','progress.js','removal-dialog.js','route-diagnostics.js']) {
+  for (const file of ['app.js','index.html','style.css','observer.js','export-dialog.js','usage.js','progress.js','removal-dialog.js','route-diagnostics.js','proposal-editor.js','terminal-request.js','draft-copy-dialog.js']) {
     await copyFile(join(workspace,'web',file),join(scratch,'web',file));
   }
   const key='c'.repeat(64);
@@ -83,6 +86,9 @@ test('a restarted workspace holds uncertain retries and preserves safe attempts'
   db.exec('CREATE TABLE tasks (id TEXT PRIMARY KEY, updated TEXT NOT NULL, data TEXT NOT NULL)');
   const insert=db.prepare('INSERT INTO tasks VALUES (?, ?, ?)');
   const unknown=makeTask(makeAttempt('opencode','dispatching'));
+  const unknownRequest={requestId:randomUUID(),version:0,sourceHash:unknown.sourceHash,approve:true,
+    engine:'opencode',model:unknown.model,modelDigest:'a'.repeat(64)};
+  unknown.attempts[0].submission=prepareRunSubmission(unknown.id,unknownRequest);
   const preflight=makeTask(makeAttempt('opencode','claimed'));
   const legacy=makeTask(makeAttempt('opencode'));
   const accepted=makeTask(makeAttempt('fixture','settled'));
@@ -127,9 +133,14 @@ test('a restarted workspace holds uncertain retries and preserves safe attempts'
   assert.equal(ready.status,'interrupted');
   assert.equal(ready.recovery,null);
   assert.equal(ready.attempts[0].recovery.evidence,'dispatch-not-started');
-  const run=await post('/api/tasks/'+preflight.id+'/run',{
+  // The restart test uses a deterministic fixture, never host model inventory.
+  const fixtureRevision=revisionForRoute({id:'fixture',engine:'fixture',digest:null,endpoint:null,
+    readiness:assessRoute({engine:'fixture'})});
+  const runRequest={requestId:randomUUID(),
     version:ready.version,sourceHash:ready.sourceHash,approve:true,engine:'fixture',model:'fixture',
-  },cookie);
+    routeRevision:fixtureRevision,
+  };
+  const run=await post('/api/tasks/'+preflight.id+'/run',runRequest,cookie);
   assert.equal(run.status,202);
   let result;
   for(let i=0;i<100;i++){
@@ -141,6 +152,10 @@ test('a restarted workspace holds uncertain retries and preserves safe attempts'
   assert.equal(result.attempts.length,2);
   assert.equal(result.attempts[1].execution.phase,'settled');
   assert.equal((await get(accepted)).status,'accepted');
+  const copyRequest={requestId:randomUUID(),version:accepted.version,confirm:true};
+  const copiedResponse=await post('/api/tasks/'+accepted.id+'/copy-draft',copyRequest,cookie);
+  assert.equal(copiedResponse.status,201);
+  const copied=await copiedResponse.json();
   const exited=once(child,'exit');
   child.disconnect();
   await exited;
@@ -161,4 +176,28 @@ test('a restarted workspace holds uncertain retries and preserves safe attempts'
   const restored=await (await fetch(origin+'/api/tasks/'+preflight.id,{headers:{Cookie:renewedCookie}})).json();
   assert.equal(restored.status,'review');
   assert.equal(restored.attempts.length,2);
+  assert.equal(restored.attempts[1].approvedRouteRevision,fixtureRevision);
+  assert.equal(restored.attempts[1].observedRouteRevision,fixtureRevision);
+  const replayed=await post('/api/tasks/'+preflight.id+'/run',runRequest,renewedCookie);
+  assert.equal(replayed.status,200);
+  const replayState=await replayed.json();
+  assert.equal(replayState.runSubmission.attemptId,restored.attempts[1].id);
+  assert.equal(replayState.attempts.length,2);assert.equal(replayState.version,restored.version);
+  const {routeRevision,...changedBinding}=runRequest;
+  assert.equal((await post('/api/tasks/'+preflight.id+'/run',changedBinding,renewedCookie)).status,409);
+  const lookup=await (await fetch(origin+'/api/tasks/'+preflight.id+'/run-submissions/'+runRequest.requestId,
+    {headers:{Cookie:renewedCookie}})).json();
+  assert.equal(lookup.attemptId,restored.attempts[1].id);
+  const unknownReplay=await post('/api/tasks/'+unknown.id+'/run',unknownRequest,renewedCookie);
+  assert.equal(unknownReplay.status,200);
+  const unknownState=await unknownReplay.json();
+  assert.equal(unknownState.runSubmission.attemptStatus,'interrupted');
+  assert.equal(unknownState.recovery.blocked,true);assert.equal(unknownState.attempts.length,1);
+  assert.equal((await post('/api/tasks/'+unknown.id+'/run',{
+    ...unknownRequest,requestId:randomUUID(),version:unknownState.version},renewedCookie)).status,409);
+  const repeatedCopy=await post('/api/tasks/'+accepted.id+'/copy-draft',copyRequest,renewedCookie);
+  assert.equal(repeatedCopy.status,200);
+  assert.equal((await repeatedCopy.json()).task.id,copied.task.id);
+  const recoveredCopy=await (await fetch(origin+'/api/draft-copies/'+copyRequest.requestId,{headers:{Cookie:renewedCookie}})).json();
+  assert.equal(recoveredCopy.taskId,copied.task.id);
 });

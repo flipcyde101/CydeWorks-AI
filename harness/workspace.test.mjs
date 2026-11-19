@@ -72,7 +72,11 @@ test(liveOpenCode?'live OpenCode and Ollama approval, terminal controls, review 
   const runs=await Promise.all([request(path+'/run',grant),request(path+'/run',grant)]);
   assert.deepEqual(runs.map(run=>run.status).sort(),[202,409]);
   if (liveOpenCode) {
-    const terminal=(command,lease,confirm)=>request(path+'/terminal',{command,lease,confirm});
+    const terminal=async(command,lease,confirm)=>{
+      const state=await (await request(path)).json();
+      return request(path+'/terminal',{command,lease,confirm,
+        attemptId:state.live?.control.attemptId,generation:state.live?.control.generation});
+    };
     let running;
     for (let i=0;i<60;i++) {
       running=await (await request(path)).json();

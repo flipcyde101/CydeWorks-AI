@@ -1,7 +1,8 @@
 import {Agent,request} from 'node:http';
 import {Readable} from 'node:stream';
 
-const routes=new Map([['/api/tags','GET'],['/api/status','GET'],['/api/chat','POST']]);
+const routes=new Map([['/api/tags','GET'],['/api/status','GET'],['/api/chat','POST'],
+  ['/health','GET'],['/v1/models','GET']]);
 
 // A dedicated agent prevents Node's environment proxy settings from receiving
 // local model requests. This is not an operating-system network sandbox.

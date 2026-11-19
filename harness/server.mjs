@@ -11,15 +11,29 @@ import {opencode} from './opencode.mjs';
 import {retryHold,recordInterruption,recordOutcomeUncertainty,recordObservedUsage} from './recovery.mjs';
 import {acquireWorkspaceLock} from './workspace-lock.mjs';
 import {exportTask} from './export.mjs';
+import {exportReceipt} from './receipt-export.mjs';
 import {attentionFor} from './attention.mjs';
 import {assessRoute,matchesModelIdentity} from './route.mjs';
 import {createOwnerLease} from './owner-lease.mjs';
 import {previewRemoval,verifyRemoval} from './removal.mjs';
 import {buildReadiness} from './readiness.mjs';
+import {llamaCpp} from './llamacpp.mjs';
+import {createTerminalControl} from './terminal-control.mjs';
+import {draftCopyHold,copiedDraftScope} from './draft-copy.mjs';
+import {inspectTaskConnections} from './connection-host.mjs';
+import {evaluateSubmittedBatch} from './router-evaluation-api.mjs';
+import {prepareRunSubmission,findRunSubmission,replayRunSubmission,submissionResult,publicAttempts,approvedRouteRevision} from './run-submission.mjs';
+import {buildRouteInventory,routeRevision} from './route-inventory.mjs';
+import {artifactDownloadRequest,acceptedArtifactDownload} from './artifact-download.mjs';
+import {presentSubmittedCost,reviewSubmittedHandoff} from './contributor-api.mjs';
+import {loadBrowserAssets} from './browser-assets.mjs';
+import {summarizeReceiptExports} from './receipt-analytics.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
+const serverRevision=createHash('sha256').update(await readFile(fileURLToPath(import.meta.url))).digest('hex');
 const port = Number(process.env.BFE_PORT || 15371);
 if (!Number.isInteger(port)||port<0||port>65535) throw Error('The workspace port is invalid.');
+const {mode:uiMode,assets}=await loadBrowserAssets(root,process.env.BFE_UI);
 let host = '127.0.0.1:' + port;
 let origin = 'http://' + host;
 const database = process.env.BFE_TEST_MEMORY === '1' ? ':memory:' : resolve(root,'.state','workspace.sqlite');
@@ -34,7 +48,7 @@ if (database !== ':memory:') {
   key=(await readFile(keyPath,'utf8')).trim();
 }
 if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
-const session=randomBytes(32).toString('hex');
+let session=randomBytes(32).toString('hex');
 const removalSecret=randomBytes(32);
 function equal(candidate, expected) {
   return typeof candidate==='string' && /^[a-f0-9]{64}$/.test(candidate) &&
@@ -43,23 +57,17 @@ function equal(candidate, expected) {
 const db = new DatabaseSync(database);
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
   CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, updated TEXT NOT NULL, data TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS task_removal_audit (id INTEGER PRIMARY KEY, reference TEXT NOT NULL, removed_at TEXT NOT NULL, scope TEXT NOT NULL)`);
+  CREATE TABLE IF NOT EXISTS task_removal_audit (id INTEGER PRIMARY KEY, reference TEXT NOT NULL, removed_at TEXT NOT NULL, scope TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS task_draft_copies (request_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,source_version INTEGER NOT NULL,draft_id TEXT NOT NULL)`);
 const saveRow = db.prepare('INSERT INTO tasks VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET updated=excluded.updated,data=excluded.data');
 const find = db.prepare('SELECT data FROM tasks WHERE id=?');
 const list = db.prepare('SELECT data FROM tasks ORDER BY updated DESC');
+const workspaceTaskCount = db.prepare('SELECT count(*) AS count FROM tasks');
+const receiptSnapshot = db.prepare('SELECT data FROM tasks ORDER BY updated DESC,id LIMIT 100');
 const all = () => list.all().map(row => JSON.parse(row.data));
 const now = () => new Date().toISOString();
 const hash = value => createHash('sha256').update(value).digest('hex');
 const providers = {fixture, ollama, opencode};
-const assets = new Map(await Promise.all([
-  ['/', 'index.html','text/html'], ['/app.js','app.js','text/javascript'], ['/style.css','style.css','text/css'],
-  ['/observer.js','observer.js','text/javascript'],
-  ['/export-dialog.js','export-dialog.js','text/javascript'],
-  ['/usage.js','usage.js','text/javascript'],
-  ['/progress.js','progress.js','text/javascript'],
-  ['/removal-dialog.js','removal-dialog.js','text/javascript'],
-  ['/route-diagnostics.js','route-diagnostics.js','text/javascript'],
-].map(async ([route,file,type]) => [route,{data:await readFile(resolve(root,'web',file)),type}])));
 let active;
 
 function save(task, event) {
@@ -78,15 +86,18 @@ function need(value, max, label, allowEmpty = false) {
 function latest(task) {
   return task.attempts.at(-1);
 }
-function currentLease(run) {
-  if (run.lease && run.lease.expires<=Date.now()) run.lease=undefined;
-  return run.lease;
+function inspectedRoute(model,freeBytes) {
+  return {...model,endpoint:model.engine==='fixture'?null:
+    model.backend==='llamacpp'?llamaCpp.endpoint:ollamaEndpoint,readiness:assessRoute(model,freeBytes)};
 }
 function view(task) {
   const run=active?.taskId===task.id ? active : null;
   const hold=retryHold(task);
-  return {...task, recovery:hold?{blocked:true,message:hold}:null, live:run ? {chars:run.chars,heartbeat:now(),lastActivity:run.lastActivity,
-    stopping:run.controller.signal.aborted,terminal:run.terminal,owner:currentLease(run) ? 'Operator' : 'None'} : null};
+  const copyHold=draftCopyHold(task,{active:!!run});
+  const control=run?.control.snapshot();
+  const attempts=publicAttempts(task.attempts);
+  return {...task,attempts, copy:{allowed:!copyHold,reason:copyHold},recovery:hold?{blocked:true,message:hold}:null, live:run ? {chars:run.chars,heartbeat:now(),lastActivity:run.lastActivity,
+    stopping:run.controller.signal.aborted,terminal:run.terminal,owner:control.owner,control} : null};
 }
 function scope(data) {
   if (!['change','brief'].includes(data.kind)) fail(400,'Choose a supported workflow.');
@@ -111,22 +122,37 @@ function inspect(task, result) {
       return refs.length > 0 && refs.every(ref => +ref[1] >= 1 && +ref[1] <= count);
     })()}];
   const patch=task.kind==='change' ? unifiedPatch(task.filename,task.source,artifact.content) : null;
-  return {artifact:{summary:artifact.summary,content:artifact.content,sha256:hash(artifact.content),patch},checks};
+  return {artifact:{summary:artifact.summary,content:artifact.content,sha256:hash(artifact.content),patch,
+    ...(typeof artifact.rawContent==='string'&&artifact.rawContent.length<=24000?{rawContent:artifact.rawContent}:{})},checks};
 }
 
 async function execute(task, run) {
   const attempt = latest(task);
   try {
     const adapter = providers[attempt.provider];
-    const choices = await adapter.models();
-    const selected = choices.find(model => model.id === task.model);
+    const backend=attempt.backend??'ollama';
+    const choices = await adapter.models({backend});
+    const selected = choices.find(model => model.id === task.model &&
+      (model.backend??(attempt.provider==='fixture'?'fixture':'ollama'))===backend);
     if (!selected) throw Error('The selected local model is unavailable or exceeds the configured model limit.');
-    if(attempt.provider!=='fixture'&&!matchesModelIdentity(attempt.approvedModelDigest,selected.digest))
+    const approvedIdentity=backend==='llamacpp'?attempt.approvedModelFingerprint:attempt.approvedModelDigest;
+    const reportedIdentity=backend==='llamacpp'?selected.fingerprint:selected.digest;
+    if(attempt.provider!=='fixture'&&!matchesModelIdentity(approvedIdentity,reportedIdentity))
       throw Error('The model identity changed or is unavailable. Refresh routes and approve the current model again.');
     run.controller.signal.throwIfAborted();
-    const readiness=assessRoute({...selected,engine:attempt.provider},freemem());
+    const currentRoute=inspectedRoute({...selected,engine:attempt.provider},freemem());
+    const readiness=currentRoute.readiness;
     if(!readiness.eligible)throw Error(readiness.reason);
-    attempt.modelDigest = selected.digest;
+    if(attempt.approvedRouteRevision!==undefined) {
+      const observedRevision=routeRevision(currentRoute);
+      if(!matchesModelIdentity(attempt.approvedRouteRevision,observedRevision))
+        throw Error('The selected route changed after review. Refresh routes and approve the current route again.');
+      attempt.observedRouteRevision=observedRevision;
+    }
+    if(backend==='llamacpp') {
+      attempt.modelFingerprint=selected.fingerprint;
+      attempt.identityKind='server-metadata';
+    } else attempt.modelDigest=selected.digest;
     attempt.quantization = selected.quantization ?? null;
     run.controller.signal.throwIfAborted();
     attempt.execution.phase='dispatching';
@@ -134,7 +160,7 @@ async function execute(task, run) {
     // Persist before crossing the provider boundary. A crash after this point
     // is conservatively treated as an unknown outcome.
     save(task,'attempt.dispatching');
-    const result = await adapter.run(task, {
+    const result = await adapter.run({...task,backend}, {
       attemptId:attempt.id,
       signal:AbortSignal.any([run.controller.signal, AbortSignal.timeout(120000)]),
       progress(chars) { if (chars !== run.chars) { run.chars=chars; run.lastActivity=now(); } },
@@ -156,6 +182,7 @@ async function execute(task, run) {
       : error instanceof TypeError || error instanceof SyntaxError ? 'The local provider connection or response was invalid.'
       : error.message;
   } finally {
+    run.control.close();
     addTerminal(run,'Attempt '+task.status+'.');
     attempt.terminal=run.terminal;
     attempt.status=task.status;
@@ -191,18 +218,27 @@ async function jsonBody(request) {
 }
 
 const server=http.createServer(async (req,res) => {
+  const sessionAtArrival=session;
   const send=(status,value) => {
     res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});
     res.end(JSON.stringify(value));
   };
   res.setHeader('Cache-Control','no-store');
   res.setHeader('X-Content-Type-Options','nosniff');
-  res.setHeader('Content-Security-Policy',"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'");
+  res.setHeader('Content-Security-Policy',"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'"+
+    (uiMode==='experience'?"; img-src 'self'":""));
   try {
     if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== origin) ||
         req.headers['sec-fetch-site'] === 'cross-site' || req.headers['sec-fetch-site'] === 'same-site') fail(403,'Use the CydeWorks AI loopback address.');
     const url=new URL(req.url,origin);
     const path=url.pathname;
+    if(path==='/api/health') {
+      if(req.method!=='GET') {
+        res.setHeader('Allow','GET');
+        fail(405,'Use GET to check preview health.');
+      }
+      return send(200,{status:'ready',serverRevision});
+    }
     if (req.method==='GET' && assets.has(path)) {
       const asset=assets.get(path);
       res.writeHead(200,{'Content-Type':asset.type+'; charset=utf-8'});
@@ -212,22 +248,70 @@ const server=http.createServer(async (req,res) => {
     if (req.method==='POST' && path==='/api/session') {
       const data=await jsonBody(req);
       if (!equal(data.key,key)) fail(401,'Choose this workspace’s access.key file.');
+      if(sessionAtArrival!==session)fail(409,'The workspace was locked while unlocking. Choose the access file again.');
       res.setHeader('Set-Cookie','bfe_session='+session+'; HttpOnly; SameSite=Strict; Path=/api');
       return send(200,{authorized:true});
     }
     const cookie=req.headers.cookie?.split(';').map(value=>value.trim()).find(value=>value.startsWith('bfe_session='));
-    if (!equal(cookie?.slice('bfe_session='.length),session)) fail(401,'Unlock this workspace with its local access.key file.');
-    if (req.method==='GET' && path==='/api/models') {
-      const [inspection,codeCheck]=await Promise.allSettled([ollama.inspect(),opencode.availability()]);
+    const requireSession=()=>{
+      if (!equal(cookie?.slice('bfe_session='.length),session)) fail(401,'Unlock this workspace with its local access.key file.');
+    };
+    requireSession();
+    const authenticatedBody=async()=>{
+      const data=await jsonBody(req);
+      // Lock may have happened while an authenticated body was still arriving.
+      requireSession();
+      return data;
+    };
+    if(path==='/api/session/lock') {
+      if(req.method!=='POST')fail(405,'Use POST to lock the workspace.');
+      const data=await authenticatedBody();
+      if(Object.keys(data).length)fail(400,'Use an empty object to lock the workspace.');
+      session=randomBytes(32).toString('hex');
+      active?.control.revoke();
+      res.setHeader('Set-Cookie','bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api');
+      return send(200,{locked:true,scope:'all-workspace-views',terminalControlReleased:true,
+        stopsWork:false,requiresAccessFile:true});
+    }
+    if(path==='/api/cost-presentation'||path==='/api/handoffs/review') {
+      if(req.method!=='POST')fail(405,'Use POST for a bounded review request.');
+      const data=await authenticatedBody();
+      const result=path==='/api/cost-presentation'?presentSubmittedCost(data):
+        reviewSubmittedHandoff(data,db.prepare('SELECT id FROM tasks').all().map(row=>row.id));
+      return send(result.ok?200:400,result);
+    }
+    if(req.method==='POST'&&path==='/api/router/evaluate') {
+      const data=await authenticatedBody();
+      const result=evaluateSubmittedBatch(data,now());
+      return send(result.ok?200:400,result);
+    }
+    const readinessMatch=/^\/api\/tasks\/([a-f0-9-]{36})\/readiness$/.exec(path);
+    if (req.method==='GET' && (path==='/api/models'||readinessMatch)) {
+      if(readinessMatch&&!find.get(readinessMatch[1]))fail(404,'Task not found.');
+      const inventoryObservedAtMs=Date.now();
+      const [inspection,codeCheck,llamaCheck]=await Promise.allSettled([ollama.inspect(),opencode.availability(),llamaCpp.inspect()]);
       const installed=inspection.status==='fulfilled'?inspection.value.models:[];
       const engines=codeCheck.status==='fulfilled'&&codeCheck.value==='present'?installed:[];
+      const llamaModels=codeCheck.status==='fulfilled'&&codeCheck.value==='present'&&llamaCheck.status==='fulfilled'
+        ?llamaCheck.value.models:[];
       const diagnostics=buildReadiness(inspection,codeCheck);
+      if(llamaCpp.configured&&llamaCheck.status==='rejected')diagnostics.messages.push({code:'llamacpp_unavailable',
+        text:'Could not verify the configured local llama.cpp model. Check the service and refresh routes.'});
       const available=freemem();
       const models=[...engines.map(model=>({...model,engine:'opencode'})),
+        ...llamaModels.map(model=>({...model,engine:'opencode'})),
         ...installed.map(model=>({...model,engine:'ollama'})),
         ...(await fixture.models()).map(model=>({...model,engine:'fixture'}))];
-      return send(200,{models:models.map(model=>({...model,endpoint:model.engine==='fixture'?null:ollamaEndpoint,
-        readiness:assessRoute(model,available)})),diagnostics});
+      requireSession(); // Do not disclose probe results to a view locked while waiting.
+      if(readinessMatch) {
+        // Re-read after asynchronous probes: do not bind evidence to a stale task.
+        const current=find.get(readinessMatch[1]);
+        if(!current)fail(404,'Task not found.');
+        return send(200,{...inspectTaskConnections(JSON.parse(current.data),models,
+          {now:now(),freeBytes:available,endpoints:{ollama:ollamaEndpoint,llamacpp:llamaCpp.endpoint}}),diagnostics});
+      }
+      return send(200,{...buildRouteInventory(models.map(model=>inspectedRoute(model,available)),
+        {observedAtMs:inventoryObservedAtMs}),diagnostics});
     }
     if (req.method==='GET' && path==='/api/tasks') {
       return send(200,{tasks:all().map(({id,title,kind,status}) => ({id,title,kind,status}))});
@@ -235,54 +319,113 @@ const server=http.createServer(async (req,res) => {
     if (req.method==='GET' && path==='/api/attention') {
       return send(200,{tasks:all().map(attentionFor).filter(Boolean)});
     }
+    if(path==='/api/receipts/analytics') {
+      if(req.method!=='GET') {
+        res.setHeader('Allow','GET');
+        fail(405,'Use GET to read workspace receipt analytics.');
+      }
+      const workspaceTasks=workspaceTaskCount.get().count;
+      const rows=receiptSnapshot.all();
+      const envelopes=[];
+      let unrunDrafts=0;
+      for(const {data} of rows) {
+        const envelope=exportReceipt(JSON.parse(data));
+        if(!envelope.available && envelope.reasons.length===1 && envelope.reasons[0].code==='no-attempts-recorded') unrunDrafts++;
+        else envelopes.push(envelope);
+      }
+      const summary=summarizeReceiptExports(envelopes,{maxEnvelopes:100});
+      if(!summary.ok)fail(500,'Saved receipts could not be summarized.');
+      return send(200,{coverage:{workspaceTasks,checkedTasks:rows.length,unrunDrafts,omittedTasks:workspaceTasks-rows.length},summary});
+    }
     if (req.method==='GET' && path==='/api/removal-audit') {
       return send(200,{records:db.prepare('SELECT reference,removed_at AS removedAt,scope FROM task_removal_audit ORDER BY id DESC LIMIT 100').all()});
     }
+    const runLookup=/^\/api\/tasks\/([a-f0-9-]{36})\/run-submissions\/([a-f0-9-]{36})$/.exec(path);
+    if(req.method==='GET'&&runLookup) {
+      const row=find.get(runLookup[1]);
+      if(!row)fail(404,'Task not found.');
+      const task=JSON.parse(row.data),attempt=findRunSubmission(task,runLookup[2]);
+      if(!attempt)fail(404,'No recorded run submission was found.');
+      return send(200,submissionResult(task,attempt,true));
+    }
+    const copyLookup=/^\/api\/draft-copies\/([a-f0-9-]{36})$/.exec(path);
+    if(req.method==='GET'&&copyLookup) {
+      const copy=db.prepare('SELECT draft_id FROM task_draft_copies WHERE request_id=?').get(copyLookup[1]);
+      if(!copy)fail(404,'No saved copy result is visible.');
+      if(!find.get(copy.draft_id))fail(410,'The recorded copy was removed.');
+      return send(200,{taskId:copy.draft_id});
+    }
     if (req.method==='POST' && path==='/api/tasks') {
-      const data=await jsonBody(req);
+      const data=await authenticatedBody();
       if (all().length>=100) fail(409,'This workspace has reached its 100-task capacity.');
       const task={id:randomUUID(),version:0,status:'draft',...scope(data),model:null,attempts:[],events:[]};
       save(task,'task.created');
       return send(201,view(task));
     }
-    const match=/^\/api\/tasks\/([a-f0-9-]{36})(?:\/(scope|run|cancel|review|export|terminal|removal-preview|remove))?$/.exec(path);
+    const match=/^\/api\/tasks\/([a-f0-9-]{36})(?:\/(scope|run|cancel|review|revise|export|receipt|artifact|terminal|removal-preview|remove|copy-draft))?$/.exec(path);
     if (!match) fail(404,'Route not found.');
     const [,id,action]=match;
-    if (req.method==='GET' && (!action || action==='export' || action==='removal-preview')) {
+    if(action==='artifact') {
+      if(req.method!=='GET')fail(405,'Use GET to download an accepted proposal.');
+      const row=find.get(id);
+      if(!row)fail(404,'Task not found.');
+      const download=acceptedArtifactDownload(JSON.parse(row.data),artifactDownloadRequest(url.searchParams));
+      const bytes=Buffer.from(download.content,'utf8');
+      res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8',
+        'Content-Disposition':'attachment; filename="'+download.filename+'"',
+        'Content-Length':bytes.length,'X-Artifact-SHA256':download.sha256});
+      return res.end(bytes);
+    }
+    if (req.method==='GET' && (!action || action==='export' || action==='receipt' || action==='removal-preview')) {
       const row=find.get(id);
       if (!row) fail(404,'Task not found.');
       const task=JSON.parse(row.data);
       return send(200,action==='export' ? exportTask(task,url.searchParams.get('mode')??'standard')
+        :action==='receipt'?exportReceipt(task,{timebase:url.searchParams.get('timebase')??undefined})
         :action==='removal-preview'?previewRemoval(task,{secret:removalSecret,active:active?.taskId===id}):view(task));
     }
     if (req.method!=='POST') fail(405,'Unsupported method.');
-    const data=await jsonBody(req);
+    const data=await authenticatedBody();
     // Read after awaiting the body, so concurrent submissions use current state.
     const row=find.get(id);
     if (!row) fail(404,'Task not found.');
     const task=JSON.parse(row.data);
+    const submission=action==='run'?prepareRunSubmission(id,data):null;
+    const recordedAttempt=action==='run'?replayRunSubmission(task,submission):null;
+    if(recordedAttempt)return send(200,{...view(task),runSubmission:submissionResult(task,recordedAttempt,true)});
+    if(action==='copy-draft') {
+      if(data.confirm!==true||!Number.isSafeInteger(data.version)||data.version<0||
+          typeof data.requestId!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(data.requestId))
+        fail(400,'Confirm the saved scope with a valid copy request.');
+      db.exec('BEGIN IMMEDIATE');
+      let draft,reused=false;
+      try {
+        const existing=db.prepare('SELECT * FROM task_draft_copies WHERE request_id=?').get(data.requestId);
+        if(existing) {
+          if(existing.source_id!==id||existing.source_version!==data.version)fail(409,'This copy request belongs to a different scope.');
+          const saved=find.get(existing.draft_id);
+          if(!saved)fail(410,'The recorded copy was removed. This request cannot recreate it.');
+          draft=JSON.parse(saved.data);reused=true;
+        } else {
+          const current=JSON.parse(find.get(id).data);
+          if(current.version!==data.version)fail(409,'The task changed. Review the current scope before copying.');
+          if(all().length>=100)fail(409,'This workspace has reached its 100-task capacity.');
+          draft={id:randomUUID(),version:0,status:'draft',...scope(copiedDraftScope(current,{active:active?.taskId===id})),
+            model:null,attempts:[],events:[]};
+          save(draft,'task.copied_as_draft');
+          db.prepare('INSERT INTO task_draft_copies VALUES (?,?,?,?)').run(data.requestId,id,data.version,draft.id);
+        }
+        db.exec('COMMIT');
+      } catch(error){db.exec('ROLLBACK');throw error;}
+      return send(reused?200:201,{task:view(draft),reused});
+    }
     if (action==='terminal') {
       if (active?.taskId!==id || latest(task)?.provider!=='opencode') fail(409,'No active OpenCode terminal.');
       const run=active;
-      const lease=currentLease(run);
-      if (data.command==='take') {
-        if (run.controller.signal.aborted || (lease && data.confirm!==true)) fail(409,'The terminal is already controlled or stopping.');
-        run.lease={id:randomUUID(),expires:Date.now()+15000};
-        addTerminal(run,lease?'Operator transferred control to this view.':'Operator took control.');
-        return send(200,{lease:run.lease.id});
-      }
-      if (!lease || data.lease!==lease.id) fail(409,'Terminal control expired or belongs to another view.');
-      if (data.command==='heartbeat') lease.expires=Date.now()+15000;
-      else if (data.command==='release' || data.command==='detach') {
-        run.lease=undefined;
-        addTerminal(run,data.command==='release'?'Operator released control.':'Operator detached. OpenCode continues.');
-      } else if (data.command==='status') addTerminal(run,run.controller.signal.aborted?'Stop is pending.':'OpenCode is running.');
-      else if (data.command==='stop' && data.confirm===true) {
-        run.lease=undefined;
-        addTerminal(run,'Operator requested Stop.');
-        run.controller.abort();
-      } else fail(400,'Choose a supported terminal control.');
-      return send(200,{accepted:true});
+      const result=run.control.command(data);
+      if(result.message)addTerminal(run,result.message);
+      if(result.stop)run.controller.abort();
+      return send(200,result.response);
     }
     if (data.version!==task.version) fail(409,'This task changed. Refresh and review its current state.');
     if (action==='remove') {
@@ -314,19 +457,30 @@ const server=http.createServer(async (req,res) => {
       task.model=need(data.model,100,'model');
       const provider=data.engine ?? (task.model==='fixture'?'fixture':'ollama');
       if (!Object.hasOwn(providers,provider) || (provider==='fixture')!==(task.model==='fixture')) fail(400,'Choose a supported route.');
-      const approvedModelDigest=provider==='fixture'?null:data.modelDigest;
-      if(provider!=='fixture'&&!matchesModelIdentity(approvedModelDigest,approvedModelDigest))
-        fail(400,'Refresh routes and select a model with a reported digest.');
+      const backend=provider==='fixture'?'fixture':data.backend??'ollama';
+      if(!['fixture','ollama','llamacpp'].includes(backend)||(backend==='llamacpp'&&provider!=='opencode')||
+          (backend==='fixture'&&provider!=='fixture'))fail(400,'Choose a supported local model route.');
+      const approvedModelDigest=provider==='fixture'||backend==='llamacpp'?null:data.modelDigest;
+      const approvedModelFingerprint=backend==='llamacpp'?data.modelFingerprint:null;
+      const approvedIdentity=backend==='llamacpp'?approvedModelFingerprint:approvedModelDigest;
+      if(provider!=='fixture'&&!matchesModelIdentity(approvedIdentity,approvedIdentity))
+        fail(400,'Refresh routes and select a model with available identity information.');
+      const revision=approvedRouteRevision(data);
+      const scopeBinding=[task.sourceHash,task.request,task.expected,task.kind,task.model,provider,backend,approvedIdentity];
+      if(revision!==undefined)scopeBinding.push(['routeRevision',revision]);
       const attempt={id:randomUUID(), model:task.model,provider,started:now(),status:'running', usage:null,
-        approvedModelDigest,scopeHash:hash(JSON.stringify([task.sourceHash,task.request,task.expected,task.kind,task.model,provider,approvedModelDigest]))};
+        backend,approvedModelDigest,approvedModelFingerprint,
+        ...(revision!==undefined?{approvedRouteRevision:revision}:{}),scopeHash:hash(JSON.stringify(scopeBinding))};
       attempt.execution={phase:'claimed',claimId:attempt.id,claimedAt:now()};
+      if(submission)attempt.submission=submission;
       task.attempts.push(attempt);
       task.status='running';
       save(task,'attempt.approved_and_started');
-      const run={taskId:id,controller:new AbortController(),chars:0,lastActivity:now(),terminal:[],lease:undefined};
+      const run={taskId:id,controller:new AbortController(),chars:0,lastActivity:now(),terminal:[],
+        control:createTerminalControl(attempt.id)};
       addTerminal(run,'Scope approved. Checking the selected route.');
       active=run;
-      send(202,view(task));
+      send(202,{...view(task),...(submission?{runSubmission:submissionResult(task,attempt,false)}:{})});
       void execute(task,run);
     } else if (action==='cancel') {
       if (active?.taskId!==id || task.status!=='running') fail(409,'No active request can be cancelled.');
@@ -334,6 +488,23 @@ const server=http.createServer(async (req,res) => {
       // The executor owns its in-memory copy and records the final outcome.
       active.controller.abort();
       return send(202,{status:'cancelling'});
+    } else if (action==='revise') {
+      const attempt=latest(task);
+      if(task.status!=='review'||!attempt?.artifact||data.artifactHash!==attempt.artifact.sha256)
+        fail(409,'The proposal changed or is no longer reviewable.');
+      const content=need(data.content,12000,'proposal');
+      if(content===attempt.artifact.content)fail(400,'The proposal has no changes to save.');
+      if((attempt.operatorEdits?.length??0)>=20)fail(409,'This attempt has reached its edit limit.');
+      const revised=inspect(task,{artifact:{summary:'Edited by the operator. Review the changes and checks.',content}});
+      if(!revised.artifact)fail(400,'The edited proposal could not be reviewed.');
+      const previous=attempt.artifact;
+      attempt.originalArtifact ??= previous;
+      attempt.operatorEdits ??= [];
+      attempt.operatorEdits.push({previousHash:previous.sha256,artifactHash:revised.artifact.sha256,at:now()});
+      attempt.artifact=revised.artifact;
+      attempt.checks=revised.checks;
+      save(task,'proposal.operator_edited');
+      return send(200,view(task));
     } else if (action==='review') {
       const attempt=latest(task);
       if (task.status!=='review' || data.artifactHash!==attempt?.artifact?.sha256) fail(409,'The proposal changed or is no longer reviewable.');

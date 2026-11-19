@@ -10,6 +10,14 @@ export function matchesModelIdentity(expected,actual) {
 export function assessRoute(route,freeBytes) {
   if(route?.engine==='fixture')return {eligible:true,reason:'Synthetic fixture only. It does not run a model.'};
   if(!['ollama','opencode'].includes(route?.engine))return {eligible:false,reason:'This route is not approved in the local preview.'};
+  if(route.backend==='llamacpp') {
+    if(route.engine!=='opencode')return {eligible:false,reason:'Choose the OpenCode route for llama.cpp.'};
+    if(!validBytes(route.bytes)||route.bytes>4000000000)return {eligible:false,reason:'The local model size is unavailable or exceeds 4 GB.'};
+    if(!validDigest(route.fingerprint))return {eligible:false,reason:'The server metadata fingerprint is unavailable.'};
+    if(!validBytes(freeBytes)||freeBytes<route.bytes+RESERVE_BYTES)
+      return {eligible:false,reason:'Available system memory is below the model-size plus 1.3 GB threshold.'};
+    return {eligible:true,reason:'The server metadata fingerprint does not verify model weights.'};
+  }
   if(!previewModels.has(route.id))return {eligible:false,reason:'This installed model is not enabled for the local preview yet.'};
   if(route.remote!==false)return {eligible:false,reason:'Ollama reports a remote destination or its locality is unknown. This preview does not approve cloud routing.'};
   if(route.cloudDisabled!==true)return {eligible:false,reason:'Ollama cloud features are enabled or their status is unavailable. This route is held.'};

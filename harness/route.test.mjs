@@ -38,3 +38,13 @@ test('the synthetic fixture is clearly separate and unknown engines are held',()
   assert.equal(assessRoute({engine:'unapproved-cloud',bytes:1},9000000000).eligible,false);
   assert.match(assessRoute({engine:'ollama',id:'another-local-model',bytes:1000},9000000000).reason,/not enabled/i);
 });
+
+test('an explicitly configured llama.cpp route is identified by metadata and checks free memory',()=>{
+  const route={engine:'opencode',backend:'llamacpp',id:'synthetic-model',bytes:2500000000,fingerprint:'b'.repeat(64)};
+  assert.equal(assessRoute(route,3799999999).eligible,false);
+  assert.equal(assessRoute(route,3800000000).eligible,true);
+  assert.match(assessRoute(route,3800000000).reason,/metadata/i);
+  assert.equal(assessRoute({...route,fingerprint:null},9000000000).eligible,false);
+  assert.equal(assessRoute({...route,bytes:4000000001},9000000000).eligible,false);
+  assert.equal(assessRoute({...route,engine:'ollama'},9000000000).eligible,false);
+});

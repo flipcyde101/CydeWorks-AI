@@ -3,6 +3,7 @@ const {randomUUID}=require('node:crypto');
 const {mkdirSync}=require('node:fs');
 const path=require('node:path');
 const {createUtilityWorker,launchWorkspace,requestLocal,queryWorkspaceStatus,createWriteFence}=require('./service.cjs');
+const {desktopChildEnvironment}=require('./environment.cjs');
 
 const root=path.resolve(__dirname,'..');
 const desktopData=path.join(root,'.state','desktop');
@@ -15,12 +16,9 @@ async function legacyPreviewActive() {
   catch(error) { if(error.code==='ECONNREFUSED')return false; throw error; }
 }
 function childEnvironment() {
-  const env=Object.fromEntries(['PATH','PATHEXT','SystemRoot','WINDIR','ComSpec','LANG','LC_ALL','BFE_OLLAMA_PORT']
-    .filter(key=>process.env[key]).map(key=>[key,process.env[key]]));
   const temporary=path.join(desktopData,'temp');
   mkdirSync(temporary,{recursive:true});
-  Object.assign(env,{TEMP:temporary,TMP:temporary});
-  return env;
+  return desktopChildEnvironment(process.env,temporary);
 }
 async function activeRunState() {
   if(!serviceAlive||!service?.child.connected)return 'unknown';
