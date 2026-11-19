@@ -570,7 +570,8 @@ test('completion reports 100 percent, 0 remaining steps, 0 ETA and recorded comp
   assert.equal(state.percent,100);
   assert.equal(state.stepRate,0.5);
   assert.equal(state.overallEtaMs,0);
-  assert.equal(state.currentStepEtaMs,0);
+  assert.equal(state.currentStepEtaMs,null);
+  assert.match(state.currentStepEta,/not measured/i);
   assert.equal(state.projectedCompletionMs,then+8000);
   assert.equal(state.projectedCompletionAt,endedAt);
   assert.match(state.completion,/completed/i);
@@ -962,7 +963,7 @@ test('current-step work activity prevents false stalls, updates latest activity 
   },attempt,then+65000);
   assert.equal(activeCurrentStepWork.stalled,false);
   assert.equal(activeCurrentStepWork.phase,'active');
-  assert.equal(activeCurrentStepWork.status,'Running step 3 of 5');
+  assert.equal(activeCurrentStepWork.status,'Running Verify checks (2 of 5 steps complete)');
   assert.equal(activeCurrentStepWork.lastActivity,then+64000);
   assert.equal(activeCurrentStepWork.lastActivityAt,new Date(then+64000).toISOString());
   assert.equal(activeCurrentStepWork.idleMs,1000);
@@ -1408,7 +1409,7 @@ test('allowlisted measured units are preserved without mislabeling non-step coun
   const filesState=describeProgress(filesTask,attempt,then+5000);
   assert.equal(filesState.unit,'files');
   assert.equal(filesState.unitSingular,'file');
-  assert.equal(filesState.status,'Running file 3 of 5');
+  assert.equal(filesState.status,'Running Run checks (2 of 5 files complete)');
   assert.match(filesState.explanation,/2 of 5 files complete/i);
   assert.doesNotMatch(filesState.explanation,/\bsteps?\b/i);
   assert.match(filesState.remaining,/3 of 5 files remaining/i);
@@ -1535,4 +1536,201 @@ test('allowlisted measured units are preserved without mislabeling non-step coun
   assert.equal(badSubUnit.currentStep.unitSingular,null);
   assert.equal(badSubUnit.currentStepEtaMs,null);
   assert.doesNotMatch(badSubUnit.currentStepEta,/<img/i);
+});
+
+test('completion ETA is null for missing, rejected, or label-only counters and zero only when measured remaining count equals zero',()=>{
+  const attempt={started:start,status:'completed',execution:{phase:'settled',dispatchedAt:start}};
+
+  // 1. Authoritative completion with no measured counters at all preserves completion status without inventing 0 ETAs.
+  const noCounters=describeProgress({status:'complete'},attempt,then+5000);
+  assert.equal(noCounters.phase,'complete');
+  assert.equal(noCounters.complete,true);
+  assert.equal(noCounters.status,'Complete');
+  assert.equal(noCounters.overallEtaMs,null);
+  assert.equal(noCounters.currentStepEtaMs,null);
+  assert.equal(noCounters.eta,noCounters.currentStepEta);
+  assert.doesNotMatch(noCounters.overallEta,/no remaining/i);
+  assert.match(noCounters.unavailableReasons.overallEta,/unknown/i);
+  assert.match(noCounters.unavailableReasons.currentStepEta,/not measured/i);
+
+  // 2. Authoritative completion with rejected counters preserves completion status and keeps numeric ETAs null.
+  const rejectedCounters=describeProgress({
+    status:'complete',
+    live:{
+      complete:true,
+      steps:{
+        measured:true,
+        unit:'chars',
+        completed:120,
+        total:120,
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(rejectedCounters.phase,'complete');
+  assert.equal(rejectedCounters.complete,true);
+  assert.equal(rejectedCounters.status,'Complete');
+  assert.equal(rejectedCounters.stepSamplesValid,false);
+  assert.equal(rejectedCounters.unit,null);
+  assert.equal(rejectedCounters.overallEtaMs,null);
+  assert.equal(rejectedCounters.currentStepEtaMs,null);
+  assert.match(rejectedCounters.overallEta,/character/i);
+  assert.match(rejectedCounters.unavailableReasons.overallEta,/character/i);
+
+  // 3. Complete overall 4/4 with label-only currentStep gives 0 overallEtaMs and null currentStepEtaMs.
+  const labelOnlySubComplete=describeProgress({
+    status:'complete',
+    live:{
+      complete:true,
+      steps:{
+        measured:true,
+        completed:4,
+        total:4,
+        currentStep:{index:4,label:'Finalize report'},
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(labelOnlySubComplete.complete,true);
+  assert.equal(labelOnlySubComplete.overallEtaMs,0);
+  assert.equal(labelOnlySubComplete.currentStep.etaMs,null);
+  assert.equal(labelOnlySubComplete.currentStepEtaMs,null);
+  assert.match(labelOnlySubComplete.unavailableReasons.currentStepEta,/not measured/i);
+
+  // 4. Complete overall 4/4 AND genuinely zero remaining current-step work returns 0 for both ETAs.
+  const genuineZeroBoth=describeProgress({
+    status:'complete',
+    live:{
+      complete:true,
+      steps:{
+        measured:true,
+        completed:4,
+        total:4,
+        currentStep:{
+          label:'Finalize report',
+          measured:true,
+          completed:3,
+          total:3,
+        },
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(genuineZeroBoth.complete,true);
+  assert.equal(genuineZeroBoth.overallEtaMs,0);
+  assert.equal(genuineZeroBoth.currentStep.etaMs,0);
+  assert.equal(genuineZeroBoth.currentStepEtaMs,0);
+});
+
+test('status reports aggregate measured counts and separate current-step labels without inventing serial ordinals',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  const noLabelParallelFiles=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4500).toISOString(),
+      steps:{
+        measured:true,
+        unit:'files',
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(noLabelParallelFiles.phase,'active');
+  assert.equal(noLabelParallelFiles.status,'Measured progress: 2 of 5 files complete');
+  assert.doesNotMatch(noLabelParallelFiles.status,/file 3 of 5/i);
+
+  const waitingWithLabel=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+1000).toISOString(),
+      heartbeat:new Date(then+19000).toISOString(),
+      steps:{
+        measured:true,
+        unit:'files',
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+1000).toISOString(),done:2},
+        ],
+        currentStep:'Run checks',
+      },
+    },
+  },attempt,then+20000);
+  assert.equal(waitingWithLabel.phase,'waiting');
+  assert.equal(waitingWithLabel.status,'Waiting: Run checks (2 of 5 files complete)');
+  assert.doesNotMatch(waitingWithLabel.status,/file 3 of 5/i);
+  assert.match(waitingWithLabel.explanation,/Run checks/);
+});
+
+test('source validation rejects UTF-16 and output-derived sources even with valid discrete units while allowing discrete sources',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  const badSources=[
+    'model-output-utf16',
+    'utf-16-length',
+    'stream-output',
+    'code-unit-counter',
+    'string.length',
+    'response-output-size',
+    'heuristic',
+    '<script>worker</script>',
+  ];
+  for (const badSource of badSources) {
+    const rejected=describeProgress({
+      status:'running',
+      live:{
+        lastActivity:new Date(then+4000).toISOString(),
+        heartbeat:new Date(then+4500).toISOString(),
+        steps:{
+          measured:true,
+          unit:'files',
+          source:badSource,
+          completed:2,
+          total:5,
+          samples:[
+            {at:start,done:0},
+            {at:new Date(then+4000).toISOString(),done:2},
+          ],
+        },
+      },
+    },attempt,then+5000);
+    assert.equal(rejected.totalKnown,false,badSource);
+    assert.equal(rejected.stepSamplesValid,false,badSource);
+    assert.equal(rejected.unit,null,badSource);
+    assert.equal(rejected.overallEtaMs,null,badSource);
+    assert.equal(rejected.projectedCompletionMs,null,badSource);
+    assert.ok(typeof rejected.stepRejectionReason==='string'&&rejected.stepRejectionReason.length>0,badSource);
+  }
+
+  const goodSources=['worker','file-scanner','test-runner','compiler'];
+  for (const goodSource of goodSources) {
+    const accepted=describeProgress({
+      status:'running',
+      live:{
+        lastActivity:new Date(then+4000).toISOString(),
+        heartbeat:new Date(then+4500).toISOString(),
+        steps:{
+          measured:true,
+          unit:'files',
+          source:goodSource,
+          completed:2,
+          total:5,
+          samples:[
+            {at:start,done:0},
+            {at:new Date(then+4000).toISOString(),done:2},
+          ],
+        },
+      },
+    },attempt,then+5000);
+    assert.equal(accepted.totalKnown,true,goodSource);
+    assert.equal(accepted.stepSamplesValid,true,goodSource);
+    assert.equal(accepted.unit,'files',goodSource);
+    assert.equal(accepted.doneTotal,'2/5',goodSource);
+    assert.equal(accepted.overallEtaMs,6000,goodSource);
+  }
 });
