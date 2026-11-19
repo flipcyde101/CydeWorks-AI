@@ -46,7 +46,7 @@ function evaluateJsonCompletion(buffer,expectedChoices) {
     return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
   if(parsed.error!==undefined&&parsed.error!==null)
     return {settled:false,evidence:'upstream-error',finishReasons:[]};
-  if(parsed.id!==undefined&&(typeof parsed.id!=='string'||!parsed.id))
+  if(parsed.id!==undefined&&(typeof parsed.id!=='string'||!parsed.id||!parsed.id.isWellFormed()))
     return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
   if(parsed.object!==undefined&&parsed.object!=='chat.completion')
     return {settled:false,evidence:'ambiguous-response',finishReasons:[]};
@@ -90,7 +90,8 @@ function evaluateJsonCompletion(buffer,expectedChoices) {
 
 function createSseTracker(expectedChoices,tryReserveObservation,releaseObservation) {
   const decoder=new TextDecoder('utf-8',{fatal:true});
-  let lineBuffer='';
+  let lineBuffer=null;
+  let lineBytes=0;
   let ignoreNextLf=false;
   let isErrorEvent=false;
   let eventDataLines=[];
@@ -105,7 +106,8 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
   const choiceFinishReasons=expectedChoices?new Array(expectedChoices).fill(null):[];
 
   const clearBuffers=()=>{
-    lineBuffer='';
+    lineBuffer=null;
+    lineBytes=0;
     eventDataLines=[];
     eventDataBytes=0;
     releaseObservation();
@@ -122,15 +124,15 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
     if(wasErrorEvent) {
       eventDataLines=[];
       eventDataBytes=0;
-      tryReserveObservation(Buffer.byteLength(lineBuffer));
+      tryReserveObservation(lineBuffer?.length??0);
       sawError=true;
       return;
     }
     if(eventDataLines.length===0)return;
-    const payload=eventDataLines.join('\n');
+    const payload=eventDataLines.map(line=>line.toString('utf8')).join('\n');
     eventDataLines=[];
     eventDataBytes=0;
-    tryReserveObservation(Buffer.byteLength(lineBuffer));
+    tryReserveObservation(lineBuffer?.length??0);
     if(sawDone) {
       try {
         const afterDone=JSON.parse(payload);
@@ -149,7 +151,7 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
     if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)){sawMalformed=true;return;}
     if(parsed.error!==undefined&&parsed.error!==null){sawError=true;return;}
     if(parsed.id!==undefined) {
-      if(typeof parsed.id!=='string'||!parsed.id){sawMalformed=true;return;}
+      if(typeof parsed.id!=='string'||!parsed.id||!parsed.id.isWellFormed()){sawMalformed=true;return;}
       const idDigest=createHash('sha256').update(parsed.id).digest('hex');
       if(sawMissingCompletionId){sawDuplicateOrContradictory=true;return;}
       if(completionId===null)completionId=idDigest;
@@ -206,7 +208,10 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
         failObservationLimit();
         return;
       }
-      eventDataLines.push(value);
+      // Keep an owned allocation so a short value cannot retain the whole decoded chunk.
+      const stored=Buffer.allocUnsafeSlow(valueBytes);
+      stored.write(value,0,valueBytes,'utf8');
+      eventDataLines.push(stored);
       eventDataBytes+=valueBytes;
     }
   };
@@ -231,21 +236,32 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
         else next=cr!==-1?cr:lf;
         if(next===-1) {
           const tail=text.slice(pos);
-          const nextBytes=Buffer.byteLength(lineBuffer)+Buffer.byteLength(tail);
-          if(nextBytes>MAX_SSE_LINE_BYTES||!tryReserveObservation(nextBytes+eventDataBytes)) {
+          const tailBytes=Buffer.byteLength(tail);
+          const nextBytes=lineBytes+tailBytes;
+          const capacity=lineBuffer?.length??0;
+          const nextCapacity=nextBytes<=capacity?capacity:
+            Math.min(MAX_SSE_LINE_BYTES,Math.max(nextBytes,capacity*2));
+          if(nextBytes>MAX_SSE_LINE_BYTES||!tryReserveObservation(nextCapacity+eventDataBytes)) {
             failObservationLimit();
             return false;
           }
-          lineBuffer+=tail;
+          if(nextCapacity!==capacity) {
+            const grown=Buffer.allocUnsafeSlow(nextCapacity);
+            lineBuffer?.copy(grown,0,0,lineBytes);
+            lineBuffer=grown;
+          }
+          lineBuffer.write(tail,lineBytes,tailBytes,'utf8');
+          lineBytes=nextBytes;
           return true;
         }
         const segment=text.slice(pos,next);
-        if(Buffer.byteLength(lineBuffer)+Buffer.byteLength(segment)>MAX_SSE_LINE_BYTES) {
+        if(lineBytes+Buffer.byteLength(segment)>MAX_SSE_LINE_BYTES) {
           failObservationLimit();
           return false;
         }
-        const fullLine=lineBuffer+segment;
-        lineBuffer='';
+        const fullLine=(lineBuffer?.toString('utf8',0,lineBytes)??'')+segment;
+        lineBuffer=null;
+        lineBytes=0;
         processLine(fullLine);
         if(observationLimitExceeded)return false;
         if(text[next]==='\r') {
@@ -256,18 +272,18 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
           pos=next+1;
         }
       }
-      if(!tryReserveObservation(Buffer.byteLength(lineBuffer)+eventDataBytes)){failObservationLimit();return false;}
+      if(!tryReserveObservation((lineBuffer?.length??0)+eventDataBytes)){failObservationLimit();return false;}
       return true;
     },
     finish(complete) {
+      let hadDangling=lineBytes>0||eventDataLines.length>0;
       if(!observationLimitExceeded) {
         try {
           const tail=decoder.decode();
-          if(tail)lineBuffer+=tail;
+          if(tail)hadDangling=true;
         } catch {sawMalformed=true;}
       }
       if(isErrorEvent)sawError=true;
-      const hadDangling=lineBuffer.length>0||eventDataLines.length>0;
       clearBuffers();
       const allChoicesFinished=expectedChoices!==null&&choiceFinishReasons.every(reason=>reason!==null);
       const settled=complete&&!observationLimitExceeded&&!sawError&&!sawMalformed&&
