@@ -13,21 +13,40 @@ import {
 import {tmpdir} from 'node:os';
 import {isAbsolute, join, relative, resolve} from 'node:path';
 import {digest as jsonOrTextDigest} from './runner-lifecycle.mjs';
+import {authenticateVerifierEvidence, beginHostAcceptance} from './host-evidence-authenticator.mjs';
 
 /**
  * Standalone patch-binding helper for the fixed two-file synthetic fixture.
  *
+ * Internal contract change, fail-closed:
+ * verifyAndBindPatch no longer accepts a caller-supplied claim, a resolveClaim
+ * callback, or verification.trusted=true as proof. Those arguments are
+ * rejected. The host must create a controller with createVerifiedPatchController
+ * before it reads verifier evidence. The controller owns the nonce the host
+ * issued, the in-memory HMAC key, and the claim record the host resolved
+ * from its own store. Received evidence authenticates only when its
+ * HMAC-SHA256 matches the Python canonical attestation format. A plain
+ * object with trusted=true is not proof.
+ *
  * Trust boundary:
- * - This helper verifies structural consistency and cryptographic SHA-256 binding
- *   across the pinned base repository, an independently resolved host-owned claim
- *   record, the unified patch reapplied onto an isolated disposable base copy,
- *   and verifier output metadata.
- * - Caller-supplied `trusted: true` flags on `verification` or `resolveClaim`
- *   results are explicit acceptance gates only; they do NOT prove provenance.
- *   The host caller must enforce that `resolveClaim` reads only a host-protected
- *   claim store/journal and that verifier attestations come from a sealed
- *   verifier boundary outside candidate control.
+ * - Evidence, candidate bytes, and patch text are untrusted until HMAC
+ *   authentication, scope binding, all 12 case rows, and disposable patch
+ *   reproduction succeed.
+ * - Returned file digests and the patch digest are recomputed from the
+ *   reproduced bytes and the patch text that was applied.
+ * - The key is not written to logs, child arguments, the environment, or files.
+ * - Nonce acceptance is single-use for one controller instance. This module
+ *   does not keep a durable cross-process replay store.
+ * - Fixture-only: limits.py and measurement.py, 12 synthetic cases.
+ *   No pilot, browser, provider, live data, or general repo execution.
  */
+
+export {
+  createVerifiedPatchController,
+  canonicalAttestationHmac,
+  FIXED_CASES,
+  FIXED_CASES_DIGEST,
+} from './host-evidence-authenticator.mjs';
 export const APPROVED_FIXTURE_FILES = Object.freeze(['limits.py', 'measurement.py']);
 const MAX_FILE_BYTES = 8192;
 const MAX_PATCH_BYTES = 65536;
@@ -37,11 +56,9 @@ const GIT_MAX_BUFFER = 262144;
 
 const HEX_REV_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
-const CLAIM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CTRL_RE = /[\x00-\x1f\x7f]/;
 const WIN_RESERVED_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 const SAFE_ENV = new Set(['path', 'pathext', 'systemroot', 'windir', 'comspec', 'temp', 'tmp', 'tmpdir']);
-const SCOPE_KEYS = ['baseFileDigests', 'baseRevision', 'casesDigest', 'files', 'totalCases'].join('\0');
 
 const GIT_BIN = process.platform === 'win32' ? 'git.exe' : 'git';
 const NULL_DEV = process.platform === 'win32' ? 'NUL' : '/dev/null';
@@ -188,94 +205,6 @@ export function buildScope({baseRevision, baseFileDigests, cases, files = APPROV
   return Object.freeze({scope, scopeHash: jsonOrTextDigest(scope)});
 }
 
-function parseAndBindScope(scope, scopeHash, expectedRev, actualBaseDigests, label) {
-  if (typeof scopeHash !== 'string' || !HEX_SHA256_RE.test(scopeHash) || !isPlainObj(scope)) {
-    throw Error(`${label} must include scope and valid scopeHash.`);
-  }
-  if (Object.keys(scope).sort(cmp).join('\0') !== SCOPE_KEYS) {
-    throw Error(`${label} scope keys do not match required binding schema.`);
-  }
-  if (!Array.isArray(scope.files) || scope.files.join('\0') !== APPROVED_FIXTURE_FILES.join('\0') ||
-      scope.baseRevision !== expectedRev ||
-      typeof scope.casesDigest !== 'string' || !HEX_SHA256_RE.test(scope.casesDigest) ||
-      !Number.isSafeInteger(scope.totalCases) || scope.totalCases <= 0 || scope.totalCases > MAX_CASES) {
-    throw Error(`${label} scope binding fields are invalid or mismatched.`);
-  }
-  const boundBaseDigests = normalizeDigestMap(scope.baseFileDigests, `${label}.scope.baseFileDigests`);
-  for (const name of APPROVED_FIXTURE_FILES) {
-    if (boundBaseDigests[name] !== actualBaseDigests[name]) {
-      throw Error(`${label} scope base digest mismatch for ${name}.`);
-    }
-  }
-  const canonicalScope = Object.freeze({
-    files: APPROVED_FIXTURE_FILES,
-    baseRevision: expectedRev,
-    baseFileDigests: boundBaseDigests,
-    casesDigest: scope.casesDigest,
-    totalCases: scope.totalCases,
-  });
-  if (jsonOrTextDigest(scope) !== scopeHash || jsonOrTextDigest(canonicalScope) !== scopeHash) {
-    throw Error(`${label} scopeHash does not match recomputed canonical scope digest.`);
-  }
-  return Object.freeze({scope: canonicalScope, scopeHash});
-}
-
-function resolveProtectedClaim(claim, resolveClaim, expectedRev, actualBaseDigests, approvedCases) {
-  if (!isPlainObj(claim) || typeof claim.claimId !== 'string' || !CLAIM_ID_RE.test(claim.claimId)) {
-    throw Error('Claim must include a valid claimId.');
-  }
-  if (typeof resolveClaim !== 'function') {
-    throw Error('A protected host-owned claim resolver (resolveClaim) is required.');
-  }
-  const resolved = resolveClaim(claim.claimId);
-  if (!isPlainObj(resolved) || resolved.trusted !== true || resolved.untrusted === true) {
-    throw Error('Missing or untrusted host claim resolution.');
-  }
-  if (resolved.claimId !== claim.claimId) {
-    throw Error('Resolved host claimId does not match requested claimId.');
-  }
-
-  const protectedRecord = parseAndBindScope(
-    resolved.scope,
-    resolved.scopeHash,
-    expectedRev,
-    actualBaseDigests,
-    'Protected claim',
-  );
-  const suppliedRecord = parseAndBindScope(
-    claim.scope,
-    claim.scopeHash,
-    expectedRev,
-    actualBaseDigests,
-    'Supplied claim',
-  );
-
-  if (suppliedRecord.scopeHash !== protectedRecord.scopeHash ||
-      suppliedRecord.scope.baseRevision !== protectedRecord.scope.baseRevision ||
-      suppliedRecord.scope.casesDigest !== protectedRecord.scope.casesDigest ||
-      suppliedRecord.scope.totalCases !== protectedRecord.scope.totalCases ||
-      suppliedRecord.scope.files.join('\0') !== protectedRecord.scope.files.join('\0') ||
-      APPROVED_FIXTURE_FILES.some(
-        name => suppliedRecord.scope.baseFileDigests[name] !== protectedRecord.scope.baseFileDigests[name],
-      )) {
-    throw Error('Supplied claim scope or scopeHash does not match protected host record.');
-  }
-
-  if (approvedCases !== undefined) {
-    const parsed = parseApprovedCases(approvedCases);
-    if (parsed.casesDigest !== protectedRecord.scope.casesDigest ||
-        parsed.totalCases !== protectedRecord.scope.totalCases) {
-      throw Error('Protected claim check digest or count does not match parsed approved cases.');
-    }
-  }
-
-  return Object.freeze({
-    claimId: resolved.claimId,
-    scope: protectedRecord.scope,
-    scopeHash: protectedRecord.scopeHash,
-  });
-}
-
 function runGit(args, {cwd, input, encoding = 'utf8'} = {}) {
   if (args.some(a => typeof a !== 'string' || CTRL_RE.test(a))) throw Error('Unsafe Git argument.');
   const env = Object.fromEntries(
@@ -417,102 +346,94 @@ export function buildCandidatePatch({baseRepoDir, baseRevision, candidateFiles, 
   }
 }
 
-export function verifyAndBindPatch({
-  baseRepoDir,
-  baseRevision,
-  claim,
-  resolveClaim,
-  verification,
-  patch,
-  approvedCases,
-  candidateFiles,
-  scratchRoot,
-}) {
-  if (typeof baseRevision !== 'string' || !HEX_REV_RE.test(baseRevision)) throw Error('Invalid baseRevision commit SHA.');
-  const patchSha256 = validatePatchAllowlist(patch);
-  const base = inspectBaseRepo(baseRepoDir, baseRevision);
-  const resolvedClaim = resolveProtectedClaim(claim, resolveClaim, baseRevision, base.fileDigests, approvedCases);
-  const boundScope = resolvedClaim.scope;
+const REJECTED_AUTHORITY_KEYS = Object.freeze([
+  'verification', 'resolveClaim', 'claim', 'attestationKey', 'expectedInvocationNonce', 'trusted',
+]);
 
-  // Note: `verification.trusted === true` is only a caller-supplied attestation gate;
-  // provenance must be enforced by the host caller via a sealed verifier channel.
-  if (!isPlainObj(verification) || verification.trusted !== true || verification.untrusted === true ||
-      verification.passed !== true ||
-      verification.claimId !== resolvedClaim.claimId || verification.baseRevision !== baseRevision ||
-      verification.casesDigest !== boundScope.casesDigest || verification.totalCases !== boundScope.totalCases ||
-      verification.passedCases !== boundScope.totalCases ||
-      !Array.isArray(verification.failures) || verification.failures.length !== 0) {
-    throw Error('Missing, mismatched, or invalid verifier attestation.');
+export function verifyAndBindPatch(options) {
+  if (!isPlainObj(options) || REJECTED_AUTHORITY_KEYS.some(key => Object.hasOwn(options, key))) {
+    throw Error('Caller-supplied trusted flags are not accepted.');
   }
-  if (verification.results !== undefined) {
-    if (!Array.isArray(verification.results) || verification.results.length !== boundScope.totalCases ||
-        verification.results.some(r => !isPlainObj(r) || Object.keys(r).join('\0') !== 'value' || !Number.isSafeInteger(r.value))) {
-      throw Error('Invalid parsed verifier results payload.');
-    }
-  }
-  const verifiedDigests = normalizeDigestMap(verification.fileDigests, 'verification.fileDigests');
-  const expectedTreeSha = jsonOrTextDigest(APPROVED_FIXTURE_FILES.map(name => [name, verifiedDigests[name]]));
-  if (verification.treeSha256 !== expectedTreeSha) throw Error('Verifier treeSha256 mismatch.');
-
-  let expectedRawBytes = null;
-  if (candidateFiles !== undefined) {
-    const cand = computeSortedFileDigests(candidateFiles);
-    for (const name of APPROVED_FIXTURE_FILES) {
-      if (cand.fileDigests[name] !== verifiedDigests[name]) throw Error(`Candidate digest mismatch for ${name}.`);
-    }
-    expectedRawBytes = cand.fileBytes;
-  }
-
-  const scratch = makeScratch(scratchRoot);
-  let indexOutcome;
+  const {controller, baseRepoDir, baseRevision, evidence, patch, approvedCases, candidateFiles, scratchRoot} = options;
+  const acceptance = beginHostAcceptance(controller);
+  let committed = false;
   try {
-    const dir = join(scratch, 'base-copy');
-    initDisposableCopy(dir, base.baseFiles);
-    runGit(['apply', '--check', '--index', '-'], {cwd: dir, input: patch});
-    runGit(['apply', '--index', '-'], {cwd: dir, input: patch});
-    indexOutcome = deriveAndVerifyDisposableIndex(dir);
-  } finally {
-    rmSync(scratch, {recursive: true, force: true});
-  }
-
-  const {derivedChanged, reproduced} = indexOutcome;
-  for (const name of APPROVED_FIXTURE_FILES) {
-    if (reproduced.fileDigests[name] !== verifiedDigests[name] ||
-        (expectedRawBytes && !reproduced.fileBytes[name].equals(expectedRawBytes[name]))) {
-      throw Error(`Reproduced raw bytes mismatch for ${name}.`);
+    if (typeof baseRevision !== 'string' || !HEX_REV_RE.test(baseRevision)) throw Error('Invalid baseRevision commit SHA.');
+    const patchSha256 = validatePatchAllowlist(patch);
+    const base = inspectBaseRepo(baseRepoDir, baseRevision);
+    const authenticated = authenticateVerifierEvidence(controller, evidence, {
+      actualBaseRevision: baseRevision,
+      actualBaseDigests: base.fileDigests,
+      approvedCases,
+    });
+    let expectedRawBytes = null;
+    if (candidateFiles !== undefined) {
+      const cand = computeSortedFileDigests(candidateFiles);
+      for (const name of APPROVED_FIXTURE_FILES) {
+        if (cand.fileDigests[name] !== authenticated.fileDigests[name]) throw Error(`Candidate digest mismatch for ${name}.`);
+      }
+      expectedRawBytes = cand.fileBytes;
     }
-    if (reproduced.fileDigests[name] === base.fileDigests[name]) {
-      throw Error(`Approved file ${name} remained unchanged.`);
+
+    const scratch = makeScratch(scratchRoot);
+    let indexOutcome;
+    try {
+      const dir = join(scratch, 'base-copy');
+      initDisposableCopy(dir, base.baseFiles);
+      runGit(['apply', '--check', '--index', '-'], {cwd: dir, input: patch});
+      runGit(['apply', '--index', '-'], {cwd: dir, input: patch});
+      indexOutcome = deriveAndVerifyDisposableIndex(dir);
+    } finally {
+      rmSync(scratch, {recursive: true, force: true});
     }
-  }
-  if (reproduced.treeSha256 !== verification.treeSha256) throw Error('Reproduced treeSha256 mismatch.');
 
-  const postBase = inspectBaseRepo(baseRepoDir, baseRevision);
-  if (postBase.treeSha256 !== base.treeSha256) throw Error('Base repository changed during verification.');
+    const {derivedChanged, reproduced} = indexOutcome;
+    for (const name of APPROVED_FIXTURE_FILES) {
+      if (reproduced.fileDigests[name] !== authenticated.fileDigests[name] ||
+          (expectedRawBytes && !reproduced.fileBytes[name].equals(expectedRawBytes[name]))) {
+        throw Error(`Reproduced raw bytes mismatch for ${name}.`);
+      }
+      if (reproduced.fileDigests[name] === base.fileDigests[name]) {
+        throw Error(`Approved file ${name} remained unchanged.`);
+      }
+    }
+    if (reproduced.treeSha256 !== authenticated.treeSha256) throw Error('Reproduced treeSha256 mismatch.');
+    const returnedPatchSha256 = validatePatchAllowlist(patch);
+    if (returnedPatchSha256 !== patchSha256) throw Error('Patch digest changed before return.');
 
-  return Object.freeze({
-    status: 'verified-patch',
-    claimId: resolvedClaim.claimId,
-    scopeHash: resolvedClaim.scopeHash,
-    scope: boundScope,
-    baseRevision,
-    baseFileDigests: base.fileDigests,
-    baseTreeSha256: base.treeSha256,
-    files: APPROVED_FIXTURE_FILES,
-    fileDigests: reproduced.fileDigests,
-    treeSha256: reproduced.treeSha256,
-    patchSha256,
-    patchedFiles: derivedChanged,
-    verification: Object.freeze({
-      callerAssertedTrusted: true,
-      passed: true,
-      claimId: resolvedClaim.claimId,
+    const postBase = inspectBaseRepo(baseRepoDir, baseRevision);
+    if (postBase.treeSha256 !== base.treeSha256) throw Error('Base repository changed during verification.');
+
+    acceptance.commit();
+    committed = true;
+    return Object.freeze({
+      status: 'verified-patch',
+      claimId: authenticated.claimId,
+      scopeHash: authenticated.scopeHash,
+      scope: authenticated.scope,
       baseRevision,
-      casesDigest: boundScope.casesDigest,
-      totalCases: boundScope.totalCases,
-      passedCases: verification.passedCases,
-    }),
-    baseUnchanged: true,
-    reproducedFromDisposableBase: true,
-  });
+      baseFileDigests: base.fileDigests,
+      baseTreeSha256: base.treeSha256,
+      files: APPROVED_FIXTURE_FILES,
+      fileDigests: reproduced.fileDigests,
+      treeSha256: reproduced.treeSha256,
+      patchSha256: returnedPatchSha256,
+      patchedFiles: derivedChanged,
+      verification: Object.freeze({
+        provenanceAuthenticated: true,
+        passed: true,
+        claimId: authenticated.claimId,
+        invocationNonce: authenticated.invocationNonce,
+        baseRevision,
+        casesDigest: authenticated.casesDigest,
+        totalCases: authenticated.totalCases,
+        passedCases: authenticated.passedCases,
+        caseRowsBound: authenticated.totalCases,
+      }),
+      baseUnchanged: true,
+      reproducedFromDisposableBase: true,
+    });
+  } finally {
+    if (!committed) acceptance.abort();
+  }
 }
