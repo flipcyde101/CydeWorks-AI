@@ -4,6 +4,19 @@
 // makes zero network calls, invokes zero models, reads zero credentials or
 // environment variables, and never executes candidate code.
 //
+// Input boundary: createSyntheticRunnerFixture(optionsJson, clock) and all
+// caller-controlled request operations (start, events, inspect, stop, collect)
+// accept bounded UTF-8 JSON strings (<= SYNTHETIC_BOUNDS.maxInputBytes) only.
+// Raw objects, arrays, functions, proxies, and other non-string values are
+// rejected in O(1) before property enumeration or trap invocation. Future
+// adapters must construct bounded JSON explicitly from individually validated
+// scalar fields and must never serialize arbitrary caller-supplied objects.
+//
+// Host clock boundary: the optional clock parameter is a trusted process-local
+// test/configuration function and must never be sourced from HTTP, IPC, or a
+// caller-supplied trust flag. Same-process hostile code is outside this
+// fixture's security boundary.
+//
 // All outcomes, checks, usage fields, and receipt-like payloads are explicitly
 // labeled synthetic with no model run and no real charge.
 
@@ -121,7 +134,8 @@ export const SYNTHETIC_LIMITS = Object.freeze([
   'Synthetic check summaries are pinned in-memory placeholders and do not constitute protected verification.',
   'No real provider charge occurred; charge evidence remains unavailable.',
   'In-memory fixture state is volatile and does not provide durable replay or claim protection across process restarts.',
-  'Raw JS object inputs cannot be property-counted before enumeration; pass bounded serialized JSON strings for pre-enumeration input size enforcement.',
+  'Options and all request operations accept bounded UTF-8 JSON strings (<= 8192 bytes) only; future adapters must construct JSON from validated scalar fields.',
+  'Injected clock hooks are trusted process-local test functions (never from HTTP, IPC, or caller trust flags); same-process hostile code is outside this fixture boundary.',
   'Windows Stop, controller recovery, protected verifier, patch-binding, and Sol High safety gates remain separate and mandatory.',
 ]);
 
@@ -214,23 +228,23 @@ function readPlainRecord(value, allowedKeys, code = 'INVALID_INPUT') {
   return out;
 }
 
-function readBoundedInput(input, allowedKeys, code = 'INVALID_INPUT') {
-  if (typeof input === 'string') {
-    if (input.length === 0 || input.length > SYNTHETIC_BOUNDS.maxInputBytes) {
-      fail(code);
-    }
-    if (Buffer.byteLength(input, 'utf8') > SYNTHETIC_BOUNDS.maxInputBytes) {
-      fail(code);
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(input);
-    } catch {
-      fail(code);
-    }
-    return readPlainRecord(parsed, allowedKeys, code);
+function parseBoundedJsonRecord(input, allowedKeys, code = 'INVALID_INPUT') {
+  if (typeof input !== 'string') {
+    fail(code);
   }
-  return readPlainRecord(input, allowedKeys, code);
+  if (input.length === 0 || input.length > SYNTHETIC_BOUNDS.maxInputBytes) {
+    fail(code);
+  }
+  if (Buffer.byteLength(input, 'utf8') > SYNTHETIC_BOUNDS.maxInputBytes) {
+    fail(code);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
+    fail(code);
+  }
+  return readPlainRecord(parsed, allowedKeys, code);
 }
 
 function readSafeId(value, code = 'INVALID_INPUT') {
@@ -496,14 +510,14 @@ function buildEvent({workerId, attemptId, sequence, type, phase, status, reason,
   };
 }
 
-export function createSyntheticRunnerFixture(options = {}) {
-  const opts = options === undefined ? Object.create(null) : readBoundedInput(
-    options,
-    ['clock', 'initialTimeMs', 'stepMs', 'maxActiveRuns', 'maxRetainedRuns', 'maxEventsPerRun', 'maxEventBytes', 'maxEventsPerRead'],
+export function createSyntheticRunnerFixture(optionsJson = '{}', clock = undefined) {
+  const opts = parseBoundedJsonRecord(
+    optionsJson,
+    ['initialTimeMs', 'stepMs', 'maxActiveRuns', 'maxRetainedRuns', 'maxEventsPerRun', 'maxEventBytes', 'maxEventsPerRead'],
     'INVALID_OPTIONS',
   );
 
-  if (opts.clock !== undefined && typeof opts.clock !== 'function') {
+  if (clock !== undefined && typeof clock !== 'function') {
     fail('INVALID_OPTIONS');
   }
   const initialTimeMs = opts.initialTimeMs === undefined
@@ -528,7 +542,7 @@ export function createSyntheticRunnerFixture(options = {}) {
     ? SYNTHETIC_BOUNDS.defaultMaxEventsPerRead
     : readBoundedInt(opts.maxEventsPerRead, 1, SYNTHETIC_BOUNDS.maxEventsPerReadLimit);
 
-  const rawClock = opts.clock ?? (() => initialTimeMs);
+  const rawClock = clock ?? (() => initialTimeMs);
   let tickOffsetMs = 0;
   let lastObservedClockMs;
 
@@ -711,8 +725,8 @@ export function createSyntheticRunnerFixture(options = {}) {
     }
   }
 
-  function lookupRun(input, allowedKeys) {
-    const args = readBoundedInput(input, allowedKeys);
+  function lookupRun(inputJson, allowedKeys) {
+    const args = parseBoundedJsonRecord(inputJson, allowedKeys);
     const workerId = readSafeId(args.workerId);
     const run = runs.get(workerId);
     if (!run) fail('WORKER_NOT_FOUND');
@@ -809,9 +823,9 @@ export function createSyntheticRunnerFixture(options = {}) {
       });
     },
 
-    start(input) {
-      const args = readBoundedInput(
-        input,
+    start(inputJson) {
+      const args = parseBoundedJsonRecord(
+        inputJson,
         ['claimId', 'attemptId', 'grantId', 'snapshotRef', 'route', 'deadlineAt', 'requestId', 'scopeHash'],
       );
       const claimId = readSafeId(args.claimId);
