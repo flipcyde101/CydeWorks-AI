@@ -162,7 +162,7 @@ export const TRACKED_SYNTHETIC_CASES = Object.freeze({
     semanticRules: {
       materialInferencePatterns: [
         /\bguest\s+[ab]\s+(?:is\s+|was\s+)?(?:confirmed|booked|locked\s+in|selected)\b/i,
-        /\b(?:either\s+)?guest\s+(?:is\s+|was\s+)?booked\b/i,
+        /\b(?<!(?:neither|not|no)\s+)(?:either\s+)?guest\s+(?:is\s+|was\s+)?booked\b/i,
         /\bguest\s+a\s+(?:committed|agreed|accepted)\s+to\s+(?:record\s+)?video\b/i,
         /\bwill\s+record\s+video\s+with\s+guest\s+a\b/i,
         /\b(?:recording|guest)\s+slot\s+(?:is\s+)?confirmed\b/i,
@@ -224,8 +224,6 @@ export const TRACKED_SYNTHETIC_CASES = Object.freeze({
     lookFor: ['one week', 'one-week', 'under $500', 'taylor', 'start', 'threshold open'],
     flags: [
       'exactly $500 qualify',
-      'invoices of exactly $500',
-      'equal to $500',
       'pilot has already started',
       'pilot started',
     ],
@@ -233,9 +231,11 @@ export const TRACKED_SYNTHETIC_CASES = Object.freeze({
     semanticRules: {
       pilotUpperBoundViolationPatterns: [
         /\b(?:up\s+to|including|includes?|covers?|qualif\w*\s+for)\s+(?:invoices?\s+)?(?:at\s+|of\s+|for\s+)?\$?\s*500\b/i,
-        /\b(?:exactly|equal\s+to|=)\s*\$?\s*500\b/i,
+        /\bincludes?\s+invoices?\s+of\s+exactly\s+\$?\s*500\b/i,
+        /\b(?:exactly|equal\s+to)\s*\$?\s*500\s+qualif\w*/i,
         /\binvoices?\s+(?:at|of|for)\s+\$?\s*500\b/i,
         /\b\$?\s*500\s+(?:invoices?\s+)?(?:and\s+under|or\s+less|inclusive)\b/i,
+        /\bpilot\b(?:\s+\w+){0,3}\s+started\b/i,
       ],
     },
   },
