@@ -255,4 +255,3 @@ async function run() {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   await run().catch(error => { console.error(error.message); process.exitCode = 1; });
 }
-
