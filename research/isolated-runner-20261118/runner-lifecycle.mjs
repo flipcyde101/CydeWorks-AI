@@ -33,12 +33,19 @@ export function reconcileClaim(path) {
 
 // The adapter must prove guest identity and complete tree termination, not just
 // termination of the Windows launcher. No PID-only recovery or broad taskkill.
-export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutMs = 5000}) {
+export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutMs = 5000, startupTimeoutMs = 7000, executeTimeoutMs = 5000, settlementTimeoutMs = 100}) {
   if (!adapter || typeof adapter.start !== 'function' || typeof adapter.stopAndVerify !== 'function') {
     claim.append({state: 'unresolved', cleanup: 'unknown', inference: 'unknown'});
     throw Error('A qualified process ownership adapter is required.');
   }
-  let worker, result, failure;
+  let worker, result, failure, execution;
+  let executionDone = false;
+  const bounded = async (promise, ms, message) => {
+    let timer;
+    try { return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Error(message)), ms);
+    })]); } finally { clearTimeout(timer); }
+  };
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason ?? Error('Cancelled.'));
   signal?.addEventListener('abort', abort, {once: true});
@@ -46,18 +53,22 @@ export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutM
   try {
     controller.signal.throwIfAborted();
     // start must persist identity through record before allowing worker work.
-    worker = await adapter.start({signal: controller.signal, record: identity => {
+    const nonce = randomUUID();
+    claim.append({state: 'launching', nonce});
+    worker = await bounded(adapter.start({nonce, signal: controller.signal, record: identity => {
       if (!identity || !identity.nonce || !identity.birthIdentity) throw Error('Incomplete ownership identity.');
       claim.append({state: 'owned', identity});
-    }});
+    }}), startupTimeoutMs, 'Startup deadline exceeded.');
     controller.signal.throwIfAborted();
     let cancel;
     try {
-      result = await Promise.race([execute(worker, controller.signal), new Promise((_, reject) => {
+      execution = Promise.resolve().then(() => execute(worker, controller.signal));
+      execution.then(() => { executionDone = true; }, () => { executionDone = true; });
+      result = await bounded(Promise.race([execution, new Promise((_, reject) => {
         cancel = () => reject(controller.signal.reason);
         controller.signal.addEventListener('abort', cancel, {once: true});
         if (controller.signal.aborted) cancel();
-      })]);
+      })]), executeTimeoutMs, 'Execute deadline exceeded.');
     } finally { controller.signal.removeEventListener('abort', cancel); }
     controller.signal.throwIfAborted();
   } catch (error) { failure = error; }
@@ -71,9 +82,14 @@ export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutM
     ]);
   } catch { evidence = null; }
   finally { clearTimeout(timer); }
-  const verified = evidence?.cleanup === 'verified' && evidence?.inference === 'settled';
+  if (execution && !executionDone) {
+    try { await bounded(execution.catch(() => {}), settlementTimeoutMs, 'Settlement deadline exceeded.'); } catch {}
+  }
+  const inference = executionDone ? 'settled' : 'unknown';
+  const cleanup = evidence?.cleanup === 'verified' ? 'verified' : 'unknown';
+  const verified = cleanup === 'verified' && inference === 'settled';
   claim.append({state: verified && !failure ? 'complete' : 'unresolved',
-    cleanup: verified ? 'verified' : 'unknown', inference: verified ? 'settled' : 'unknown'});
+    cleanup, inference});
   if (!verified) throw Error('Worker cleanup or inference outcome unresolved.');
   if (failure) throw failure;
   return result;
