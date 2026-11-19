@@ -463,6 +463,10 @@ class ClaimsSupervisor {
         if (phase === 'terminating') finish(unknownOutcome(operation, terminateCode, 'exit-observed'));
       });
       child.on('close', (code, signal) => {
+        // A close without a prior 'spawn' event is out of order (a real
+        // ChildProcess emits 'spawn' first, or 'error' on spawn failure). Its
+        // output is never trusted: the exit handler has already released the
+        // slot and the deadline turns this into an unknown outcome.
         if (phase !== 'running' || !spawned) return;
         phase = 'done';
         clearTimeout(deadlineTimer);

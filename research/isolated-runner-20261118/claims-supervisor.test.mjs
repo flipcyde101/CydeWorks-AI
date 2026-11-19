@@ -140,7 +140,12 @@ async function defineTests() {
           setImmediate(() => script(this, this.request));
         },
       });
-      if (emitSpawn) setImmediate(() => this.emit('spawn'));
+      this.spawned = false;
+      if (emitSpawn) setImmediate(() => this.emitSpawnNow());
+    }
+    emitSpawnNow() {
+      this.spawned = true;
+      this.emit('spawn');
     }
     kill(signal) {
       this.killSignals.push(signal);
@@ -392,14 +397,51 @@ async function defineTests() {
     const third = await supervisor.run('inspect', INSPECT_ARGS());
     assert.equal(third.code, 'SUPERVISOR_BUSY');
     assert.equal(supervisor.stats().active, 2);
-    for (let tick = 0; tick < 1000 && children.some(child => child.request === null); tick++) {
+    // A real ChildProcess always emits 'spawn' before 'exit' or 'close'. Wait
+    // for both the captured request and the spawn event before replying, so
+    // the fake keeps that order.
+    for (let tick = 0; tick < 1000 && children.some(child => child.request === null || !child.spawned); tick++) {
       await new Promise(resolve => setImmediate(resolve));
     }
+    assert.ok(children.every(child => child.request !== null && child.spawned), 'fake children did not reach spawned state');
     for (const child of children) { child.reply({status: 'ok', result: {found: false}}); child.finish(0); }
-    assert.equal((await first).outcome, 'ok');
-    assert.equal((await second).outcome, 'ok');
+    const firstOutcome = await first;
+    const secondOutcome = await second;
+    assert.equal(firstOutcome.outcome, 'ok', firstOutcome.code);
+    assert.equal(secondOutcome.outcome, 'ok', secondOutcome.code);
     assert.equal(children.length, 2);
     assert.equal(supervisor.stats().active, 0);
+  });
+
+  // Regression for the event order found in the concurrency fixture: exit
+  // and close before 'spawn'. The supervisor must never trust that reply. It
+  // releases the slot when exit is seen and stays unknown until the deadline.
+  test('invalid event order: exit and close before spawn never yield ok and release the slot', async () => {
+    const children = [];
+    const supervisor = _testing.createSupervisor(
+      {storePath: fakeStorePath(), deadlineMs: 300, exitWaitMs: 150, busyTimeoutMs: 50, maxConcurrent: 1},
+      {spawnImpl: () => {
+        const child = new FakeChild(() => {}, {emitSpawn: false});
+        children.push(child);
+        return child;
+      }});
+    const pending = supervisor.run('inspect', INSPECT_ARGS());
+    const child = children[0];
+    for (let tick = 0; tick < 1000 && child.request === null; tick++) await new Promise(resolve => setImmediate(resolve));
+    assert.notEqual(child.request, null);
+    assert.equal(child.spawned, false);
+    child.reply({status: 'ok', result: {found: false}});
+    await new Promise(resolve => { child.stdout.once('end', resolve); child.stdout.end(); });
+    child.exitNow(0);
+    assert.equal(supervisor.stats().active, 0, 'observed exit releases the slot');
+    child.emitSpawnNow();
+    const outcome = await pending;
+    assert.equal(outcome.outcome, 'unknown');
+    assert.equal(outcome.code, 'CHILD_TIMEOUT');
+    assert.equal(outcome.childState, 'exit-observed');
+    assert.equal(Object.hasOwn(outcome, 'result'), false);
+    assertNoAuthority(outcome);
+    assert.equal(children.length, 1, 'no retry');
   });
 
   // ---------- Preflight (in-process, disposable stores) ----------
