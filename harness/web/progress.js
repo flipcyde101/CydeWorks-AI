@@ -3,7 +3,86 @@ export const WAITING_OUTPUT_THRESHOLD_MS = 15_000;
 export const MAX_DATE_MS = 8_640_000_000_000_000;
 
 const UNTRUSTED_SOURCE_RE = /(?:estimat|infer|heuristic|guess|char|token|byte|simulat|synthetic|mock|predict|unknown|unverif)/i;
-const UNTRUSTED_UNITS = new Set(['char', 'chars', 'character', 'characters', 'token', 'tokens', 'byte', 'bytes']);
+const MAX_UNIT_LENGTH = 24;
+const SAFE_UNIT_RE = /^[a-z][a-z0-9-]*$/;
+const UNTRUSTED_UNITS = new Set([
+  'char', 'chars', 'character', 'characters',
+  'codeunit', 'codeunits', 'code-unit', 'code-units',
+  'codepoint', 'codepoints', 'code-point', 'code-points',
+  'utf16', 'utf-16',
+  'token', 'tokens',
+  'byte', 'bytes',
+]);
+const ALLOWED_MEASURED_UNITS = new Map([
+  ['step', { singular: 'step', plural: 'steps' }],
+  ['steps', { singular: 'step', plural: 'steps' }],
+  ['substep', { singular: 'sub-step', plural: 'sub-steps' }],
+  ['substeps', { singular: 'sub-step', plural: 'sub-steps' }],
+  ['sub-step', { singular: 'sub-step', plural: 'sub-steps' }],
+  ['sub-steps', { singular: 'sub-step', plural: 'sub-steps' }],
+  ['file', { singular: 'file', plural: 'files' }],
+  ['files', { singular: 'file', plural: 'files' }],
+  ['check', { singular: 'check', plural: 'checks' }],
+  ['checks', { singular: 'check', plural: 'checks' }],
+  ['test', { singular: 'test', plural: 'tests' }],
+  ['tests', { singular: 'test', plural: 'tests' }],
+  ['task', { singular: 'task', plural: 'tasks' }],
+  ['tasks', { singular: 'task', plural: 'tasks' }],
+  ['item', { singular: 'item', plural: 'items' }],
+  ['items', { singular: 'item', plural: 'items' }],
+  ['stage', { singular: 'stage', plural: 'stages' }],
+  ['stages', { singular: 'stage', plural: 'stages' }],
+  ['phase', { singular: 'phase', plural: 'phases' }],
+  ['phases', { singular: 'phase', plural: 'phases' }],
+  ['case', { singular: 'case', plural: 'cases' }],
+  ['cases', { singular: 'case', plural: 'cases' }],
+  ['suite', { singular: 'suite', plural: 'suites' }],
+  ['suites', { singular: 'suite', plural: 'suites' }],
+  ['batch', { singular: 'batch', plural: 'batches' }],
+  ['batches', { singular: 'batch', plural: 'batches' }],
+  ['chunk', { singular: 'chunk', plural: 'chunks' }],
+  ['chunks', { singular: 'chunk', plural: 'chunks' }],
+  ['page', { singular: 'page', plural: 'pages' }],
+  ['pages', { singular: 'page', plural: 'pages' }],
+  ['job', { singular: 'job', plural: 'jobs' }],
+  ['jobs', { singular: 'job', plural: 'jobs' }],
+  ['call', { singular: 'call', plural: 'calls' }],
+  ['calls', { singular: 'call', plural: 'calls' }],
+  ['tool', { singular: 'tool', plural: 'tools' }],
+  ['tools', { singular: 'tool', plural: 'tools' }],
+  ['action', { singular: 'action', plural: 'actions' }],
+  ['actions', { singular: 'action', plural: 'actions' }],
+  ['op', { singular: 'operation', plural: 'operations' }],
+  ['ops', { singular: 'operation', plural: 'operations' }],
+  ['operation', { singular: 'operation', plural: 'operations' }],
+  ['operations', { singular: 'operation', plural: 'operations' }],
+  ['pass', { singular: 'pass', plural: 'passes' }],
+  ['passes', { singular: 'pass', plural: 'passes' }],
+  ['iteration', { singular: 'iteration', plural: 'iterations' }],
+  ['iterations', { singular: 'iteration', plural: 'iterations' }],
+  ['epoch', { singular: 'epoch', plural: 'epochs' }],
+  ['epochs', { singular: 'epoch', plural: 'epochs' }],
+  ['milestone', { singular: 'milestone', plural: 'milestones' }],
+  ['milestones', { singular: 'milestone', plural: 'milestones' }],
+  ['command', { singular: 'command', plural: 'commands' }],
+  ['commands', { singular: 'command', plural: 'commands' }],
+  ['shard', { singular: 'shard', plural: 'shards' }],
+  ['shards', { singular: 'shard', plural: 'shards' }],
+  ['partition', { singular: 'partition', plural: 'partitions' }],
+  ['partitions', { singular: 'partition', plural: 'partitions' }],
+  ['record', { singular: 'record', plural: 'records' }],
+  ['records', { singular: 'record', plural: 'records' }],
+  ['row', { singular: 'row', plural: 'rows' }],
+  ['rows', { singular: 'row', plural: 'rows' }],
+  ['module', { singular: 'module', plural: 'modules' }],
+  ['modules', { singular: 'module', plural: 'modules' }],
+  ['package', { singular: 'package', plural: 'packages' }],
+  ['packages', { singular: 'package', plural: 'packages' }],
+  ['target', { singular: 'target', plural: 'targets' }],
+  ['targets', { singular: 'target', plural: 'targets' }],
+  ['unit', { singular: 'unit', plural: 'units' }],
+  ['units', { singular: 'unit', plural: 'units' }],
+]);
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value) || ArrayBuffer.isView(value)) {
@@ -80,15 +159,20 @@ function formatDuration(ms) {
 }
 
 function computeRemainingEtaMs(remaining, spanInfo) {
-  if (remaining === null || !spanInfo || !(spanInfo.deltaSteps > 0) || !(spanInfo.spanMs > 0)) return null;
-  const etaMs = Math.round((remaining * spanInfo.spanMs) / spanInfo.deltaSteps);
-  if (!Number.isFinite(etaMs) || etaMs < 0) return null;
+  if (remaining === null || remaining < 0) return null;
+  if (remaining === 0) return 0;
+  if (!spanInfo || !(spanInfo.deltaSteps > 0) || !(spanInfo.spanMs > 0)) return null;
+  const rawEtaMs = (remaining * spanInfo.spanMs) / spanInfo.deltaSteps;
+  if (!Number.isFinite(rawEtaMs) || rawEtaMs <= 0) return null;
+  const etaMs = Math.max(1, Math.round(rawEtaMs));
+  if (!Number.isFinite(etaMs) || etaMs <= 0) return null;
   return etaMs;
 }
 
 function evaluateStepSeries(raw, {
   validNow,
   started,
+  defaultUnit = 'steps',
   minSampleTime = null,
   minSampleLabel = null,
   maxSampleTime = null,
@@ -99,6 +183,8 @@ function evaluateStepSeries(raw, {
       present: false,
       valid: true,
       totalKnown: false,
+      unit: null,
+      unitSingular: null,
       completed: null,
       total: null,
       remaining: null,
@@ -113,7 +199,7 @@ function evaluateStepSeries(raw, {
       samplesStale: false,
       clockAnomaly: null,
       rejectionReason: null,
-      rateUnavailableReason: 'No measured step counters were supplied.',
+      rateUnavailableReason: 'No measured counters were supplied.',
     };
   }
 
@@ -121,6 +207,8 @@ function evaluateStepSeries(raw, {
     present: true,
     valid: false,
     totalKnown: false,
+    unit: null,
+    unitSingular: null,
     completed: null,
     total: null,
     remaining: null,
@@ -139,53 +227,66 @@ function evaluateStepSeries(raw, {
   });
 
   if (!isPlainObject(raw)) {
-    return invalid('Measured step counters must be a plain object.');
+    return invalid('Measured counters must be a plain object.');
   }
   if (raw.measured !== undefined && raw.measured !== true) {
-    return invalid('Step counters are not marked as measured.');
+    return invalid('Counters are not marked as measured.');
   }
   if (raw.trustworthy !== undefined && raw.trustworthy !== true) {
-    return invalid('Step counters are not marked as trustworthy.');
+    return invalid('Counters are not marked as trustworthy.');
   }
   if (raw.estimated === true || raw.inferred === true || raw.simulated === true) {
     return invalid('Estimated, inferred, or simulated counters cannot be used as measured progress.');
   }
+
+  const fallbackUnit = ALLOWED_MEASURED_UNITS.get(defaultUnit) ?? ALLOWED_MEASURED_UNITS.get('steps');
+  let unitInfo = fallbackUnit;
   if (raw.unit !== undefined && raw.unit !== null) {
     if (typeof raw.unit !== 'string' || !raw.unit.trim()) {
-      return invalid('Step unit must be a non-empty string when provided.');
+      return invalid('Measured counter unit must be a non-empty string when provided.');
     }
-    if (UNTRUSTED_UNITS.has(raw.unit.trim().toLowerCase())) {
-      return invalid('Output character, token, or byte counts do not imply measured step totals.');
+    const normalizedUnit = raw.unit.trim().toLowerCase();
+    if (normalizedUnit.length > MAX_UNIT_LENGTH || !SAFE_UNIT_RE.test(normalizedUnit)) {
+      return invalid('Measured counter unit must be a bounded, display-safe identifier.');
     }
+    if (UNTRUSTED_UNITS.has(normalizedUnit)) {
+      return invalid('Output character, token, or byte counts do not imply measured work totals.');
+    }
+    const allowedUnit = ALLOWED_MEASURED_UNITS.get(normalizedUnit);
+    if (!allowedUnit) {
+      return invalid('Measured counter unit is not an allowlisted discrete progress unit.');
+    }
+    unitInfo = allowedUnit;
   }
+
   if (raw.source !== undefined && raw.source !== null) {
     if (typeof raw.source !== 'string' || !raw.source.trim()) {
-      return invalid('Step counter source must be a non-empty string when provided.');
+      return invalid('Counter source must be a non-empty string when provided.');
     }
     if (UNTRUSTED_SOURCE_RE.test(raw.source.trim())) {
-      return invalid('Step counters come from an untrusted or unmeasured source.');
+      return invalid('Counters come from an untrusted or unmeasured source.');
     }
   }
 
   const hasTotal = raw.total !== undefined && raw.total !== null;
   if (hasTotal && (typeof raw.total !== 'number' || !Number.isSafeInteger(raw.total) || raw.total <= 0)) {
-    return invalid('Total steps must be a positive safe integer.');
+    return invalid('Total count must be a positive safe integer.');
   }
   const total = hasTotal ? raw.total : null;
 
   const hasCompletedField = raw.completed !== undefined && raw.completed !== null;
   const hasDoneField = raw.done !== undefined && raw.done !== null;
   if (hasCompletedField && hasDoneField && raw.completed !== raw.done) {
-    return invalid('Conflicting completed and done step counts.');
+    return invalid('Conflicting completed and done counts.');
   }
   const rawDone = hasCompletedField ? raw.completed : raw.done;
   const hasDone = rawDone !== undefined && rawDone !== null;
   if (hasDone) {
     if (typeof rawDone !== 'number' || !Number.isSafeInteger(rawDone) || rawDone < 0) {
-      return invalid('Completed steps must be a non-negative safe integer.');
+      return invalid('Completed count must be a non-negative safe integer.');
     }
     if (total !== null && rawDone > total) {
-      return invalid('Completed steps cannot exceed total steps.');
+      return invalid('Completed count cannot exceed total count.');
     }
   }
 
@@ -193,20 +294,20 @@ function evaluateStepSeries(raw, {
   let lastProgressAt = null;
   if (raw.samples !== undefined && raw.samples !== null) {
     if (!Array.isArray(raw.samples)) {
-      return invalid('Step samples must be an array.');
+      return invalid('Measured samples must be an array.');
     }
     for (let i = 0; i < raw.samples.length; i += 1) {
       const sample = raw.samples[i];
       if (!isPlainObject(sample)) {
-        return invalid('Each step sample must be a plain object.');
+        return invalid('Each measured sample must be a plain object.');
       }
       const rawAt = sample.at !== undefined ? sample.at : sample.timestamp;
       if (rawAt === undefined || rawAt === null) {
-        return invalid('Step sample is missing a timestamp.');
+        return invalid('Measured sample is missing a timestamp.');
       }
       const checkedAt = inspectTime(rawAt, validNow, 'Step sample');
       if (checkedAt.anomaly !== null || checkedAt.time === null) {
-        const reason = checkedAt.anomaly ?? 'Step sample timestamp is invalid.';
+        const reason = checkedAt.anomaly ?? 'Measured sample timestamp is invalid.';
         return invalid(reason, reason);
       }
       const sampleAt = checkedAt.time;
@@ -226,27 +327,27 @@ function evaluateStepSeries(raw, {
       const sComp = sample.completed !== undefined && sample.completed !== null;
       const sDone = sample.done !== undefined && sample.done !== null;
       if (sComp && sDone && sample.completed !== sample.done) {
-        return invalid('Step sample has conflicting completed and done counts.');
+        return invalid('Measured sample has conflicting completed and done counts.');
       }
       const sampleDone = sComp ? sample.completed : sample.done;
       if (typeof sampleDone !== 'number' || !Number.isSafeInteger(sampleDone) || sampleDone < 0) {
-        return invalid('Step sample count must be a non-negative safe integer.');
+        return invalid('Measured sample count must be a non-negative safe integer.');
       }
       if (total !== null && sampleDone > total) {
-        return invalid('Step sample count cannot exceed total steps.');
+        return invalid('Measured sample count cannot exceed total count.');
       }
 
       if (validSamples.length > 0) {
         const prev = validSamples[validSamples.length - 1];
         if (sampleAt < prev.at) {
-          const reason = 'Step sample timestamps moved backward.';
+          const reason = 'Measured sample timestamps moved backward.';
           return invalid(reason, reason);
         }
         if (sampleDone < prev.done) {
-          return invalid('Step sample count regressed.');
+          return invalid('Measured sample count regressed.');
         }
         if (sampleAt === prev.at && sampleDone !== prev.done) {
-          const reason = 'Step count changed in zero elapsed time.';
+          const reason = 'Measured count changed in zero elapsed time.';
           return invalid(reason, reason);
         }
         if (sampleDone > prev.done) {
@@ -264,7 +365,7 @@ function evaluateStepSeries(raw, {
   if (validSamples.length > 0) {
     const latest = validSamples[validSamples.length - 1];
     if (completed !== null && completed < latest.done) {
-      return invalid('Current completed step count regressed below latest sample.');
+      return invalid('Current completed count regressed below latest sample.');
     }
     if (completed === null) {
       completed = latest.done;
@@ -280,14 +381,14 @@ function evaluateStepSeries(raw, {
   let spanInfo = null;
   let rateUnavailableReason = null;
   if (validSamples.length < 2) {
-    rateUnavailableReason = 'Insufficient measured step samples to calculate rate.';
+    rateUnavailableReason = 'Insufficient measured samples to calculate rate.';
   } else {
     const first = validSamples[0];
     const last = validSamples[validSamples.length - 1];
     const spanMs = last.at - first.at;
     const deltaSteps = last.done - first.done;
     if (spanMs <= 0) {
-      rateUnavailableReason = 'Step samples do not span a positive elapsed interval.';
+      rateUnavailableReason = 'Measured samples do not span a positive elapsed interval.';
     } else if (deltaSteps === 0) {
       rate = 0;
     } else {
@@ -307,6 +408,8 @@ function evaluateStepSeries(raw, {
     present: true,
     valid: true,
     totalKnown,
+    unit: unitInfo.plural,
+    unitSingular: unitInfo.singular,
     completed,
     total,
     remaining,
@@ -385,7 +488,8 @@ function inspectCurrentStep(rawCurrent, { validNow, started, dispatched = null, 
   const hasSubCounters = rawCurrent.completed !== undefined
     || rawCurrent.done !== undefined
     || rawCurrent.total !== undefined
-    || rawCurrent.samples !== undefined;
+    || rawCurrent.samples !== undefined
+    || rawCurrent.unit !== undefined;
 
   if (!hasSubCounters) {
     return {
@@ -406,6 +510,7 @@ function inspectCurrentStep(rawCurrent, { validNow, started, dispatched = null, 
   const subEval = evaluateStepSeries(rawCurrent, {
     validNow,
     started,
+    defaultUnit: 'sub-steps',
     minSampleTime,
     minSampleLabel,
     maxSampleTime: ended,
@@ -425,7 +530,13 @@ function inspectCurrentStep(rawCurrent, { validNow, started, dispatched = null, 
   };
 }
 
-function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone = false, blockedReason, defaultUnavailableEta }) {
+function finalizeCurrentStep(parsedStep, {
+  overallComplete,
+  missingOverallDone = false,
+  overallUnitSingular = 'step',
+  blockedReason,
+  defaultUnavailableEta,
+}) {
   if (parsedStep.kind === 'none') {
     if (blockedReason !== null) {
       return {
@@ -437,11 +548,11 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
     }
     if (overallComplete) {
       if (missingOverallDone) {
-        const reason = 'Completed step count is not recorded.';
+        const reason = `Completed ${overallUnitSingular} count is not recorded.`;
         return {
           info: null,
           etaMs: null,
-          eta: 'Unavailable because completed step count is not recorded.',
+          eta: `Unavailable because completed ${overallUnitSingular} count is not recorded.`,
           unavailableReason: reason,
         };
       }
@@ -476,13 +587,15 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
       ? blockedReason
       : overallComplete
         ? missingOverallDone
-          ? 'Unavailable because completed step count is not recorded.'
+          ? `Unavailable because completed ${overallUnitSingular} count is not recorded.`
           : 'Complete. No remaining work.'
         : defaultUnavailableEta;
     return {
       info: {
         index: parsedStep.index,
         label: parsedStep.label,
+        unit: null,
+        unitSingular: null,
         completed: null,
         total: null,
         remaining: null,
@@ -498,7 +611,7 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
         ? blockedReason
         : overallComplete
           ? missingOverallDone
-            ? 'Completed step count is not recorded.'
+            ? `Completed ${overallUnitSingular} count is not recorded.`
             : null
           : 'Current-step sub-progress is not measured.',
     };
@@ -511,6 +624,8 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
       info: {
         index: parsedStep.index,
         label: parsedStep.label,
+        unit: null,
+        unitSingular: null,
         completed: null,
         total: null,
         remaining: null,
@@ -526,6 +641,7 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
     };
   }
 
+  const subUnitPlural = subEval.unit ?? 'sub-steps';
   let etaMs = null;
   let eta;
   let unavailableReason = null;
@@ -541,10 +657,10 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
     eta = 'Unavailable because completion was reported with remaining current-step work.';
   } else if (overallComplete && (!subEval.totalKnown || subEval.remaining === null)) {
     unavailableReason = missingOverallDone
-      ? 'Completed step count is not recorded.'
+      ? `Completed ${overallUnitSingular} count is not recorded.`
       : 'Current-step total or completed counter is missing.';
     eta = missingOverallDone
-      ? 'Unavailable because completed step count is not recorded.'
+      ? `Unavailable because completed ${overallUnitSingular} count is not recorded.`
       : 'Unavailable because current-step sub-progress is not measured.';
   } else if (overallComplete) {
     etaMs = 0;
@@ -556,8 +672,8 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
     unavailableReason = subEval.rateUnavailableReason;
     eta = 'Unavailable: ' + subEval.rateUnavailableReason;
   } else if (subEval.rate === 0) {
-    unavailableReason = 'Measured current-step rate is 0 steps/s.';
-    eta = 'Unavailable because the measured current-step rate is 0 steps/s.';
+    unavailableReason = `Measured current-step rate is 0 ${subUnitPlural}/s.`;
+    eta = `Unavailable because the measured current-step rate is 0 ${subUnitPlural}/s.`;
   } else if (subEval.samplesStale) {
     unavailableReason = 'Latest current-step samples are stale.';
     eta = 'Unavailable because the latest current-step samples are stale.';
@@ -575,6 +691,8 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
     info: {
       index: parsedStep.index,
       label: parsedStep.label,
+      unit: subEval.unit,
+      unitSingular: subEval.unitSingular,
       completed: subEval.completed,
       total: subEval.total,
       remaining: subEval.remaining,
@@ -590,6 +708,23 @@ function finalizeCurrentStep(parsedStep, { overallComplete, missingOverallDone =
   };
 }
 
+/**
+ * Derive a conservative, telemetry-safe progress snapshot for presentation components.
+ *
+ * Output measurement fields:
+ * - `chars`: provider-reported JavaScript UTF-16 code units (`string.length`), never Unicode scalar count;
+ *   never used to infer total work or discrete step/item counts.
+ * - `rate`: UTF-16 code units per second while active, or `null`.
+ *
+ * Overall measured counter fields (when valid discrete counters are supplied):
+ * - `unit` / `unitSingular`: allowlisted, bounded, display-safe plural/singular unit (e.g. `'steps'`/`'step'`, `'files'`/`'file'`), or `null` when unmeasured/rejected.
+ * - `totalKnown`, `completedSteps`, `totalSteps`, `remainingSteps`, `doneTotal`, `percent`, `stepRate` (units/s), `stepSamplesValid`, `stepRejectionReason`.
+ * - `overallEtaMs` / `overallEta`: overall remaining time (`0` only when remaining work is `0`; positive sub-millisecond estimates round up to `>= 1` ms; `null` when blocked/stale/unknown).
+ *
+ * Current-step fields:
+ * - `currentStep`: `{ index, label, unit, unitSingular, completed, total, remaining, doneTotal, percent, rate, etaMs, eta } | null`.
+ * - `currentStepEtaMs` / `currentStepEta` (and legacy `eta` alias): current-step remaining time.
+ */
 export function describeProgress(task, attempt, now = Date.now()) {
   const taskObj = task && typeof task === 'object' ? task : {};
   const attemptObj = attempt && typeof attempt === 'object' ? attempt : null;
@@ -747,6 +882,9 @@ export function describeProgress(task, attempt, now = Date.now()) {
     }
   }
 
+  const unitPlural = stepEval.present && stepEval.valid ? stepEval.unit : 'steps';
+  const unitSingular = stepEval.present && stepEval.valid ? stepEval.unitSingular : 'step';
+
   let phase = 'waiting';
   let status = 'Waiting for run state';
   let explanation = 'Waiting for a current status from the local workspace.';
@@ -760,11 +898,12 @@ export function describeProgress(task, attempt, now = Date.now()) {
     phase = 'failed';
     status = 'Incomplete termination';
     if (overallPremature) {
-      explanation = 'Completion was reported before all measured steps finished.';
-      remaining = `${stepEval.remaining} of ${stepEval.total} steps remaining.`;
+      explanation = `Completion was reported before all measured ${unitPlural} finished.`;
+      remaining = `${stepEval.remaining} of ${stepEval.total} ${unitPlural} remaining.`;
     } else {
-      explanation = 'Completion was reported before all measured current-step sub-steps finished.';
-      remaining = `${subEval.remaining} of ${subEval.total} current-step sub-steps remaining.`;
+      const subUnitPlural = subEval.unit ?? 'sub-steps';
+      explanation = `Completion was reported before all measured current-step ${subUnitPlural} finished.`;
+      remaining = `${subEval.remaining} of ${subEval.total} current-step ${subUnitPlural} remaining.`;
     }
   } else if (isFailed) {
     phase = 'failed';
@@ -797,11 +936,11 @@ export function describeProgress(task, attempt, now = Date.now()) {
           ? 'Proposal rejected'
           : 'Complete';
     if (overallMissingDone) {
-      explanation = `The attempt reported completion, but the completed count for ${stepEval.total} total steps was not recorded.`;
-      remaining = `Remaining steps unknown; completed count for ${stepEval.total} total steps was not recorded.`;
+      explanation = `The attempt reported completion, but the completed count for ${stepEval.total} total ${unitPlural} was not recorded.`;
+      remaining = `Remaining ${unitPlural} unknown; completed count for ${stepEval.total} total ${unitPlural} was not recorded.`;
     } else if (stepsComplete) {
-      explanation = `All ${stepEval.total} measured steps completed.`;
-      remaining = `0 of ${stepEval.total} steps remaining.`;
+      explanation = `All ${stepEval.total} measured ${unitPlural} completed.`;
+      remaining = `0 of ${stepEval.total} ${unitPlural} remaining.`;
     } else {
       explanation = 'The attempt has completed.';
       remaining = 'No remaining work.';
@@ -824,41 +963,43 @@ export function describeProgress(task, attempt, now = Date.now()) {
     phase = 'stalled';
     status = 'Possibly stalled';
     explanation = stepEval.valid && (stepEval.totalKnown || stepEval.completed !== null || subEval !== null)
-      ? 'No new step progress or activity for at least 60 seconds. The worker may still be working.'
+      ? `No new ${unitSingular} progress or activity for at least 60 seconds. The worker may still be working.`
       : 'No new model output for at least 60 seconds. The model may still be working.';
   } else if (waitingForSettlementAfterSteps) {
     phase = 'waiting';
     status = 'Waiting for completion';
-    explanation = `All ${stepEval.total} measured steps completed, waiting for authoritative run completion.`;
-    remaining = `0 of ${stepEval.total} steps remaining; waiting for completion.`;
+    explanation = `All ${stepEval.total} measured ${unitPlural} completed, waiting for authoritative run completion.`;
+    remaining = `0 of ${stepEval.total} ${unitPlural} remaining; waiting for completion.`;
   } else if (live && stepEval.present && stepEval.valid && (stepEval.completed !== null || stepEval.totalKnown || (subEval !== null && (subEval.completed !== null || subEval.totalKnown)))) {
     const recentStepProgress = latestWorkProgressAt !== null && validNow !== null && (validNow - latestWorkProgressAt) < WAITING_OUTPUT_THRESHOLD_MS;
     const recentSubProgress = subWorkProgressAt !== null && validNow !== null && (validNow - subWorkProgressAt) < WAITING_OUTPUT_THRESHOLD_MS;
     if (!recentSubProgress && (stepEval.completed === 0 || stepEval.completed === null || (outputIdle !== null && outputIdle >= WAITING_OUTPUT_THRESHOLD_MS && !recentStepProgress) || stepEval.rate === 0)) {
       phase = 'waiting';
       status = stepEval.totalKnown && stepEval.completed !== null
-        ? `Waiting on step ${Math.min(stepEval.completed + 1, stepEval.total)} of ${stepEval.total}`
-        : 'Waiting for step progress';
+        ? `Waiting on ${unitSingular} ${Math.min(stepEval.completed + 1, stepEval.total)} of ${stepEval.total}`
+        : `Waiting for ${unitSingular} progress`;
       explanation = stepEval.rate === 0
-        ? 'No new steps have completed in the latest measured window. The worker may still be running.'
-        : 'Waiting for the current step to complete.';
+        ? `No new ${unitPlural} have completed in the latest measured window. The worker may still be running.`
+        : `Waiting for the current ${unitSingular} to complete.`;
     } else {
       phase = 'active';
       status = stepEval.totalKnown && stepEval.completed !== null
-        ? `Running step ${Math.min(stepEval.completed + 1, stepEval.total)} of ${stepEval.total}`
+        ? `Running ${unitSingular} ${Math.min(stepEval.completed + 1, stepEval.total)} of ${stepEval.total}`
         : stepEval.completed !== null
-          ? `Completed ${stepEval.completed} steps`
+          ? `Completed ${stepEval.completed} ${stepEval.completed === 1 ? unitSingular : unitPlural}`
           : parsedCurrentStep.label
             ? `Running ${parsedCurrentStep.label}`
-            : 'Running current step';
+            : `Running current ${unitSingular}`;
       explanation = stepEval.totalKnown && stepEval.completed !== null
-        ? `Measured progress: ${stepEval.completed} of ${stepEval.total} steps complete.`
+        ? `Measured progress: ${stepEval.completed} of ${stepEval.total} ${unitPlural} complete.`
         : stepEval.completed !== null
-          ? `Measured progress: ${stepEval.completed} steps complete; total steps unknown.`
-          : 'Current-step sub-progress is advancing.';
+          ? `Measured progress: ${stepEval.completed} ${stepEval.completed === 1 ? unitSingular : unitPlural} complete; total ${unitPlural} unknown.`
+          : subEval?.unit && subEval.unit !== 'sub-steps'
+            ? `Current-step ${subEval.unit} are advancing.`
+            : 'Current-step sub-progress is advancing.';
     }
     if (stepEval.totalKnown && stepEval.remaining !== null) {
-      remaining = `${stepEval.remaining} of ${stepEval.total} steps remaining.`;
+      remaining = `${stepEval.remaining} of ${stepEval.total} ${unitPlural} remaining.`;
     }
   } else if (live && (chars === 0 || (outputIdle !== null && outputIdle >= WAITING_OUTPUT_THRESHOLD_MS))) {
     phase = 'waiting';
@@ -882,24 +1023,24 @@ export function describeProgress(task, attempt, now = Date.now()) {
     : hasClockAnomaly
       ? 'Unavailable due to clock anomaly: ' + clockAnomalyReason
       : overallPremature
-        ? 'Unavailable because completion was reported with remaining steps.'
+        ? `Unavailable because completion was reported with remaining ${unitPlural}.`
         : subPremature
           ? 'Unavailable because completion was reported with remaining current-step work.'
-        : phase === 'failed'
-          ? 'Unavailable because the attempt failed.'
-          : phase === 'interrupted'
-            ? 'Unavailable because the run was interrupted.'
-            : phase === 'cancelled'
-              ? 'Unavailable because the request was cancelled.'
-              : phase === 'stopping'
-                ? 'Unavailable because stop was requested.'
-                : phase === 'stalled'
-                  ? 'Unavailable because the run appears stalled with no recent activity.'
-                  : waitingForSettlementAfterSteps
-                    ? 'Unavailable until the workspace confirms run completion.'
-                    : isDraft
-                      ? 'Unavailable because the attempt has not started.'
-                      : null;
+          : phase === 'failed'
+            ? 'Unavailable because the attempt failed.'
+            : phase === 'interrupted'
+              ? 'Unavailable because the run was interrupted.'
+              : phase === 'cancelled'
+                ? 'Unavailable because the request was cancelled.'
+                : phase === 'stopping'
+                  ? 'Unavailable because stop was requested.'
+                  : phase === 'stalled'
+                    ? 'Unavailable because the run appears stalled with no recent activity.'
+                    : waitingForSettlementAfterSteps
+                      ? 'Unavailable until the workspace confirms run completion.'
+                      : isDraft
+                        ? 'Unavailable because the attempt has not started.'
+                        : null;
 
   const defaultUnavailableCurrentStepEta = stepEval.present && stepEval.valid && stepEval.totalKnown
     ? 'Unavailable because current-step sub-progress is not measured.'
@@ -908,6 +1049,7 @@ export function describeProgress(task, attempt, now = Date.now()) {
   const currentStepEval = finalizeCurrentStep(parsedCurrentStep, {
     overallComplete: isComplete,
     missingOverallDone: overallMissingDone,
+    overallUnitSingular: unitSingular,
     blockedReason: etaBlockedReason,
     defaultUnavailableEta: defaultUnavailableCurrentStepEta,
   });
@@ -921,8 +1063,8 @@ export function describeProgress(task, attempt, now = Date.now()) {
     overallEta = etaBlockedReason;
   } else if (isComplete) {
     if (overallMissingDone) {
-      overallEtaUnavailableReason = 'Completed step count is not recorded.';
-      overallEta = 'Unavailable because completed step count is not recorded.';
+      overallEtaUnavailableReason = `Completed ${unitSingular} count is not recorded.`;
+      overallEta = `Unavailable because completed ${unitSingular} count is not recorded.`;
     } else {
       overallEtaMs = 0;
       overallEta = 'Complete. No remaining time.';
@@ -934,17 +1076,17 @@ export function describeProgress(task, attempt, now = Date.now()) {
     overallEtaUnavailableReason = 'Total work and remaining output are unknown.';
     overallEta = 'Unavailable because total work and remaining output are unknown.';
   } else if (stepEval.completed === null || stepEval.remaining === null) {
-    overallEtaUnavailableReason = 'Completed step count is not recorded.';
-    overallEta = 'Unavailable because completed step count is not recorded.';
+    overallEtaUnavailableReason = `Completed ${unitSingular} count is not recorded.`;
+    overallEta = `Unavailable because completed ${unitSingular} count is not recorded.`;
   } else if (stepEval.rate === null) {
     overallEtaUnavailableReason = stepEval.rateUnavailableReason;
     overallEta = 'Unavailable: ' + stepEval.rateUnavailableReason;
   } else if (stepEval.rate === 0) {
-    overallEtaUnavailableReason = 'Measured step rate is 0 steps/s.';
-    overallEta = 'Unavailable because the measured step rate is 0 steps/s.';
+    overallEtaUnavailableReason = `Measured ${unitSingular} rate is 0 ${unitPlural}/s.`;
+    overallEta = `Unavailable because the measured ${unitSingular} rate is 0 ${unitPlural}/s.`;
   } else if (stepEval.samplesStale) {
-    overallEtaUnavailableReason = 'Latest measured step samples are stale.';
-    overallEta = 'Unavailable because the latest measured step samples are stale.';
+    overallEtaUnavailableReason = `Latest measured ${unitSingular} samples are stale.`;
+    overallEta = `Unavailable because the latest measured ${unitSingular} samples are stale.`;
   } else {
     overallEtaMs = computeRemainingEtaMs(stepEval.remaining, stepEval.spanInfo);
     if (overallEtaMs === null) {
@@ -998,11 +1140,11 @@ export function describeProgress(task, attempt, now = Date.now()) {
     completionUnavailableReason = stepEval.rejectionReason;
     completion = 'Unavailable: ' + stepEval.rejectionReason;
   } else if (stepEval.totalKnown && stepEval.rate === 0) {
-    completionUnavailableReason = 'Measured step rate is 0 steps/s.';
-    completion = 'Unavailable because the measured step rate is 0 steps/s.';
+    completionUnavailableReason = `Measured ${unitSingular} rate is 0 ${unitPlural}/s.`;
+    completion = `Unavailable because the measured ${unitSingular} rate is 0 ${unitPlural}/s.`;
   } else if (stepEval.totalKnown && stepEval.samplesStale) {
-    completionUnavailableReason = 'Latest measured step samples are stale.';
-    completion = 'Unavailable because the latest measured step samples are stale.';
+    completionUnavailableReason = `Latest measured ${unitSingular} samples are stale.`;
+    completion = `Unavailable because the latest measured ${unitSingular} samples are stale.`;
   } else if (stepEval.totalKnown && stepEval.rate === null) {
     completionUnavailableReason = stepEval.rateUnavailableReason;
     completion = 'Unavailable: ' + stepEval.rateUnavailableReason;
@@ -1055,6 +1197,8 @@ export function describeProgress(task, attempt, now = Date.now()) {
     idleMs: latestIdle,
     remaining,
     totalKnown: stepEval.valid && stepEval.totalKnown,
+    unit: stepEval.present && stepEval.valid ? stepEval.unit : null,
+    unitSingular: stepEval.present && stepEval.valid ? stepEval.unitSingular : null,
     completedSteps: stepEval.valid ? stepEval.completed : null,
     totalSteps: stepEval.valid ? stepEval.total : null,
     remainingSteps: stepEval.valid ? stepEval.remaining : null,
@@ -1081,6 +1225,9 @@ export function describeProgress(task, attempt, now = Date.now()) {
   };
 }
 
+/**
+ * Format an accessible live-region announcement matching `describeProgress` state.
+ */
 export function progressAnnouncement(task, progress, connection) {
   if (connection !== 'connected') return 'Connection interrupted. The saved task state may be stale.';
   if (!task) return '';
@@ -1091,7 +1238,7 @@ export function progressAnnouncement(task, progress, connection) {
       if (progress.status === 'Incomplete termination') {
         return progress.remaining
           ? `Incomplete termination. ${progress.remaining}`
-          : 'Incomplete termination. Completion was reported before all measured steps finished.';
+          : 'Incomplete termination. Completion was reported before all measured work finished.';
       }
       return 'Attempt failed. Review the problem and recovery status.';
     }
@@ -1138,7 +1285,8 @@ export function progressAnnouncement(task, progress, connection) {
           : null;
     const stepEval = evaluateStepSeries(rawStepInput, { validNow: MAX_DATE_MS, started: null });
     if (stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed < stepEval.total) {
-      return `Incomplete termination. ${stepEval.remaining} of ${stepEval.total} steps remaining.`;
+      const uPlural = stepEval.unit ?? 'steps';
+      return `Incomplete termination. ${stepEval.remaining} of ${stepEval.total} ${uPlural} remaining.`;
     }
     const parsedSub = inspectCurrentStep(
       isPlainObject(rawStepInput) ? rawStepInput.currentStep : null,
@@ -1152,7 +1300,8 @@ export function progressAnnouncement(task, progress, connection) {
       && parsedSub.subEval.completed !== null
       && parsedSub.subEval.completed < parsedSub.subEval.total
     ) {
-      return `Incomplete termination. ${parsedSub.subEval.remaining} of ${parsedSub.subEval.total} current-step sub-steps remaining.`;
+      const subUnitPlural = parsedSub.subEval.unit ?? 'sub-steps';
+      return `Incomplete termination. ${parsedSub.subEval.remaining} of ${parsedSub.subEval.total} current-step ${subUnitPlural} remaining.`;
     }
   }
 

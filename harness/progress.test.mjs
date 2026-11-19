@@ -1283,3 +1283,256 @@ test('declared completion with missing overall done or partial current-step coun
   assert.doesNotMatch(missingSubDoneState.currentStepEta,/no remaining work/i);
   assert.match(missingSubDoneState.unavailableReasons.currentStepEta,/missing/i);
 });
+
+test('positive sub-millisecond estimates round up to 1 ms while reserving 0 ETA strictly for zero remaining work',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  const subMsOverall=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+10000).toISOString(),
+      heartbeat:new Date(then+10000).toISOString(),
+      steps:{
+        measured:true,
+        completed:99999,
+        total:100000,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+10000).toISOString(),done:99999},
+        ],
+        currentStep:{
+          label:'Final item',
+          startedAt:start,
+          measured:true,
+          completed:99999,
+          total:100000,
+          samples:[
+            {at:start,done:0},
+            {at:new Date(then+10000).toISOString(),done:99999},
+          ],
+        },
+      },
+    },
+  },attempt,then+10000);
+  assert.equal(subMsOverall.overallEtaMs,1);
+  assert.equal(subMsOverall.overallEta,'1 ms');
+  assert.equal(subMsOverall.projectedCompletionMs,then+10001);
+  assert.equal(subMsOverall.projectedCompletionAt,new Date(then+10001).toISOString());
+  assert.match(subMsOverall.completion,/in 1 ms/i);
+  assert.equal(subMsOverall.currentStepEtaMs,1);
+  assert.equal(subMsOverall.currentStep.etaMs,1);
+  assert.equal(subMsOverall.currentStepEta,'1 ms');
+  assert.equal(subMsOverall.eta,'1 ms');
+
+  // Actual zero remaining sub-steps while running still yields 0 currentStepEtaMs.
+  const zeroSubRemaining=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+5000).toISOString(),
+      heartbeat:new Date(then+5000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Completed sub-phase',
+          startedAt:new Date(then+4000).toISOString(),
+          measured:true,
+          completed:4,
+          total:4,
+        },
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(zeroSubRemaining.currentStepEtaMs,0);
+  assert.equal(zeroSubRemaining.currentStep.eta,'Current step complete.');
+
+  // Overflow protection still blocks projectedCompletionMs when validNow + 1 ms exceeds MAX_DATE_MS.
+  const subMsOverflow=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:MAX_DATE_MS,
+      heartbeat:MAX_DATE_MS,
+      steps:{
+        measured:true,
+        completed:99999,
+        total:100000,
+        samples:[
+          {at:MAX_DATE_MS-10000,done:0},
+          {at:MAX_DATE_MS,done:99999},
+        ],
+      },
+    },
+  },{started:MAX_DATE_MS-10000,execution:{phase:'dispatching',dispatchedAt:MAX_DATE_MS-10000}},MAX_DATE_MS);
+  assert.equal(subMsOverflow.overallEtaMs,1);
+  assert.equal(subMsOverflow.projectedCompletionMs,null);
+  assert.match(subMsOverflow.completion,/calendar range/i);
+});
+
+test('allowlisted measured units are preserved without mislabeling non-step counters as steps and unsafe units are rejected',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  const filesTask={
+    status:'running',
+    live:{
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4500).toISOString(),
+      steps:{
+        measured:true,
+        unit:'Files',
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Run checks',
+          startedAt:new Date(then+3000).toISOString(),
+          measured:true,
+          unit:'checks',
+          completed:1,
+          total:4,
+          samples:[
+            {at:new Date(then+3000).toISOString(),done:0},
+            {at:new Date(then+4000).toISOString(),done:1},
+          ],
+        },
+      },
+    },
+  };
+  const filesState=describeProgress(filesTask,attempt,then+5000);
+  assert.equal(filesState.unit,'files');
+  assert.equal(filesState.unitSingular,'file');
+  assert.equal(filesState.status,'Running file 3 of 5');
+  assert.match(filesState.explanation,/2 of 5 files complete/i);
+  assert.doesNotMatch(filesState.explanation,/\bsteps?\b/i);
+  assert.match(filesState.remaining,/3 of 5 files remaining/i);
+  assert.doesNotMatch(filesState.remaining,/\bsteps?\b/i);
+  assert.equal(filesState.currentStep.unit,'checks');
+  assert.equal(filesState.currentStep.unitSingular,'check');
+  assert.equal(filesState.overallEtaMs,6000);
+  assert.equal(filesState.currentStepEtaMs,3000);
+
+  const zeroFilesRate=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+10000).toISOString(),
+      heartbeat:new Date(then+10000).toISOString(),
+      steps:{
+        measured:true,
+        unit:'files',
+        completed:1,
+        total:5,
+        samples:[
+          {at:start,done:1},
+          {at:new Date(then+10000).toISOString(),done:1},
+        ],
+      },
+    },
+  },attempt,then+10000);
+  assert.equal(zeroFilesRate.unit,'files');
+  assert.match(zeroFilesRate.overallEta,/0 files\/s/i);
+  assert.doesNotMatch(zeroFilesRate.overallEta,/steps\/s/i);
+  assert.match(zeroFilesRate.completion,/0 files\/s/i);
+
+  const prematureFiles={
+    status:'complete',
+    live:{
+      complete:true,
+      steps:{
+        measured:true,
+        unit:'files',
+        completed:2,
+        total:5,
+      },
+    },
+  };
+  const prematureFilesState=describeProgress(prematureFiles,attempt,then+5000);
+  assert.equal(prematureFilesState.status,'Incomplete termination');
+  assert.match(prematureFilesState.explanation,/measured files finished/i);
+  assert.match(prematureFilesState.remaining,/3 of 5 files remaining/i);
+  assert.doesNotMatch(prematureFilesState.remaining,/\bsteps?\b/i);
+  assert.match(prematureFilesState.overallEta,/remaining files/i);
+  assert.match(progressAnnouncement(prematureFiles,prematureFilesState,'connected'),/3 of 5 files remaining/i);
+  assert.match(progressAnnouncement(prematureFiles,null,'connected'),/3 of 5 files remaining/i);
+
+  const prematureChecksSub={
+    status:'complete',
+    live:{
+      complete:true,
+      steps:{
+        measured:true,
+        unit:'files',
+        completed:5,
+        total:5,
+        currentStep:{
+          label:'Run checks',
+          measured:true,
+          unit:'checks',
+          completed:1,
+          total:4,
+        },
+      },
+    },
+  };
+  const prematureChecksState=describeProgress(prematureChecksSub,attempt,then+5000);
+  assert.equal(prematureChecksState.status,'Incomplete termination');
+  assert.match(prematureChecksState.remaining,/3 of 4 current-step checks remaining/i);
+  assert.match(progressAnnouncement(prematureChecksSub,null,'connected'),/3 of 4 current-step checks remaining/i);
+
+  const invalidUnits=['tokens','utf-16','bytes','<script>files</script>','files/sec','excessively-long-unbounded-unit-name','widgets'];
+  for (const badUnit of invalidUnits) {
+    const rejected=describeProgress({
+      status:'running',
+      live:{
+        steps:{
+          measured:true,
+          unit:badUnit,
+          completed:1,
+          total:5,
+        },
+      },
+    },attempt,then+5000);
+    assert.equal(rejected.totalKnown,false,badUnit);
+    assert.equal(rejected.stepSamplesValid,false,badUnit);
+    assert.equal(rejected.unit,null,badUnit);
+    assert.equal(rejected.unitSingular,null,badUnit);
+    assert.equal(rejected.overallEtaMs,null,badUnit);
+    assert.ok(typeof rejected.stepRejectionReason==='string'&&rejected.stepRejectionReason.length>0,badUnit);
+  }
+
+  const badSubUnit=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4500).toISOString(),
+      steps:{
+        measured:true,
+        unit:'files',
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Verify',
+          unit:'<img onerror=1>',
+          completed:1,
+          total:3,
+        },
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(badSubUnit.unit,'files');
+  assert.equal(badSubUnit.overallEtaMs,6000);
+  assert.equal(badSubUnit.currentStep.unit,null);
+  assert.equal(badSubUnit.currentStep.unitSingular,null);
+  assert.equal(badSubUnit.currentStepEtaMs,null);
+  assert.doesNotMatch(badSubUnit.currentStepEta,/<img/i);
+});
