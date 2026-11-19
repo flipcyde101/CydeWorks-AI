@@ -77,7 +77,7 @@ test('a restarted workspace holds uncertain retries and preserves safe attempts'
   for (const file of ['browser-assets.mjs','receipt-analytics.mjs','receipt-analytics-contract.mjs','contributor-api.mjs','cost-presentation.mjs','portable-import-review-planner.mjs','portable-handoff-validator.mjs','portable-manifest-contract.mjs','portable-sha256.mjs','artifact-download.mjs','route-inventory.mjs','run-submission.mjs','router-evaluation-api.mjs','router-evaluator.mjs','router-evaluation-contract.mjs','connection-host.mjs','connection-readiness.mjs','connection-contract.mjs','receipt-export.mjs','receipt-adapter.mjs','receipt-contract.mjs','server.mjs','opencode.mjs','opencode-usage.mjs','providers.mjs','llamacpp.mjs','inference-broker.mjs','direct-local-fetch.mjs','readiness.mjs','patch.mjs','recovery.mjs','workspace-lock.mjs','export.mjs','attention.mjs','route.mjs','owner-lease.mjs','removal.mjs','terminal-control.mjs','draft-copy.mjs']) {
     await copyFile(join(workspace,file),join(scratch,file));
   }
-  for (const file of ['app.js','index.html','style.css','observer.js','export-dialog.js','usage.js','progress.js','progress-view.js','removal-dialog.js','route-diagnostics.js','proposal-editor.js','terminal-request.js','draft-copy-dialog.js']) {
+  for (const file of ['app.js','index.html','style.css','observer.js','export-dialog.js','usage.js','progress.js','progress-view.js','progress-ui.js','removal-dialog.js','route-diagnostics.js','proposal-editor.js','terminal-request.js','draft-copy-dialog.js']) {
     await copyFile(join(workspace,'web',file),join(scratch,'web',file));
   }
   const key='c'.repeat(64);

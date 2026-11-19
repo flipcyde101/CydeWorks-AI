@@ -4,14 +4,17 @@ import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {loadBrowserAssets} from './browser-assets.mjs';
 import {renderTask} from './web-experience/views/task.js';
-import {describeProgress} from './web/progress.js';
+import {describeProgress, progressAnnouncement} from './web/progress.js';
+import {progressUiState} from './web/progress-ui.js';
+import {progressUiState as experienceProgressUiState} from './web-experience/vendor/harness-web/progress-ui.js';
+import {announce} from './web-experience/ui/primitives.js';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 
 test('both browser modes serve the same pinned progress modules', async () => {
   const legacy = await loadBrowserAssets(root, 'legacy');
   const experience = await loadBrowserAssets(root, 'experience');
-  for (const name of ['progress.js', 'progress-view.js']) {
+  for (const name of ['progress.js', 'progress-view.js', 'progress-ui.js']) {
     const original = await readFile(new URL('./web/' + name, import.meta.url));
     assert.deepEqual(legacy.assets.get('/' + name)?.data, original);
     assert.deepEqual(experience.assets.get('/vendor/harness-web/' + name)?.data, original);
@@ -28,6 +31,8 @@ test('the host claim timestamp before dispatch is valid while waiting for first 
   assert.equal(progress.elapsedMs, 3000);
   assert.equal(progress.lastActivity, then + 1000);
   assert.equal(progress.phase, 'waiting');
+  const impossible = describeProgress({...task, live: {...task.live, chars: 1}}, attempt, then + 3000);
+  assert.equal(impossible.clockAnomaly, true);
 });
 
 class TestNode {
@@ -57,7 +62,7 @@ class TestNode {
     this.append(...nodes);
   }
   get textContent() { return this.ownText + this.children.map(child => child.textContent).join(''); }
-  set textContent(value) { this.replaceChildren(); this.ownText = String(value); }
+  set textContent(value) { this.replaceChildren(); this.ownText = String(value); this.textWrites = (this.textWrites ?? 0) + 1; }
   addEventListener() {}
   contains(node) { return node === this || this.children.some(child => child.contains(node)); }
   descendants() { return this.children.flatMap(child => [child, ...child.descendants()]); }
@@ -79,11 +84,15 @@ test('experience progress shows measured values, preserves focus, and hides stal
   t.after(() => { globalThis.document = old.document; globalThis.Node = old.Node; globalThis.CSS = old.CSS; });
   globalThis.Node = TestNode;
   globalThis.CSS = {escape: value => value};
+  const liveRegion = new TestNode('p');
+  liveRegion.setAttribute('role', 'status');
+  liveRegion.setAttribute('aria-live', 'polite');
   globalThis.document = {
     activeElement: null,
     createElement: tag => new TestNode(tag),
     createElementNS: (_namespace, tag) => new TestNode(tag),
     createTextNode: text => new TestNode('#text', text),
+    getElementById: id => id === 'live' ? liveRegion : null,
   };
 
   const start = '2026-11-14T12:00:00.000Z';
@@ -105,7 +114,7 @@ test('experience progress shows measured values, preserves focus, and hides stal
   assert.match(panel.textContent, /Latest activity/);
   assert.match(panel.textContent, /Heartbeat/);
   assert.doesNotMatch(panel.textContent, /\d+%/);
-  const liveRegion = container.querySelector('#task-progress-announcement');
+  assert.equal(container.querySelector('#task-progress-announcement'), null);
   assert.equal(liveRegion.getAttribute('role'), 'status');
   assert.equal(liveRegion.getAttribute('aria-live'), 'polite');
 
@@ -130,6 +139,16 @@ test('experience progress shows measured values, preserves focus, and hides stal
   assert.equal(globalThis.document.activeElement.dataset.fid, 'cancel-request');
   assert.notEqual(globalThis.document.activeElement, stop);
 
+  task.live.steps.currentStep = 'C:\\Synthetic\\private.txt';
+  renderTask(container, ctx);
+  assert.doesNotMatch(liveRegion.textContent, /Synthetic|private\.txt/);
+  assert.doesNotMatch(container.querySelector('#run-progress').textContent, /C:\\Synthetic\\private\.txt/);
+  assert.doesNotMatch(progressAnnouncement(task, describeProgress(task, attempt, state.now), 'connected'), /Synthetic|private\.txt/);
+  assert.doesNotMatch(progressAnnouncement(task, {failed: true, status: 'Incomplete termination',
+    remaining: 'C:\\Synthetic\\private.txt'}, 'connected'), /Synthetic|private\.txt/);
+  assert.equal(progressUiState(task, state.now, 'connected').announcement,
+    experienceProgressUiState(task, state.now, 'connected').announcement);
+
   state.needsReconcile = true;
   renderTask(container, ctx);
   panel = container.querySelector('#run-progress');
@@ -150,11 +169,24 @@ test('experience progress shows measured values, preserves focus, and hides stal
   panel = container.querySelector('#run-progress');
   assert.equal(panel.querySelector('[data-fid="cancel-request"]').disabled, true);
   assert.ok(panel.descendants().some(node => node.className?.includes('pulse-off')));
+  task.live.stopping = false;
+  renderTask(container, ctx);
+  panel = container.querySelector('#run-progress');
+  assert.equal(panel.querySelector('[data-fid="cancel-request"]').disabled, false);
+  task.live.stopping = true;
+  renderTask(container, ctx);
+  panel = container.querySelector('#run-progress');
+  assert.equal(panel.querySelector('[data-fid="cancel-request"]').disabled, true);
 
   task.status = 'review';
   attempt.status = 'completed';
   task.live.stopping = false;
   delete task.live.error;
+  const transitionMessage = experienceProgressUiState(task, state.now, 'connected').announcement;
+  announce(transitionMessage);
+  const writesAfterPoll = liveRegion.textWrites;
   renderTask(container, ctx);
   assert.match(liveRegion.textContent, /incomplete termination/i);
+  assert.doesNotMatch(liveRegion.textContent, /ready for review/i);
+  assert.equal(liveRegion.textWrites, writesAfterPoll);
 });

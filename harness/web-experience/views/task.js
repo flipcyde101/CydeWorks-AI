@@ -1,8 +1,7 @@
 import {h, icon, swap, stableKey} from '../core/dom.js';
-import {button, chip, notice, kv, panel, disclosure, planned, simulated, approximation, confirmDialog} from '../ui/primitives.js';
+import {button, chip, notice, kv, panel, disclosure, planned, simulated, approximation, confirmDialog, announce} from '../ui/primitives.js';
 import {STATUS_LABEL, STATUS_TONE, STEPS, journeyStep, describeSituation, dispatchEvidence, attemptTiming, timingLine} from '../logic/situation.js';
-import {describeProgress, progressAnnouncement} from '../vendor/harness-web/progress.js';
-import {presentProgress} from '../vendor/harness-web/progress-view.js';
+import {progressUiState} from '../vendor/harness-web/progress-ui.js';
 import {terminalTarget, terminalTargetHolds} from '../logic/approval.js';
 import {describeCost, formatDuration, formatClock, formatDateTime, formatCount, formatAge, shortHash} from '../core/format.js';
 import {demoAcceptance} from '../demo/acceptance.js';
@@ -17,19 +16,20 @@ const TYPE_LABEL = {local: 'Local', subscription: 'Subscription', metered: 'Mete
 export function renderTask(container, ctx) {
   const {state} = ctx, task = state.task;
   if (container.dataset.swapKey !== 'task:' + task.id) {
-    container.replaceChildren(h('p', {id: 'task-progress-announcement', class: 'sr-only', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true'}),
-      ...['head', 'steps', 'overview', 'pending', 'primary', 'usage', 'foot'].map(id => h('div', {id: 'task-' + id, class: 'stack'})));
+    container.replaceChildren(...['head', 'steps', 'overview', 'pending', 'primary', 'usage', 'foot'].map(id => h('div', {id: 'task-' + id, class: 'stack'})));
     container.dataset.swapKey = 'task:' + task.id;
+    delete container.dataset.progressAnnouncement;
   }
   const region = id => container.querySelector('#task-' + id);
   const locked = state.connection !== 'connected' || state.needsReconcile || state.busy;
   const attempt = task.attempts.at(-1);
   const owns = ctx.ownsControl();
   const progressConnection = state.needsReconcile && state.connection === 'connected' ? 'checking' : state.connection;
-  const progress = progressConnection === 'connected' && attempt ? describeProgress(task, attempt, state.now) : null;
-  const announcement = progressAnnouncement(task, progress, progressConnection);
-  const announcementNode = container.querySelector('#task-progress-announcement');
-  if (announcementNode.textContent !== announcement) announcementNode.textContent = announcement;
+  const {view: progressView, announcement} = progressUiState(task, state.now, progressConnection);
+  if (container.dataset.progressAnnouncement !== announcement) {
+    container.dataset.progressAnnouncement = announcement;
+    if (announcement) announce(announcement);
+  }
 
   swap(region('head'), stableKey([task.title, task.status, locked, task.copy]), () => [
     h('a', {class: 'btn btn-quiet back', href: '#/work'}, icon('back'), 'All tasks'),
@@ -62,7 +62,7 @@ export function renderTask(container, ctx) {
   swap(region('pending'), stableKey([pending, locked]), () => pending ? pendingPanel(ctx, pending, locked) : []);
 
   const primary = region('primary');
-  if (task.status === 'running') renderRunning(primary, ctx, {locked, owns, progress, progressConnection});
+  if (task.status === 'running') renderRunning(primary, ctx, {locked, owns, model: progressView, progressConnection});
   else {
     const decided = ['accepted', 'rejected'].includes(task.status);
     const showApproval = !task.recovery?.blocked && task.status !== 'review' && (!decided || state.anotherAttempt === task.id);
@@ -202,19 +202,20 @@ function problemPanel(task, attempt) {
 
 // ---- Running: progress and terminal ----------------------------------------------------------
 
-function renderRunning(container, ctx, {locked, owns, progress, progressConnection}) {
+function renderRunning(container, ctx, {locked, owns, model, progressConnection}) {
   const {state, actions} = ctx, task = state.task, attempt = task.attempts.at(-1);
   if (container.dataset.swapKey !== 'running') {
     container.replaceChildren(h('div', {id: 'run-progress', class: 'stack'}), h('div', {id: 'run-terminal', class: 'stack'}));
     container.dataset.swapKey = 'running';
   }
   const stale = progressConnection !== 'connected';
-  const model = progress ? presentProgress(progress) : null;
-  swap(container.querySelector('#run-progress'), stableKey([model, stale, locked, attempt.provider]), () => {
+  swap(container.querySelector('#run-progress'), stableKey([model, stale, locked, attempt.provider, task.live?.stopping === true]), () => {
     if (!model) return panel('Progress', notice('warn', h('p', null, 'Progress is hidden while the connection is unverified. The last saved state may be out of date.')));
-    const stopping = model.phase === 'stopping';
+    const stopping = task.live?.stopping === true || model.phase === 'stopping';
+    const attention = !model.available || model.stalled || model.failed || stopping ||
+      ['interrupted', 'cancelled', 'unavailable'].includes(model.phase);
     return panel([h('div', {class: 'row'}, h('h2', null, 'Progress'), simulated()),
-      h('div', {class: 'row'}, h('span', {class: 'pulse' + (model.stalled || stopping ? ' pulse-off' : ''), 'aria-hidden': 'true'}), chip(model.status, model.stalled || stopping || model.failed ? 'warn' : 'active'))],
+      h('div', {class: 'row'}, h('span', {class: 'pulse' + (attention ? ' pulse-off' : ''), 'aria-hidden': 'true'}), chip(model.status, attention ? 'warn' : 'active'))],
     h('p', null, model.explanation),
     kv(model.pairs),
     attempt.provider !== 'opencode' ? h('div', {class: 'row'},
