@@ -41,7 +41,8 @@ test('pinned synthetic multi-file fixtures and route metadata are frozen and exp
   assert.match(SYNTHETIC_PATCH_SHA256, /^[a-f0-9]{64}$/);
   assert.ok(SYNTHETIC_MULTI_FILE_PATCH.includes('diff --git a/limits.py b/limits.py'));
   assert.ok(SYNTHETIC_MULTI_FILE_PATCH.includes('diff --git a/measurement.py b/measurement.py'));
-  assert.ok(SYNTHETIC_LIMITS.length >= 4);
+  assert.ok(SYNTHETIC_LIMITS.length >= 5);
+  assert.equal(SYNTHETIC_LIMITS.some(entry => /across process restarts/i.test(entry)), true);
 
   const runner = createSyntheticRunnerFixture();
   const route = runner.route();
@@ -269,17 +270,40 @@ test('confirmed stop before completion, stale control generations, and terminal 
   runner.tick(2);
   assert.equal(runner.inspect({workerId: started.workerId, generation: 1}).progress.completedSteps, 2);
 
-  // Explicit confirm: false is rejected without stopping the run
-  assert.throws(
-    () => runner.stop({workerId: started.workerId, attemptId: 'attempt-1', confirm: false}),
-    error => error instanceof SyntheticRunnerError && error.code === 'STOP_NOT_CONFIRMED',
-  );
-  assert.equal(runner.inspect({workerId: started.workerId}).status, 'running');
+  // Missing, explicit false, and malformed confirm values are rejected without stopping the run
+  for (const badConfirmArgs of [
+    {workerId: started.workerId, attemptId: 'attempt-1'},
+    {workerId: started.workerId, attemptId: 'attempt-1', generation: 1},
+    {workerId: started.workerId, attemptId: 'attempt-1', confirm: false},
+    {workerId: started.workerId, attemptId: 'attempt-1', confirm: 'true'},
+    {workerId: started.workerId, attemptId: 'attempt-1', confirm: 1},
+    {workerId: started.workerId, attemptId: 'attempt-1', confirm: null},
+    {workerId: started.workerId, attemptId: 'attempt-1', confirm: {}},
+  ]) {
+    assert.throws(
+      () => runner.stop(badConfirmArgs),
+      error => error instanceof SyntheticRunnerError && error.code === 'STOP_NOT_CONFIRMED',
+    );
+  }
 
-  // Stale generation is rejected
-  assert.throws(
-    () => runner.stop({workerId: started.workerId, generation: 0, confirm: true}),
-    error => error instanceof SyntheticRunnerError && error.code === 'STALE_CONTROL',
+  // Stale or malformed generation is rejected even when confirm: true
+  for (const badGeneration of [0, 2, '1', null]) {
+    assert.throws(
+      () => runner.stop({workerId: started.workerId, attemptId: 'attempt-1', generation: badGeneration, confirm: true}),
+      error => error instanceof SyntheticRunnerError && error.code === 'STALE_CONTROL',
+    );
+  }
+
+  // None of the rejected stop attempts stopped or mutated the running attempt
+  const stillRunning = runner.inspect({workerId: started.workerId, attemptId: 'attempt-1'});
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(stillRunning.state, 'running');
+  assert.equal(stillRunning.generation, 1);
+  assert.equal(stillRunning.progress.completedSteps, 2);
+  assert.equal(runner.stats().totalStopped, 0);
+  assert.equal(
+    runner.events({workerId: started.workerId, afterSequence: 0}).events.filter(event => event.type === 'terminal').length,
+    0,
   );
 
   // Confirmed stop succeeds
@@ -319,14 +343,24 @@ test('confirmed stop before completion, stale control generations, and terminal 
   runner.tick(5);
   assert.equal(runner.inspect({workerId: started.workerId}).status, 'cancelled');
 
-  // Stop replay on a naturally succeeded run preserves succeeded without overwriting it
+  // Running attempt whose stop lacked confirmation or had stale generation still completes normally
   const second = runner.start(makeStartArgs({
     claimId: 'claim-2',
     attemptId: 'attempt-2',
     grantId: 'grant-2',
     deadlineAt: 2000,
   }));
+  assert.throws(
+    () => runner.stop({workerId: second.workerId, attemptId: 'attempt-2'}),
+    error => error instanceof SyntheticRunnerError && error.code === 'STOP_NOT_CONFIRMED',
+  );
+  assert.throws(
+    () => runner.stop({workerId: second.workerId, attemptId: 'attempt-2', generation: 0, confirm: true}),
+    error => error instanceof SyntheticRunnerError && error.code === 'STALE_CONTROL',
+  );
+  assert.equal(runner.inspect({workerId: second.workerId}).status, 'running');
   runner.tick(4);
+  assert.equal(runner.inspect({workerId: second.workerId}).status, 'succeeded');
   const stopAfterSuccess = runner.stop({workerId: second.workerId, confirm: true});
   assert.equal(stopAfterSuccess.alreadyTerminal, true);
   assert.equal(stopAfterSuccess.stopped, false);
@@ -415,8 +449,8 @@ test('collection enforces terminal state, handles deadline expiry, and labels al
   assert.equal(timedCollect.receipt.elapsedMs, 60);
 });
 
-test('bounds limit active runs, retained runs, event ring buffer, event bytes, and tick steps', () => {
-  // Active and retained run bounds
+test('bounds limit active runs, retained runs without identity eviction, event ring buffer, event bytes, and tick steps', () => {
+  // Active and retained run bounds fail closed and preserve lifetime replay protection
   const boundedRunner = createSyntheticRunnerFixture({
     initialTimeMs: 0,
     stepMs: 25,
@@ -424,26 +458,127 @@ test('bounds limit active runs, retained runs, event ring buffer, event bytes, a
     maxRetainedRuns: 3,
   });
 
-  const r1 = boundedRunner.start(makeStartArgs({claimId: 'c1', attemptId: 'a1', grantId: 'g1', deadlineAt: 1000}));
-  const r2 = boundedRunner.start(makeStartArgs({claimId: 'c2', attemptId: 'a2', grantId: 'g2', deadlineAt: 1000}));
+  const r1 = boundedRunner.start(makeStartArgs({
+    claimId: 'c1',
+    attemptId: 'a1',
+    grantId: 'g1',
+    requestId: 'req1',
+    deadlineAt: 1000,
+  }));
+  const r2 = boundedRunner.start(makeStartArgs({
+    claimId: 'c2',
+    attemptId: 'a2',
+    grantId: 'g2',
+    requestId: 'req2',
+    deadlineAt: 1000,
+  }));
   assert.throws(
-    () => boundedRunner.start(makeStartArgs({claimId: 'c3', attemptId: 'a3', grantId: 'g3', deadlineAt: 1000})),
+    () => boundedRunner.start(makeStartArgs({
+      claimId: 'c3',
+      attemptId: 'a3',
+      grantId: 'g3',
+      requestId: 'req3',
+      deadlineAt: 1000,
+    })),
     error => error instanceof SyntheticRunnerError && error.code === 'CAPACITY_EXCEEDED',
   );
 
   boundedRunner.stop({workerId: r1.workerId, confirm: true});
-  const r3 = boundedRunner.start(makeStartArgs({claimId: 'c3', attemptId: 'a3', grantId: 'g3', deadlineAt: 1000}));
+  const r3 = boundedRunner.start(makeStartArgs({
+    claimId: 'c3',
+    attemptId: 'a3',
+    grantId: 'g3',
+    requestId: 'req3',
+    deadlineAt: 1000,
+  }));
   boundedRunner.stop({workerId: r2.workerId, confirm: true});
-  const r4 = boundedRunner.start(makeStartArgs({claimId: 'c4', attemptId: 'a4', grantId: 'g4', deadlineAt: 1000}));
+  // Allow r3 to succeed so all 3 retained slots are terminal (cancelled, cancelled, succeeded)
+  boundedRunner.tick(4);
+  assert.equal(boundedRunner.inspect({workerId: r3.workerId}).status, 'succeeded');
+
+  // Fresh start beyond maxRetainedRuns fails closed rather than evicting identity history
+  assert.throws(
+    () => boundedRunner.start(makeStartArgs({
+      claimId: 'c4',
+      attemptId: 'a4',
+      grantId: 'g4',
+      requestId: 'req4',
+      deadlineAt: 1000,
+    })),
+    error => error instanceof SyntheticRunnerError && error.code === 'CAPACITY_EXCEEDED',
+  );
 
   assert.equal(boundedRunner.stats().retainedRuns, 3);
-  // Oldest terminal run (r1) was evicted to keep memory bounded
+  assert.equal(boundedRunner.stats().totalStarted, 3);
+  assert.equal(boundedRunner.inspect({workerId: r1.workerId}).status, 'cancelled');
+  assert.equal(boundedRunner.inspect({workerId: r2.workerId}).status, 'cancelled');
+  assert.equal(boundedRunner.inspect({workerId: r3.workerId}).status, 'succeeded');
+
+  // Replaying any old identifier (attemptId, claimId, grantId, requestId) after capacity pressure
+  // must remain blocked as DUPLICATE_START rather than restarting or rotating out
+  const oldTuples = [
+    {claimId: 'c1', attemptId: 'a1', grantId: 'g1', requestId: 'req1'},
+    {claimId: 'c2', attemptId: 'a2', grantId: 'g2', requestId: 'req2'},
+    {claimId: 'c3', attemptId: 'a3', grantId: 'g3', requestId: 'req3'},
+  ];
+  for (const old of oldTuples) {
+    const conflicts = [
+      old,
+      {claimId: old.claimId, attemptId: 'fresh-a', grantId: 'fresh-g', requestId: 'fresh-req'},
+      {claimId: 'fresh-c', attemptId: old.attemptId, grantId: 'fresh-g', requestId: 'fresh-req'},
+      {claimId: 'fresh-c', attemptId: 'fresh-a', grantId: old.grantId, requestId: 'fresh-req'},
+      {claimId: 'fresh-c', attemptId: 'fresh-a', grantId: 'fresh-g', requestId: old.requestId},
+    ];
+    for (const conflict of conflicts) {
+      assert.throws(
+        () => boundedRunner.start(makeStartArgs({...conflict, deadlineAt: 1000})),
+        error => error instanceof SyntheticRunnerError && error.code === 'DUPLICATE_START',
+      );
+    }
+  }
+  assert.equal(boundedRunner.stats().retainedRuns, 3);
+  assert.equal(boundedRunner.stats().totalStarted, 3);
+
+  // Replay protection also holds for deadline-failed runs at capacity and after deadline expiry
+  const expiredRunner = createSyntheticRunnerFixture({
+    initialTimeMs: 0,
+    stepMs: 25,
+    maxActiveRuns: 1,
+    maxRetainedRuns: 1,
+  });
+  const failedRun = expiredRunner.start(makeStartArgs({
+    claimId: 'c-exp',
+    attemptId: 'a-exp',
+    grantId: 'g-exp',
+    requestId: 'req-exp',
+    deadlineAt: 60,
+  }));
+  expiredRunner.tick(3);
+  assert.equal(expiredRunner.inspect({workerId: failedRun.workerId}).status, 'failed');
   assert.throws(
-    () => boundedRunner.inspect({workerId: r1.workerId}),
-    error => error instanceof SyntheticRunnerError && error.code === 'WORKER_NOT_FOUND',
+    () => expiredRunner.start(makeStartArgs({
+      claimId: 'c-fresh',
+      attemptId: 'a-fresh',
+      grantId: 'g-fresh',
+      requestId: 'req-fresh',
+      deadlineAt: 1000,
+    })),
+    error => error instanceof SyntheticRunnerError && error.code === 'CAPACITY_EXCEEDED',
   );
-  assert.equal(boundedRunner.inspect({workerId: r3.workerId}).status, 'running');
-  assert.equal(boundedRunner.inspect({workerId: r4.workerId}).status, 'running');
+  for (const conflict of [
+    {claimId: 'c-exp', attemptId: 'a-exp', grantId: 'g-exp', requestId: 'req-exp', deadlineAt: 60},
+    {claimId: 'c-exp', attemptId: 'a-new', grantId: 'g-new', requestId: 'req-new', deadlineAt: 1000},
+    {claimId: 'c-new', attemptId: 'a-exp', grantId: 'g-new', requestId: 'req-new', deadlineAt: 1000},
+    {claimId: 'c-new', attemptId: 'a-new', grantId: 'g-exp', requestId: 'req-new', deadlineAt: 1000},
+    {claimId: 'c-new', attemptId: 'a-new', grantId: 'g-new', requestId: 'req-exp', deadlineAt: 1000},
+  ]) {
+    assert.throws(
+      () => expiredRunner.start(makeStartArgs(conflict)),
+      error => error instanceof SyntheticRunnerError && error.code === 'DUPLICATE_START',
+    );
+  }
+  assert.equal(expiredRunner.stats().retainedRuns, 1);
+  assert.equal(expiredRunner.stats().totalStarted, 1);
 
   // Event ring buffer bound
   const ringRunner = createSyntheticRunnerFixture({maxEventsPerRun: 3, stepMs: 10});

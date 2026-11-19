@@ -120,6 +120,7 @@ export const SYNTHETIC_LIMITS = Object.freeze([
   'No candidate code was executed, no process was spawned, and no files or network endpoints were accessed.',
   'Synthetic check summaries are pinned in-memory placeholders and do not constitute protected verification.',
   'No real provider charge occurred; charge evidence remains unavailable.',
+  'In-memory fixture state is volatile and does not provide durable replay or claim protection across process restarts.',
   'Windows Stop, controller recovery, protected verifier, patch-binding, and Sol High safety gates remain separate and mandatory.',
 ]);
 
@@ -153,13 +154,13 @@ const MESSAGES = Object.freeze({
   INVALID_CLOCK: 'Synthetic runner clock produced an invalid or backwards timestamp.',
   SNAPSHOT_MISMATCH: 'Synthetic runner accepts only the pinned synthetic multi-file fixture.',
   ROUTE_MISMATCH: 'Synthetic runner accepts only the synthetic fixture route.',
-  DUPLICATE_START: 'An active or retained synthetic run already exists for this attempt, claim, or grant.',
+  DUPLICATE_START: 'An active or retained synthetic run already used this attempt, claim, grant, or request identifier.',
   STALE_START: 'Synthetic start deadline is already expired or out of bounds.',
   CAPACITY_EXCEEDED: 'Synthetic runner has reached its active or retained run bound.',
   WORKER_NOT_FOUND: 'No synthetic worker was found for the supplied identifier.',
   ATTEMPT_MISMATCH: 'Synthetic worker does not match the supplied attempt identifier.',
   STALE_CONTROL: 'Synthetic control generation is stale for this worker.',
-  STOP_NOT_CONFIRMED: 'Synthetic stop requires explicit confirmation when provided.',
+  STOP_NOT_CONFIRMED: 'Synthetic stop requires explicit confirmation (confirm: true).',
   RUN_NOT_TERMINAL: 'Synthetic run has not reached a terminal state.',
   EVENT_LIMIT_EXCEEDED: 'Synthetic event exceeded the configured byte bound.',
 });
@@ -570,22 +571,6 @@ export function createSyntheticRunnerFixture(options = {}) {
     }
   }
 
-  function evictOldestTerminalRun() {
-    for (const [workerId, candidate] of runs.entries()) {
-      if (candidate.status !== 'running') {
-        runs.delete(workerId);
-        attemptIndex.delete(candidate.attemptId);
-        claimIndex.delete(candidate.claimId);
-        grantIndex.delete(candidate.grantId);
-        if (candidate.requestId !== undefined) {
-          requestIndex.delete(candidate.requestId);
-        }
-        return true;
-      }
-    }
-    return false;
-  }
-
   function lookupRun(input, allowedKeys) {
     const args = readPlainRecord(input, allowedKeys);
     const workerId = readSafeId(args.workerId);
@@ -707,9 +692,6 @@ export function createSyntheticRunnerFixture(options = {}) {
       syncAll(effectiveNow);
 
       const deadlineAtMs = parseTimestampMs(args.deadlineAt);
-      if (deadlineAtMs <= effectiveNow || deadlineAtMs - effectiveNow > SYNTHETIC_BOUNDS.maxDeadlineWindowMs) {
-        fail('STALE_START');
-      }
 
       if (
         attemptIndex.has(attemptId) ||
@@ -720,14 +702,15 @@ export function createSyntheticRunnerFixture(options = {}) {
         fail('DUPLICATE_START');
       }
 
+      if (deadlineAtMs <= effectiveNow || deadlineAtMs - effectiveNow > SYNTHETIC_BOUNDS.maxDeadlineWindowMs) {
+        fail('STALE_START');
+      }
+
       let activeCount = 0;
       for (const existing of runs.values()) {
         if (existing.status === 'running') activeCount++;
       }
-      if (activeCount >= maxActiveRuns) {
-        fail('CAPACITY_EXCEEDED');
-      }
-      if (runs.size >= maxRetainedRuns && !evictOldestTerminalRun()) {
+      if (activeCount >= maxActiveRuns || runs.size >= maxRetainedRuns) {
         fail('CAPACITY_EXCEEDED');
       }
 
@@ -847,7 +830,7 @@ export function createSyntheticRunnerFixture(options = {}) {
 
     stop(input) {
       const {args, run} = lookupRun(input, ['workerId', 'attemptId', 'generation', 'confirm']);
-      if (args.confirm !== undefined && args.confirm !== true) {
+      if (args.confirm !== true) {
         fail('STOP_NOT_CONFIRMED');
       }
       const effectiveNow = readEffectiveNow();
