@@ -148,6 +148,10 @@ test('inventory, consistent WAL backup, secret exclusion, and disposable restore
   // Keep the WAL writer connection open during inventory and backup to verify online snapshot consistency.
   const inventory=await inventoryWorkspace(sourceDir);
   assert.equal(inventory.database.integrity,'ok');
+  assert.equal(inventory.consistency.crossStoreConsistency,'unknown');
+  assert.equal(inventory.consistency.copiedFilesBinding,'unverified-best-effort-copy');
+  assert.equal(inventory.consistency.activeLockOrWalObserved,true);
+  assert.equal(inventory.consistency.databaseContentSecrets,'unknown-full-db-retained');
   assert.deepEqual(inventory.database.tables,{
     ledger_usage_events:1,
     task_draft_copies:0,
@@ -178,6 +182,9 @@ test('inventory, consistent WAL backup, secret exclusion, and disposable restore
   });
   assert.equal(created.manifest.format,BACKUP_FORMAT);
   assert.equal(created.manifest.schemaVersion,BACKUP_SCHEMA_VERSION);
+  assert.equal(created.manifest.consistency.crossStoreConsistency,'unknown');
+  assert.equal(created.manifest.consistency.databaseContentSecrets,'unknown-full-db-retained');
+  assert.equal(created.manifest.consistency.activeLockOrWalObserved,true);
   assert.equal(created.manifest.database.summary.taskCount,2);
   assert.deepEqual(created.manifest.database.summary.acceptedArtifactHashes[acceptedTask.id],[artifactHash]);
   assert.deepEqual(created.manifest.database.summary.eventSequences[acceptedTask.id],[1,2,3]);
@@ -197,15 +204,16 @@ test('inventory, consistent WAL backup, secret exclusion, and disposable restore
     assert.equal(content.includes(secret),false,`Secret sentinel leaked into ${rel}`);
   }
 
-  // Close the source writer before mutating source further; confirm backup verifies and restores cleanly.
   db.close();
 
   const verified=await verifyWorkspaceBackup({backupDir});
   assert.equal(verified.ok,true);
   assert.equal(verified.manifestSha256,created.manifestSha256);
+  assert.equal(verified.consistency.crossStoreConsistency,'unknown');
 
   const restored=await restoreWorkspaceBackup({backupDir,restoreDir});
   assert.equal(restored.restored,true);
+  assert.equal(restored.consistency.crossStoreConsistency,'unknown');
   assert.deepEqual(restored.database.tables,created.manifest.database.tables);
   assert.deepEqual(restored.database.summary,created.manifest.database.summary);
   assert.equal(restored.database.summary.taskCount,2);
@@ -233,6 +241,45 @@ test('inventory, consistent WAL backup, secret exclusion, and disposable restore
   } finally {
     checkDb.close();
   }
+});
+
+test('whole-DB secret retention and suspicious table names are disclosed, not hidden',async t=>{
+  const root=await makeTempDir(t,'bfe-bak-dbsecrets-');
+  const sourceDir=join(root,'source');
+  const backupDir=join(root,'backup');
+  await mkdir(sourceDir,{recursive:true});
+
+  const inlineDbSecret='INLINE_DB_TEXT_RETAINED_VERBATIM';
+  const db=new DatabaseSync(join(sourceDir,'workspace.sqlite'));
+  db.exec(`PRAGMA journal_mode=DELETE;
+    CREATE TABLE tasks (id TEXT PRIMARY KEY, updated TEXT NOT NULL, data TEXT NOT NULL);
+    CREATE TABLE oauth_tokens (id TEXT PRIMARY KEY, note TEXT NOT NULL);`);
+  db.prepare('INSERT INTO tasks VALUES (?, ?, ?)').run(
+    '44444444-4444-4444-8444-444444444444',
+    '2026-11-18T11:00:00.000Z',
+    JSON.stringify({
+      id:'44444444-4444-4444-8444-444444444444',
+      version:1,
+      status:'draft',
+      kind:'brief',
+      title:'Note',
+      request:'Summarize',
+      source:inlineDbSecret,
+      filename:null,
+      expected:null,
+      sourceHash:sha256(inlineDbSecret),
+      model:null,
+      attempts:[],
+      events:[{seq:1,at:'2026-11-18T11:00:00.000Z',event:'task.created'}],
+    }),
+  );
+  db.close();
+
+  const created=await createWorkspaceBackup({sourceDir,backupDir});
+  assert.equal(created.manifest.consistency.activeLockOrWalObserved,false);
+  assert.equal(created.manifest.consistency.databaseContentSecrets,'unknown-full-db-retained');
+  assert.deepEqual(created.manifest.consistency.suspiciousSecretTables,['oauth_tokens']);
+  assert.ok(created.manifest.limits.some(line=>/may contain secrets/i.test(line)));
 });
 
 test('tampered or corrupted backups are rejected without creating or mutating restore destination',async t=>{
@@ -290,14 +337,21 @@ test('tampered or corrupted backups are rejected without creating or mutating re
     await writeFile(join(dir,'manifest.sha256'),sha256(raw)+'\n','utf8');
   });
 
-  await assertTamperRejected('tampered sqlite rows with matching db hash and re-signed manifest','BACKUP_CORRUPTED',async dir=>{
+  await assertTamperRejected('overstated consistency claim in re-signed manifest','MANIFEST_INVALID',async dir=>{
+    const m=JSON.parse(await readFile(join(dir,'manifest.json'),'utf8'));
+    m.consistency.crossStoreConsistency='verified';
+    const raw=JSON.stringify(m,null,2)+'\n';
+    await writeFile(join(dir,'manifest.json'),raw,'utf8');
+    await writeFile(join(dir,'manifest.sha256'),sha256(raw)+'\n','utf8');
+  });
+
+  await assertTamperRejected('tampered sqlite rows without updating manifest','BACKUP_CORRUPTED',async dir=>{
     const bakDb=new DatabaseSync(join(dir,'database','workspace.sqlite'));
     try {
       bakDb.exec('DELETE FROM task_removal_audit');
     } finally {
       bakDb.close();
     }
-    // Leave manifest pointing to old table count/hash -> caught by DB hash and/or summary cross-check.
   });
 
   await assertTamperRejected('missing manifest.sha256','BACKUP_CORRUPTED',async dir=>{
@@ -344,7 +398,7 @@ test('tampered or corrupted backups are rejected without creating or mutating re
   await mkdir(sentinelDir,{recursive:true});
   const sentinelDbPath=join(sentinelDir,'workspace.sqlite');
   const sentinelDb=new DatabaseSync(sentinelDbPath);
-  sentinelDb.exec('CREATE TABLE tasks (id TEXT PRIMARY KEY); INSERT INTO tasks VALUES (\'live-sentinel\');');
+  sentinelDb.exec("CREATE TABLE tasks (id TEXT PRIMARY KEY); INSERT INTO tasks VALUES ('live-sentinel');");
   sentinelDb.close();
   const beforeBytes=await readFile(sentinelDbPath);
   await assert.rejects(
@@ -353,6 +407,118 @@ test('tampered or corrupted backups are rejected without creating or mutating re
   );
   const afterBytes=await readFile(sentinelDbPath);
   assert.equal(sha256(afterBytes),sha256(beforeBytes));
+});
+
+test('concurrent destination races preserve original and concurrently added files on publish failure',async t=>{
+  const root=await makeTempDir(t,'bfe-bak-race-');
+  const sourceDir=join(root,'source');
+  await mkdir(sourceDir,{recursive:true});
+  const {db}=await seedDisposableWorkspace(sourceDir);
+  db.close();
+
+  // 1. Non-existent backupDir raced before publish: concurrent file is preserved.
+  const racedNewBackup=join(root,'raced-new-backup');
+  await assert.rejects(
+    ()=>createWorkspaceBackup({
+      sourceDir,
+      backupDir:racedNewBackup,
+      _testHooks:{
+        async onBeforePublish(target) {
+          await mkdir(target,{recursive:true});
+          await writeFile(join(target,'concurrent-owner.txt'),'keep-new','utf8');
+        },
+      },
+    }),
+    error=>error instanceof BackupError&&error.code==='DESTINATION_NOT_EMPTY',
+  );
+  assert.deepEqual(await listAllRelative(racedNewBackup),['concurrent-owner.txt']);
+  assert.equal(await readFile(join(racedNewBackup,'concurrent-owner.txt'),'utf8'),'keep-new');
+
+  // 2. Pre-created empty backupDir raced before publish: concurrent file is preserved, dir not removed.
+  const racedEmptyBackup=join(root,'raced-empty-backup');
+  await mkdir(racedEmptyBackup,{recursive:true});
+  await assert.rejects(
+    ()=>createWorkspaceBackup({
+      sourceDir,
+      backupDir:racedEmptyBackup,
+      _testHooks:{
+        async onBeforePublish(target) {
+          await writeFile(join(target,'unrelated.txt'),'keep-unrelated','utf8');
+        },
+      },
+    }),
+    error=>error instanceof BackupError&&error.code==='DESTINATION_NOT_EMPTY',
+  );
+  assert.deepEqual(await listAllRelative(racedEmptyBackup),['unrelated.txt']);
+  assert.equal(await readFile(join(racedEmptyBackup,'unrelated.txt'),'utf8'),'keep-unrelated');
+
+  // 3. Pre-created empty backupDir raced mid-publish with conflicting manifest.json:
+  // concurrent manifest.json is preserved and operation-created files/empty subdirs are rolled back.
+  const midRaceBackup=join(root,'mid-race-backup');
+  await mkdir(midRaceBackup,{recursive:true});
+  await assert.rejects(
+    ()=>createWorkspaceBackup({
+      sourceDir,
+      backupDir:midRaceBackup,
+      _testHooks:{
+        async onAfterFileWrite(_rel,index,target) {
+          if (index===0) {
+            await writeFile(join(target,'manifest.json'),'{"concurrent":true}\n','utf8');
+          }
+        },
+      },
+    }),
+    error=>error instanceof BackupError&&error.code==='CONCURRENT_MODIFICATION',
+  );
+  assert.deepEqual(await listAllRelative(midRaceBackup),['manifest.json']);
+  assert.equal(await readFile(join(midRaceBackup,'manifest.json'),'utf8'),'{"concurrent":true}\n');
+
+  // 4. Create a clean backup, then race restoreWorkspaceBackup mid-publish with an unrelated sibling file
+  // inside a pre-created empty restoreDir and inside a new non-existent restoreDir.
+  const validBackup=join(root,'valid-backup');
+  await createWorkspaceBackup({sourceDir,backupDir:validBackup});
+
+  const midRacePreRestore=join(root,'mid-race-pre-restore');
+  await mkdir(midRacePreRestore,{recursive:true});
+  await assert.rejects(
+    ()=>restoreWorkspaceBackup({
+      backupDir:validBackup,
+      restoreDir:midRacePreRestore,
+      _testHooks:{
+        async onAfterFileWrite(_rel,index,target) {
+          if (index===0) {
+            await mkdir(join(target,'concurrent-dir'),{recursive:true});
+            await writeFile(join(target,'concurrent-dir','keep.txt'),'concurrent-data','utf8');
+          }
+        },
+      },
+    }),
+    error=>error instanceof BackupError&&error.code==='CONCURRENT_MODIFICATION',
+  );
+  assert.deepEqual(await listAllRelative(midRacePreRestore),['concurrent-dir/keep.txt']);
+  assert.equal(await readFile(join(midRacePreRestore,'concurrent-dir','keep.txt'),'utf8'),'concurrent-data');
+
+  const midRaceNewRestore=join(root,'mid-race-new-restore');
+  await assert.rejects(
+    ()=>restoreWorkspaceBackup({
+      backupDir:validBackup,
+      restoreDir:midRaceNewRestore,
+      _testHooks:{
+        async onAfterFileWrite(_rel,index,target) {
+          if (index===0) {
+            await writeFile(join(target,'workspace.sqlite'),'concurrent-db-bytes','utf8');
+          }
+        },
+      },
+    }),
+    error=>error instanceof BackupError&&error.code==='CONCURRENT_MODIFICATION',
+  );
+  assert.deepEqual(await listAllRelative(midRaceNewRestore),['workspace.sqlite']);
+  assert.equal(await readFile(join(midRaceNewRestore,'workspace.sqlite'),'utf8'),'concurrent-db-bytes');
+
+  // Verify no leftover operation staging directories remain in tmpdir.
+  const tmpEntries=await readdir(tmpdir());
+  assert.equal(tmpEntries.some(name=>name.startsWith('cydeworks-backup-stage-')||name.startsWith('cydeworks-restore-stage-')),false);
 });
 
 test('strict path checks, overlapping directories, corrupt source DB, and symlink rejection',async t=>{

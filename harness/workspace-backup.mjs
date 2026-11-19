@@ -1,5 +1,6 @@
 import {createHash, timingSafeEqual} from 'node:crypto';
-import {copyFile, lstat, mkdir, readdir, readFile, realpath, rm, writeFile} from 'node:fs/promises';
+import {copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, rmdir, unlink, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
 import {dirname, isAbsolute, join, relative, resolve} from 'node:path';
 import {DatabaseSync, backup} from 'node:sqlite';
 import {exportReceipt} from './receipt-export.mjs';
@@ -9,12 +10,20 @@ export const BACKUP_SCHEMA_VERSION=1;
 
 const SHA256_HEX=/^[a-f0-9]{64}$/;
 const TABLE_NAME=/^[A-Za-z_][A-Za-z0-9_]*$/;
+const SUSPICIOUS_TABLE_NAME=/(?:secret|credential|password|passwd|token|session|access_key|auth)/i;
 const CONTROL_CHARS=/[\x00-\x1f\x7f]/;
 const WINDOWS_RESERVED=/^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\..*)?$/i;
 const SECRET_BASENAME=/^(?:\.env(?:\..+)?|access\.key|bfe_session|auth\.json|credentials(?:\.[^.]+)?|secrets?(?:\.[^.]+)?|removal[_-]?secret(?:\.[^.]+)?|.*(?:secret|credential|password|passwd|auth[_-]?token).*)$/i;
 const SECRET_EXTENSION=/\.(?:key|pem|p12|pfx|secret|token|kdbx)$/i;
 const SECRET_DIR_SEGMENT=new Set(['secrets','credentials','.ssh','.gnupg','tokens']);
 const PROTOTYPE_KEYS=new Set(['__proto__','constructor','prototype']);
+
+export const BACKUP_LIMITS=Object.freeze([
+  'SQLite snapshot is transactionally consistent within SQLite, but copied files under files/ are not bound to the database snapshot; cross-store consistency is unknown.',
+  'Backup excludes separate key, credential, lock, and journal files, but retains all SQLite table rows and pages verbatim (including task source, requests, proposals, and terminal history), which may contain secrets.',
+  'SHA-256 checksums detect corruption and post-backup edits against manifest.sha256, but the archive is unsigned and cannot prove origin authenticity.',
+  'Restore must be verified in a separate disposable destination before replacing any workspace.',
+]);
 
 export class BackupError extends Error {
   constructor(code,message,cause) {
@@ -82,21 +91,22 @@ async function statNoFollow(targetPath,label) {
 
 async function resolveComparablePath(targetPath,label) {
   const resolved=assertRootPath(targetPath,label);
-  await statNoFollow(resolved,label);
   let cursor=resolved;
   const tail=[];
+  let nearestCanonical=null;
   while (true) {
     const info=await statNoFollow(cursor,label);
-    if (info) {
-      const canonicalBase=await realpath(cursor);
-      const full=tail.length?resolve(canonicalBase,...tail.reverse()):canonicalBase;
-      return process.platform==='win32'?full.toLowerCase():full;
+    if (info&&!nearestCanonical) {
+      nearestCanonical=await realpath(cursor);
+      const tailCopy=[...tail];
+      const full=tailCopy.length?resolve(nearestCanonical,...tailCopy.reverse()):nearestCanonical;
+      nearestCanonical=process.platform==='win32'?full.toLowerCase():full;
     }
     const parent=dirname(cursor);
     if (parent===cursor) {
-      return process.platform==='win32'?resolved.toLowerCase():resolved;
+      return nearestCanonical??(process.platform==='win32'?resolved.toLowerCase():resolved);
     }
-    tail.push(relative(parent,cursor));
+    if (!info) tail.push(relative(parent,cursor));
     cursor=parent;
   }
 }
@@ -126,28 +136,23 @@ export function classifyWorkspaceFile(relPath,dbFilename='workspace.sqlite') {
   const parts=relPath.split('/');
   const base=parts.at(-1);
   if (relPath===dbFilename) {
-    return {included:false,category:'sqlite-primary',reason:'Captured via consistent SQLite backup snapshot.'};
+    return {included:false,category:'sqlite-primary',reason:'Captured via SQLite online backup API; not raw-copied.'};
   }
   if (relPath===`${dbFilename}.owner.sqlite`||base.endsWith('.owner.sqlite')) {
     return {included:false,category:'runtime-lock',reason:'Workspace owner lock file is transient runtime state.'};
   }
   if (relPath===`${dbFilename}-wal`||relPath===`${dbFilename}-shm`||relPath===`${dbFilename}-journal`||
       /-(?:wal|shm|journal)$/i.test(base)) {
-    return {included:false,category:'sqlite-journal',reason:'SQLite journal sidecars are folded into the snapshot.'};
+    return {included:false,category:'sqlite-journal',reason:'SQLite journal sidecars are folded into the SQLite snapshot.'};
   }
   if (parts.slice(0,-1).some(part=>SECRET_DIR_SEGMENT.has(part.toLowerCase()))||
       SECRET_BASENAME.test(base)||SECRET_EXTENSION.test(base)) {
-    return {included:false,category:'credential-or-secret',reason:'Access keys, session secrets, and credentials are excluded.'};
+    return {included:false,category:'credential-or-secret',reason:'Separate access keys, session secrets, and credential files are excluded.'};
   }
   if (relPath==='backups'||relPath.startsWith('backups/')) {
     return {included:false,category:'backup-archive',reason:'Existing backup archives are excluded.'};
   }
   return {included:true,store:inferStoreCategory(relPath)};
-}
-
-async function clearDirectoryContents(dir) {
-  const names=await readdir(dir);
-  await Promise.all(names.map(name=>rm(join(dir,name),{recursive:true,force:true})));
 }
 
 async function walkDirectory(rootDir,prefix='') {
@@ -237,6 +242,23 @@ async function hashFile(filePath) {
   return {byteLength:bytes.byteLength,sha256:sha256Hex(bytes)};
 }
 
+function buildConsistencyReport(exclusions,tables) {
+  const activeLockOrWalObserved=exclusions.some(
+    item=>item.category==='runtime-lock'||item.category==='sqlite-journal',
+  );
+  const suspiciousSecretTables=Object.keys(tables).filter(name=>SUSPICIOUS_TABLE_NAME.test(name));
+  return {
+    sqliteSnapshot:'online-backup-consistent',
+    copiedFilesBinding:'unverified-best-effort-copy',
+    crossStoreConsistency:'unknown',
+    activeLockOrWalObserved,
+    archiveAuthenticity:'unsigned-sha256-checksums',
+    databaseContentSecrets:'unknown-full-db-retained',
+    suspiciousSecretTables,
+    sqlitePagesMayRetainDeletedData:true,
+  };
+}
+
 function assertNoUnsafeObjectKeys(value) {
   if (value===null||typeof value!=='object') return;
   for (const key of Reflect.ownKeys(value)) {
@@ -251,8 +273,7 @@ function assertPlainObject(value,allowedKeys,label) {
   if (!value||typeof value!=='object'||Array.isArray(value)) {
     fail('MANIFEST_INVALID',`${label} must be a plain object.`);
   }
-  const keys=Object.keys(value);
-  for (const key of keys) {
+  for (const key of Object.keys(value)) {
     if (!allowedKeys.has(key)) fail('MANIFEST_INVALID',`${label} contains unexpected key: ${key}.`);
   }
   return value;
@@ -260,13 +281,44 @@ function assertPlainObject(value,allowedKeys,label) {
 
 function validateManifestSchema(manifest,dbFilename) {
   assertNoUnsafeObjectKeys(manifest);
-  assertPlainObject(manifest,new Set(['format','schemaVersion','createdAt','hashAlgorithm','database','artifacts','exclusions','limits']),'manifest');
+  assertPlainObject(
+    manifest,
+    new Set(['format','schemaVersion','createdAt','hashAlgorithm','consistency','database','artifacts','exclusions','limits']),
+    'manifest',
+  );
   if (manifest.format!==BACKUP_FORMAT) fail('MANIFEST_INVALID','Unsupported backup manifest format.');
   if (manifest.schemaVersion!==BACKUP_SCHEMA_VERSION) fail('MANIFEST_INVALID','Unsupported backup schema version.');
   if (manifest.hashAlgorithm!=='sha256') fail('MANIFEST_INVALID','Unsupported hash algorithm.');
   if (typeof manifest.createdAt!=='string'||!Number.isFinite(Date.parse(manifest.createdAt))) {
     fail('MANIFEST_INVALID','Invalid manifest timestamp.');
   }
+
+  const consistency=assertPlainObject(
+    manifest.consistency,
+    new Set([
+      'sqliteSnapshot',
+      'copiedFilesBinding',
+      'crossStoreConsistency',
+      'activeLockOrWalObserved',
+      'archiveAuthenticity',
+      'databaseContentSecrets',
+      'suspiciousSecretTables',
+      'sqlitePagesMayRetainDeletedData',
+    ]),
+    'manifest.consistency',
+  );
+  if (consistency.sqliteSnapshot!=='online-backup-consistent'||
+      consistency.copiedFilesBinding!=='unverified-best-effort-copy'||
+      consistency.crossStoreConsistency!=='unknown'||
+      typeof consistency.activeLockOrWalObserved!=='boolean'||
+      consistency.archiveAuthenticity!=='unsigned-sha256-checksums'||
+      consistency.databaseContentSecrets!=='unknown-full-db-retained'||
+      !Array.isArray(consistency.suspiciousSecretTables)||
+      consistency.suspiciousSecretTables.some(name=>typeof name!=='string'||!TABLE_NAME.test(name))||
+      consistency.sqlitePagesMayRetainDeletedData!==true) {
+    fail('MANIFEST_INVALID','Invalid or overstated consistency metadata in manifest.');
+  }
+
   const db=assertPlainObject(manifest.database,new Set(['path','byteLength','sha256','integrity','tables','summary']),'manifest.database');
   if (db.path!=='database/workspace.sqlite') fail('MANIFEST_INVALID','Invalid database snapshot path in manifest.');
   if (!Number.isSafeInteger(db.byteLength)||db.byteLength<=0) fail('MANIFEST_INVALID','Invalid database byteLength.');
@@ -304,6 +356,110 @@ function validateManifestSchema(manifest,dbFilename) {
   }
 }
 
+async function publishStagedToDestination({
+  stageRoot,
+  targetRoot,
+  targetLabel,
+  relativeFiles,
+  targetPreexisted,
+  onBeforePublish,
+  onAfterFileWrite,
+}) {
+  if (onBeforePublish) await onBeforePublish(targetRoot);
+
+  const createdFiles=[];
+  const createdDirs=[];
+  const createdDirSet=new Set();
+
+  // Only remove exact files opened exclusively ('wx') and empty directories created by this operation.
+  // Never clear or recursively delete a caller-supplied destination.
+  const rollbackCreated=async()=>{
+    for (let i=createdFiles.length-1;i>=0;i--) {
+      try { await unlink(createdFiles[i]); } catch {}
+    }
+    for (let i=createdDirs.length-1;i>=0;i--) {
+      try { await rmdir(createdDirs[i]); } catch {}
+    }
+  };
+
+  try {
+    const currentInfo=await statNoFollow(targetRoot,targetLabel);
+    if (!targetPreexisted) {
+      if (currentInfo) {
+        fail('DESTINATION_NOT_EMPTY',`${targetLabel} was created concurrently before publish.`);
+      }
+      await mkdir(dirname(targetRoot),{recursive:true});
+      try {
+        await mkdir(targetRoot);
+      } catch (error) {
+        if (error.code==='EEXIST') {
+          fail('DESTINATION_NOT_EMPTY',`${targetLabel} was created concurrently before publish.`);
+        }
+        throw error;
+      }
+      createdDirs.push(targetRoot);
+      createdDirSet.add(targetRoot);
+    } else {
+      if (!currentInfo||!currentInfo.isDirectory()) {
+        fail('INVALID_PATH',`${targetLabel} is no longer a valid directory.`);
+      }
+      if ((await readdir(targetRoot)).length>0) {
+        fail('DESTINATION_NOT_EMPTY',`${targetLabel} contains existing or concurrently added entries.`);
+      }
+    }
+
+    for (const rel of relativeFiles) {
+      const parts=rel.split('/');
+      let cur=targetRoot;
+      for (let i=0;i<parts.length-1;i++) {
+        cur=join(cur,parts[i]);
+        if (!createdDirSet.has(cur)) {
+          try {
+            await mkdir(cur);
+          } catch (error) {
+            if (error.code==='EEXIST') {
+              fail('CONCURRENT_MODIFICATION',`Concurrent entry appeared at ${parts.slice(0,i+1).join('/')} in ${targetLabel}.`);
+            }
+            throw error;
+          }
+          createdDirs.push(cur);
+          createdDirSet.add(cur);
+        }
+      }
+    }
+
+    for (let i=0;i<relativeFiles.length;i++) {
+      const rel=relativeFiles[i];
+      const srcPath=resolveContainedPath(stageRoot,rel,'staged file');
+      const dstPath=resolveContainedPath(targetRoot,rel,'destination file');
+      const bytes=await readFile(srcPath);
+      let handle;
+      try {
+        handle=await open(dstPath,'wx');
+        createdFiles.push(dstPath);
+        await handle.writeFile(bytes);
+      } catch (error) {
+        if (error.code==='EEXIST') {
+          fail('CONCURRENT_MODIFICATION',`Concurrent file appeared at ${rel} in ${targetLabel}.`);
+        }
+        throw error;
+      } finally {
+        try { await handle?.close(); } catch {}
+      }
+      if (onAfterFileWrite) await onAfterFileWrite(rel,i,targetRoot);
+    }
+
+    const publishedEntries=await walkDirectory(targetRoot);
+    const expectedSet=new Set(relativeFiles);
+    if (publishedEntries.length!==expectedSet.size||publishedEntries.some(entry=>!expectedSet.has(entry.rel))) {
+      fail('CONCURRENT_MODIFICATION',`${targetLabel} was modified concurrently during publish.`);
+    }
+  } catch (error) {
+    await rollbackCreated();
+    throw error;
+  }
+}
+
 export async function inventoryWorkspace(stateDir,{dbFilename='workspace.sqlite'}={}) {
   const root=assertRootPath(stateDir,'stateDir');
   assertDbFilename(dbFilename);
@@ -326,10 +482,17 @@ export async function inventoryWorkspace(stateDir,{dbFilename='workspace.sqlite'
       exclusions.push({path:entry.rel,category:classification.category,reason:classification.reason});
     }
   }
-  return {stateDir:root,dbFilename,database,included,exclusions};
+  const consistency=buildConsistencyReport(exclusions,database.tables);
+  return {stateDir:root,dbFilename,consistency,database,included,exclusions,limits:[...BACKUP_LIMITS]};
 }
 
-export async function createWorkspaceBackup({sourceDir,backupDir,dbFilename='workspace.sqlite',now=()=>new Date().toISOString()}={}) {
+export async function createWorkspaceBackup({
+  sourceDir,
+  backupDir,
+  dbFilename='workspace.sqlite',
+  now=()=>new Date().toISOString(),
+  _testHooks={},
+}={}) {
   const sourceRoot=assertRootPath(sourceDir,'sourceDir');
   const backupRoot=assertRootPath(backupDir,'backupDir');
   assertDbFilename(dbFilename);
@@ -342,14 +505,13 @@ export async function createWorkspaceBackup({sourceDir,backupDir,dbFilename='wor
   if (!sourceDbInfo||!sourceDbInfo.isFile()) fail('MISSING_DATABASE','Source workspace SQLite database does not exist.');
 
   const backupInfo=await statNoFollow(backupRoot,'backupDir');
-  let createdBackupRoot=false;
+  let targetPreexisted=false;
   if (backupInfo) {
     if (!backupInfo.isDirectory()) fail('INVALID_PATH','Backup destination must be a directory.');
     if ((await readdir(backupRoot)).length>0) {
       fail('DESTINATION_NOT_EMPTY','Backup destination directory must be empty.');
     }
-  } else {
-    createdBackupRoot=true;
+    targetPreexisted=true;
   }
 
   const allEntries=await walkDirectory(sourceRoot);
@@ -364,15 +526,15 @@ export async function createWorkspaceBackup({sourceDir,backupDir,dbFilename='wor
     }
   }
 
-  await mkdir(join(backupRoot,'database'),{recursive:true});
-  const backupDbPath=resolveContainedPath(backupRoot,'database/workspace.sqlite','backup database');
-  const rollbackBackup=()=>createdBackupRoot?rm(backupRoot,{recursive:true,force:true}):clearDirectoryContents(backupRoot);
-
+  const stageRoot=await mkdtemp(join(tmpdir(),'cydeworks-backup-stage-'));
   try {
+    await mkdir(join(stageRoot,'database'),{recursive:true});
+    const stagedDbPath=resolveContainedPath(stageRoot,'database/workspace.sqlite','staged database');
+
     let srcDb;
     try {
       srcDb=new DatabaseSync(sourceDbPath,{readOnly:true});
-      await backup(srcDb,backupDbPath);
+      await backup(srcDb,stagedDbPath);
     } catch (error) {
       if (error instanceof BackupError) throw error;
       fail('SQLITE_INTEGRITY_FAILED','Failed to create consistent SQLite backup snapshot.',error);
@@ -382,7 +544,7 @@ export async function createWorkspaceBackup({sourceDir,backupDir,dbFilename='wor
 
     let snapDb;
     try {
-      snapDb=new DatabaseSync(backupDbPath);
+      snapDb=new DatabaseSync(stagedDbPath);
       snapDb.exec('PRAGMA journal_mode=DELETE;');
     } catch (error) {
       fail('SQLITE_INTEGRITY_FAILED','Failed to finalize SQLite backup snapshot.',error);
@@ -390,23 +552,27 @@ export async function createWorkspaceBackup({sourceDir,backupDir,dbFilename='wor
       try { snapDb?.close(); } catch {}
     }
 
-    const dbMeta=inspectSnapshotFile(backupDbPath);
-    const dbDigest=await hashFile(backupDbPath);
+    const dbMeta=inspectSnapshotFile(stagedDbPath);
+    const dbDigest=await hashFile(stagedDbPath);
     const artifacts=[];
+    const relativeFiles=['database/workspace.sqlite'];
     for (const item of included) {
       const targetRel=`files/${item.sourcePath}`;
-      const targetPath=resolveContainedPath(backupRoot,targetRel,'backup artifact');
+      const targetPath=resolveContainedPath(stageRoot,targetRel,'staged artifact');
       await mkdir(dirname(targetPath),{recursive:true});
       await copyFile(item.full,targetPath);
       const digest=await hashFile(targetPath);
       artifacts.push({path:targetRel,sourcePath:item.sourcePath,store:item.store,byteLength:digest.byteLength,sha256:digest.sha256});
+      relativeFiles.push(targetRel);
     }
 
+    const consistency=buildConsistencyReport(exclusions,dbMeta.tables);
     const manifest={
       format:BACKUP_FORMAT,
       schemaVersion:BACKUP_SCHEMA_VERSION,
       createdAt:now(),
       hashAlgorithm:'sha256',
+      consistency,
       database:{
         path:'database/workspace.sqlite',
         byteLength:dbDigest.byteLength,
@@ -417,19 +583,28 @@ export async function createWorkspaceBackup({sourceDir,backupDir,dbFilename='wor
       },
       artifacts,
       exclusions,
-      limits:[
-        'Backup excludes access keys, session tokens, credentials, and transient lock/journal files.',
-        'Restore must be verified in a separate disposable destination before replacing any workspace.',
-      ],
+      limits:[...BACKUP_LIMITS],
     };
     const manifestJson=JSON.stringify(manifest,null,2)+'\n';
     const manifestSha256=sha256Hex(Buffer.from(manifestJson,'utf8'));
-    await writeFile(resolveContainedPath(backupRoot,'manifest.json','manifest'),manifestJson,'utf8');
-    await writeFile(resolveContainedPath(backupRoot,'manifest.sha256','manifest digest'),manifestSha256+'\n','utf8');
+    await writeFile(resolveContainedPath(stageRoot,'manifest.json','manifest'),manifestJson,'utf8');
+    await writeFile(resolveContainedPath(stageRoot,'manifest.sha256','manifest digest'),manifestSha256+'\n','utf8');
+    relativeFiles.push('manifest.json','manifest.sha256');
+    relativeFiles.sort();
+
+    await publishStagedToDestination({
+      stageRoot,
+      targetRoot:backupRoot,
+      targetLabel:'backupDir',
+      relativeFiles,
+      targetPreexisted,
+      onBeforePublish:_testHooks.onBeforePublish,
+      onAfterFileWrite:_testHooks.onAfterFileWrite,
+    });
+
     return {backupDir:backupRoot,manifest,manifestSha256};
-  } catch (error) {
-    await rollbackBackup();
-    throw error;
+  } finally {
+    await rm(stageRoot,{recursive:true,force:true});
   }
 }
 
@@ -512,75 +687,98 @@ export async function verifyWorkspaceBackup({backupDir,dbFilename='workspace.sql
     fail('BACKUP_CORRUPTED','Backup SQLite contents do not match manifest database summary.');
   }
 
-  return {ok:true,manifest,manifestSha256:actualManifestDigest,database:verifiedDb};
+  return {
+    ok:true,
+    manifest,
+    manifestSha256:actualManifestDigest,
+    consistency:manifest.consistency,
+    database:verifiedDb,
+  };
 }
 
-export async function restoreWorkspaceBackup({backupDir,restoreDir,dbFilename='workspace.sqlite'}={}) {
+export async function restoreWorkspaceBackup({
+  backupDir,
+  restoreDir,
+  dbFilename='workspace.sqlite',
+  _testHooks={},
+}={}) {
   const backupRoot=assertRootPath(backupDir,'backupDir');
   const restoreRoot=assertRootPath(restoreDir,'restoreDir');
   assertDbFilename(dbFilename);
   await assertDistinctPaths(backupRoot,restoreRoot,'backupDir','restoreDir');
 
   const restoreInfo=await statNoFollow(restoreRoot,'restoreDir');
-  let createdRestoreRoot=false;
+  let targetPreexisted=false;
   if (restoreInfo) {
     if (!restoreInfo.isDirectory()) fail('INVALID_PATH','Restore destination must be a directory.');
     if ((await readdir(restoreRoot)).length>0) {
       fail('DESTINATION_NOT_EMPTY','Restore destination must be an empty disposable directory.');
     }
-  } else {
-    createdRestoreRoot=true;
+    targetPreexisted=true;
   }
 
-  // Verify the entire backup archive before creating or modifying anything in restoreDir.
+  // Verify the entire backup archive before staging or touching restoreDir.
   const verification=await verifyWorkspaceBackup({backupDir:backupRoot,dbFilename});
 
-  await mkdir(restoreRoot,{recursive:true});
-  const backupDbPath=resolveContainedPath(backupRoot,'database/workspace.sqlite','backup database');
-  const targetDbPath=resolveContainedPath(restoreRoot,dbFilename,'restored database');
-  const rollbackRestore=()=>createdRestoreRoot?rm(restoreRoot,{recursive:true,force:true}):clearDirectoryContents(restoreRoot);
-
+  const stageRoot=await mkdtemp(join(tmpdir(),'cydeworks-restore-stage-'));
   try {
+    const backupDbPath=resolveContainedPath(backupRoot,'database/workspace.sqlite','backup database');
+    const stagedDbPath=resolveContainedPath(stageRoot,dbFilename,'staged restored database');
+
     let srcDb;
     try {
       srcDb=new DatabaseSync(backupDbPath,{readOnly:true});
-      await backup(srcDb,targetDbPath);
+      await backup(srcDb,stagedDbPath);
     } catch (error) {
       if (error instanceof BackupError) throw error;
-      fail('SQLITE_INTEGRITY_FAILED','Failed to restore SQLite database to disposable destination.',error);
+      fail('SQLITE_INTEGRITY_FAILED','Failed to restore SQLite database in staging.',error);
     } finally {
       try { srcDb?.close(); } catch {}
     }
 
+    const relativeFiles=[dbFilename];
     const restoredFiles=[];
     for (const artifact of verification.manifest.artifacts) {
       const srcArtifact=resolveContainedPath(backupRoot,artifact.path,'backup artifact');
-      const dstArtifact=resolveContainedPath(restoreRoot,artifact.sourcePath,'restored artifact');
+      const dstArtifact=resolveContainedPath(stageRoot,artifact.sourcePath,'staged artifact');
       await mkdir(dirname(dstArtifact),{recursive:true});
       await copyFile(srcArtifact,dstArtifact);
       const written=await hashFile(dstArtifact);
       if (written.byteLength!==artifact.byteLength||written.sha256!==artifact.sha256) {
         fail('BACKUP_CORRUPTED',`Restored artifact checksum mismatch for ${artifact.sourcePath}.`);
       }
+      relativeFiles.push(artifact.sourcePath);
       restoredFiles.push(artifact.sourcePath);
     }
 
-    const restoredDb=inspectSnapshotFile(targetDbPath);
+    const restoredDb=inspectSnapshotFile(stagedDbPath);
     if (JSON.stringify(restoredDb.tables)!==JSON.stringify(verification.manifest.database.tables)||
         JSON.stringify(restoredDb.summary)!==JSON.stringify(verification.manifest.database.summary)) {
       fail('BACKUP_CORRUPTED','Restored SQLite database does not match verified manifest summary.');
     }
 
+    relativeFiles.sort();
+    await publishStagedToDestination({
+      stageRoot,
+      targetRoot:restoreRoot,
+      targetLabel:'restoreDir',
+      relativeFiles,
+      targetPreexisted,
+      onBeforePublish:_testHooks.onBeforePublish,
+      onAfterFileWrite:_testHooks.onAfterFileWrite,
+    });
+
     return {
       restored:true,
       restoreDir:restoreRoot,
-      databasePath:targetDbPath,
+      databasePath:resolveContainedPath(restoreRoot,dbFilename,'restored database'),
       manifestSha256:verification.manifestSha256,
+      consistency:verification.consistency,
       database:restoredDb,
       restoredFiles,
+      limits:[...verification.manifest.limits],
     };
-  } catch (error) {
-    await rollbackRestore();
-    throw error;
+  } finally {
+    await rm(stageRoot,{recursive:true,force:true});
   }
 }
