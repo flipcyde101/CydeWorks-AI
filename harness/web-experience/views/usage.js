@@ -1,21 +1,13 @@
 import {h, swap, stableKey} from '../core/dom.js';
 import {button, chip, notice, kv, panel, emptyState, simulated} from '../ui/primitives.js';
-import {describeCost, formatCount, formatDuration, formatMicros, formatSignedMicros} from '../core/format.js';
+import {formatCount, formatDuration, formatMicros, formatSignedMicros} from '../core/format.js';
 import {mode} from '../core/mode.js';
-import {usageRow, coverageNotice} from '../logic/usage-rows.js';
-import {receiptSummary, comparisonView, costDifferenceInput, receiptView} from '../adapters/slots.js';
+import {usageRow, usageCoverage} from '../logic/usage-rows.js';
+import {comparisonView, costDifferenceInput, receiptView} from '../adapters/slots.js';
 import {STATUS_LABEL} from '../logic/situation.js';
 import {openReceiptDialog} from './dialogs.js';
 
 const pick = {baseline: null, candidate: null};
-
-function totals(summary) {
-  if (!summary) return {time: 'Unavailable', cost: describeCost(null)};
-  const cost = summary.totalCost.available
-    ? describeCost({amountMicros: summary.totalCost.value, currency: summary.totalCost.currency, evidence: summary.totalCost.evidence, complete: true})
-    : describeCost(null);
-  return {time: summary.wallTime.available ? formatDuration(summary.wallTime.value) : 'Unavailable', cost};
-}
 
 // The cost sentence comes from the reviewed formatter behind POST /api/cost-presentation (Qwen's
 // describeCostDifference), shown as plain text exactly as returned. Until it answers, or if it
@@ -100,43 +92,54 @@ function workspaceTotals(report) {
       ['Recorded attempts', formatCount(attempts) + ', including ' + formatCount(summary.runs.retries.retryAttemptCount) +
         ' retries, ' + formatCount(summary.attempts.statusCounts.failed) + ' failures, and ' +
         formatCount(summary.attempts.recordedStatusCounts.cancelled) + ' stopped'],
-      ['Recorded attempt time', formatDuration(elapsed.cumulativeKnownElapsedMs) + ' across ' + formatCount(elapsed.knownAttemptCount) +
-        ' of ' + formatCount(attempts) + ' attempts'],
+      ['Recorded attempt time', elapsed.cumulativeKnownElapsedMs !== null
+        ? formatDuration(elapsed.cumulativeKnownElapsedMs) + ' across ' + formatCount(elapsed.knownAttemptCount) + ' of ' + formatCount(attempts) + ' attempts'
+        : elapsed.overflow ? 'Unavailable. The duration total is too large to report precisely.' : 'Unavailable. No attempt durations were recorded.'],
       ['Charge coverage', formatCount(summary.costs.knownCostAttemptCount) + ' recorded, ' + formatCount(summary.costs.unknownCostAttemptCount) + ' unknown'],
       ...costRows,
-      ...(tokenRows.length ? tokenRows : [['Token usage', 'Unavailable']]),
+      ...(tokenRows.length ? tokenRows : [['Token usage', 'Unavailable. No token totals could be calculated.']]),
     ]),
     h('p', {class: 'faint'}, 'Attempt durations include retries. Token categories may overlap and are listed separately.')));
 }
 
 export function renderUsage(main, ctx) {
   const {state} = ctx, data = state.cache.usage;
-  const acceptedRuns = data?.receipts.filter(item => item.envelope.available && item.envelope.run?.accepted === true) ?? [];
+  const rows = data ? state.tasks.map(task => {
+    const entry = data.receipts.find(item => item.taskId === task.id);
+    const missing = data.unavailable?.find(item => item.taskId === task.id)
+      ?? (data.omitted?.some(item => item.taskId === task.id) ? {reason: 'omitted'} : null);
+    return {task, entry, row: usageRow(task, entry, missing)};
+  }) : [];
+  const coverage = usageCoverage(rows.map(item => item.row));
+  const acceptedRuns = rows.filter(({entry, row}) => row.kind === 'receipt' && entry.envelope.run.accepted === true)
+    .map(({entry}) => entry);
   const rerender = () => { if (state.path[0] !== 'usage' || !state.session.unlocked) return; delete main.dataset.swapKey; renderUsage(main, ctx); };
   swap(main, stableKey(['usage', data, state.tasks, pick]), () => h('div', {class: 'page'},
     h('div', {class: 'page-head'}, h('h1', null, 'Usage'),
-      h('p', null, 'What each task used, attempt by attempt. Every figure says whether it was reported by a provider, estimated, or is unavailable. An unavailable figure is never shown as zero.')),
+      h('p', null, 'See recorded durations, charges and receipt coverage for each task.')),
     !data ? h('p', {class: 'loading', role: 'status'}, 'Reading usage records.') : [
       workspaceTotals(data.analytics),
-      coverageNotice(data) ? notice('warn', h('p', {dataset: {fid: 'usage-partial'}}, coverageNotice(data))) : null,
       panel([h('h2', null, 'By task'), simulated()],
-        state.tasks.length ? h('div', {class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Usage by task'}, h('table', null,
-          h('thead', null, h('tr', null, ['Task', 'State', 'Attempts', 'Execution window', 'Total cost', 'Evidence', 'Receipt'].map(name => h('th', {scope: 'col'}, name)))),
-          h('tbody', null, state.tasks.map(task => {
-            const entry = data.receipts.find(item => item.taskId === task.id);
-            const missing = data.unavailable?.find(item => item.taskId === task.id) ?? (data.omitted?.some(item => item.taskId === task.id) ? {reason: 'omitted'} : null);
-            const row = usageRow(task, entry, missing);
-            const view = row.kind === 'receipt' ? totals(receiptSummary(entry.summary)) : null;
+        coverage.partial ? notice('warn', h('p', {id: 'usage-coverage', dataset: {fid: 'usage-partial'}}, 'Partial coverage. ' + coverage.text))
+          : coverage.text ? h('p', {id: 'usage-coverage'}, coverage.text) : null,
+        rows.length ? h('div', {class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Usage by task', 'aria-describedby': 'usage-coverage'}, h('table', null,
+          h('thead', null, h('tr', null, ['Task', 'State', 'Recorded attempts', 'Execution window', 'Total cost', 'Evidence', 'Receipt'].map(name => h('th', {scope: 'col'}, name)))),
+          h('tbody', null, rows.map(({task, entry, row}) => {
+            const view = row.fields;
             const status = entry?.envelope?.evidence?.task?.status;
             const label = Object.hasOwn(STATUS_LABEL, status) ? STATUS_LABEL[status] : STATUS_LABEL[task.status];
             return h('tr', {dataset: {fid: 'usage-row-' + task.id}}, h('th', {scope: 'row'}, h('a', {href: '#/task/' + task.id}, task.title)), h('td', null, label),
               h('td', null, row.attempts === null ? 'Unknown' : String(row.attempts)),
-              h('td', null, view ? view.time : row.text),
-              h('td', null, view ? view.cost.primary : row.text),
-              h('td', null, view ? chip(view.cost.label, view.cost.kind === 'estimated' ? 'warn' : 'neutral') : chip(row.chip, row.kind === 'unknown' ? 'warn' : 'neutral'),
+              h('td', null, view ? view.time : row.text,
+                view?.timeNote ? h('p', {class: 'faint'}, view.timeNote) : null,
+                view?.attemptTime ? h('p', null, 'Recorded attempt duration ' + view.attemptTime) : null),
+              h('td', null, view ? view.cost.primary : row.text,
+                view?.costNote ? h('p', {class: 'faint'}, view.costNote) : null),
+              h('td', null, view ? chip(view.cost.kind === 'unavailable' ? 'Charge unavailable' : view.cost.label, view.cost.kind === 'estimated' ? 'warn' : 'neutral')
+                : chip(row.chip, row.kind === 'none' ? 'neutral' : 'warn'),
                 row.note ? h('span', {class: 'faint'}, ' ' + row.note) : null),
               h('td', null, entry ? button('Inspect', {fid: 'receipt-' + entry.key, onClick: event => openReceiptDialog(ctx, {title: entry.title, envelope: entry.envelope}, event.currentTarget)})
-                : h('span', {class: 'faint'}, mode.synthetic && !missing ? 'Not in demo' : 'Unavailable')));
+                : h('span', {class: 'faint'}, 'Unavailable')));
           }))))
           : emptyState('No usage yet', 'Usage appears after a task has run at least one attempt.', h('a', {class: 'btn btn-primary', href: '#/new'}, 'Describe work')),
         h('p', {class: 'faint'}, 'The execution window runs from the first attempt start to the last attempt end, counting failures and gaps. Waiting and review time are shown per attempt on each task. ' +

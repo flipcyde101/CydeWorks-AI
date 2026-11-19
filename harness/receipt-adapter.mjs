@@ -213,7 +213,11 @@ export function adaptTaskToReceipt(task,{timebase='run-relative',charges}={}) {
   if(identity.problem)mark(identity.problem);
   const records=[],ids=new Set();
   if(!Array.isArray(attempts))mark('attempt-records-missing');
-  else if(attempts.length===0)mark(taskStatus==='draft'?'no-attempts-recorded':'attempt-records-missing');
+  else if(attempts.length===0) {
+    // A saved start event contradicts an empty attempt list, even on a draft.
+    const started=taskStatus==='draft'&&eventNames(task)?.includes(START_EVENT);
+    mark(taskStatus==='draft'&&!started?'no-attempts-recorded':'attempt-records-missing');
+  }
   else if(attempts.length>LIMITS.attempts)mark('attempt-limit-exceeded');
   else for(let index=0;index<attempts.length;index++) {
     const attempt=own(attempts,index),id=own(attempt,'id'),status=own(attempt,'status');

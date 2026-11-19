@@ -4,7 +4,8 @@ import {exportReceipt} from './receipt-export.mjs';
 import {validateReceiptExport} from './receipt-contract.mjs';
 import {summarizeReceiptExports} from './receipt-analytics.mjs';
 import {compareRuns,summarizeRun} from './test-support/inspector-v1/accounting.mjs';
-import {acceptedTask,clone,deepFreeze,sha} from './test-support/receipt-synthetic.mjs';
+import {acceptedTask,clone,deepFreeze,dispatch,draft,finish,review,scenarios,sha,start} from './test-support/receipt-synthetic.mjs';
+import {usageCoverage,usageRow} from './web-experience/logic/usage-rows.js';
 
 // This fixture mirrors work/continuity-before/server.mjs. That server wrote
 // a six-field source approval hash before recording a backend or model digest.
@@ -134,4 +135,101 @@ test('unrecorded legacy provider outcomes cannot establish complete timing total
   const comparison=compareRuns(receipt.run,candidate.run);
   assert.equal(comparison.time.available,false);
   assert.equal(comparison.cost.available,false);
+});
+
+function usageEntry(task,options) {
+  const envelope=exportReceipt(task,options);
+  return {envelope,summary:envelope.available?summarizeRun(envelope.run):null};
+}
+
+test('Usage keeps current and legacy receipts visible alongside every coverage gap',()=>{
+  const current=draft();
+  start(current,1000,{provider:'opencode',backend:'llamacpp'});
+  const attempt=current.attempts[0];
+  attempt.approvedRouteRevision='a'.repeat(64);
+  attempt.scopeHash=sha(JSON.stringify([current.sourceHash,current.request,current.expected,current.kind,
+    attempt.model,attempt.provider,attempt.backend,attempt.approvedModelFingerprint,['routeRevision',attempt.approvedRouteRevision]]));
+  dispatch(current,1000);
+  finish(current,1000);
+  review(current,2000);
+  const currentEntry=usageEntry(current,{charges:[{attemptId:attempt.id,amountMicros:0,currency:'USD',evidence:'provider-billed',complete:true}]});
+  assert.equal(currentEntry.envelope.formatVersion,2);
+  assert.equal(currentEntry.envelope.run.attempts[0].provider,'opencode+llamacpp');
+  const currentRow=usageRow({attempts:null},currentEntry);
+  assert.equal(currentRow.fields.time,'0.0 s');
+  assert.equal(currentRow.fields.cost.primary,'0.00 USD');
+  assert.equal(currentRow.fields.timeNote,null);
+  assert.equal(currentRow.fields.costNote,null);
+
+  const old=legacyTask();
+  const oldEntry=usageEntry(old);
+  assert.equal(oldEntry.envelope.formatVersion,2);
+  const oldRow=usageRow({attempts:null},oldEntry);
+  assert.equal(oldRow.attempts,1);
+  assert.equal(oldRow.fields.time,'Unavailable');
+  assert.equal(oldRow.fields.timeNote,'The record does not confirm how every attempt ended.');
+  assert.equal(oldRow.fields.attemptTime,'4.0 s');
+  assert.equal(oldRow.fields.cost.primary,'Unavailable');
+  assert.match(oldRow.fields.costNote,/A charge is missing/);
+
+  delete old.attempts[0].scopeHash;
+  const unavailable=usageRow({attempts:1},usageEntry(old));
+  const unrun=usageRow({attempts:null},usageEntry(draft()));
+  const unreadable=usageRow({attempts:null},null,{reason:'removed',status:404});
+  const omitted=usageRow({attempts:null},null,{reason:'omitted'});
+  assert.equal(unavailable.note,'An attempt has no usable record of the approved input.');
+  assert.equal(unavailable.attempts,1);
+  assert.equal(unrun.attempts,0);
+  assert.equal(unreadable.attempts,null);
+  assert.equal(omitted.text,'Unknown');
+  assert.deepEqual(usageCoverage([currentRow,oldRow,unavailable,unrun,unreadable,omitted]),{
+    partial:true,
+    text:'6 tasks listed. 2 usable receipts, 1 with no attempts, 1 with an unavailable receipt, 1 with a receipt read failure, 1 whose receipt was not read.',
+  });
+  assert.equal(usageCoverage([currentRow,oldRow,unrun]).partial,false);
+});
+
+test('a saved start overrides an empty draft attempt list for receipt coverage',()=>{
+  const task=legacyTask();
+  task.status='draft';
+  task.attempts=[];
+  const entry=usageEntry(task);
+  assert.equal(validateReceiptExport(entry.envelope).ok,true);
+  assert.deepEqual(entry.envelope.reasons.map(reason=>reason.code),['attempt-records-missing']);
+  const row=usageRow({attempts:0},entry);
+  assert.equal(row.kind,'receipt-unavailable');
+  assert.equal(row.attempts,null);
+  assert.equal(row.note,'The saved attempt history is missing.');
+});
+
+test('Usage explains missing end times without substituting a recorded attempt duration',()=>{
+  const task=acceptedTask();
+  delete task.attempts[0].ended;
+  const row=usageRow({attempts:null},usageEntry(task));
+  assert.equal(row.kind,'receipt');
+  assert.equal(row.fields.time,'Unavailable');
+  assert.equal(row.fields.timeNote,'The receipt lacks usable start or end times.');
+  assert.equal(row.fields.attemptTime,'4.0 s');
+  delete task.attempts[0].elapsedMs;
+  assert.equal(usageRow({attempts:null},usageEntry(task)).fields.attemptTime,null);
+});
+
+test('Usage handles an unreadable summary and unknown reason codes without exposing raw text',()=>{
+  const good=usageEntry(acceptedTask());
+  assert.equal(usageRow({attempts:null},{...good,summary:{ok:false}}).kind,'receipt-unavailable');
+  const row=usageRow({attempts:-1},{envelope:{available:false,reasons:[
+    {code:'unknown-future-code',message:'SYNTHETIC_PRIVATE_DIAGNOSTIC'},
+  ]}});
+  assert.equal(row.attempts,null);
+  assert.equal(row.note,'The saved receipt could not be verified.');
+});
+
+test('Usage explains why recorded charges in different currencies have no total',()=>{
+  const task=scenarios().failedThenAccepted;
+  const charges=task.attempts.map((attempt,index)=>({attemptId:attempt.id,amountMicros:1000,
+    currency:index===0?'EUR':'USD',evidence:'provider-billed',complete:true}));
+  const row=usageRow({attempts:null},usageEntry(task,{charges}));
+  assert.equal(row.kind,'receipt');
+  assert.equal(row.fields.cost.primary,'Unavailable');
+  assert.equal(row.fields.costNote,'The charges use different currencies.');
 });
