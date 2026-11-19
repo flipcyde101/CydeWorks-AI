@@ -573,7 +573,9 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(http,/x-view-generation/);
   const server=await readFile(new URL('./server.mjs',import.meta.url),'utf8');
   assert.match(server,/admittedViews/);
-  assert.match(server,/sec-fetch-site'\]==='same-origin'/);
+  assert.match(server,/fetchSite!==undefined\|\|presentedView!==undefined/);
+  assert.match(server,/site==='none'\|\|site==='same-origin'/);
+  assert.doesNotMatch(server,/sec-fetch-site'\]==='same-origin'/);
   assert.match(server,/must not\s+rotate the session or expire the cookie/);
   assert.match(server,/sec-fetch-dest'\]==='document'/);
   assert.match(server,/sec-fetch-mode'\]==='navigate'/);
@@ -889,11 +891,11 @@ function headerList(headers, name) {
   if(!value) return [];
   return Array.isArray(value)?value:[value];
 }
-function rawRequest(origin, path, {method='GET', body, headers={}}={}) {
+function rawRequest(origin, path, {method='GET', body, headers={}, originHeader=true}={}) {
   const payload=body===undefined?null:JSON.stringify(body);
   return new Promise((resolve,reject)=>{
     const req=httpRequest(new URL(origin+path),{method,headers:{
-      Origin:origin,Accept:'application/json',
+      ...(originHeader?{Origin:origin}:{}),Accept:'application/json',
       ...(payload?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{}),
       ...headers,
     }},res=>{
@@ -1129,6 +1131,18 @@ test('a shared cookie jar does not keep a view that did not unlock again',{timeo
     if(viewId) headers['X-Workspace-View']=viewId;
     return rawRequest(origin,'/api/tasks',{headers});
   }
+  async function navigateGet(viewId) {
+    const headers={
+      Cookie:jarCookie(jar),
+      'Sec-Fetch-Dest':'document',
+      'Sec-Fetch-Mode':'navigate',
+      'Sec-Fetch-Site':'none',
+      'Sec-Fetch-User':'?1',
+      Accept:'text/html',
+    };
+    if(viewId) headers['X-Workspace-View']=viewId;
+    return rawRequest(origin,'/api/tasks',{headers,originHeader:false});
+  }
   const first=await unlock();
   const second=await unlock();
   assert.equal(first.viewGeneration, second.viewGeneration);
@@ -1155,5 +1169,17 @@ test('a shared cookie jar does not keep a view that did not unlock again',{timeo
   assert.equal(headerList(staleFirst.headers,'set-cookie').length, 0);
   assert.equal((await viewGet(null)).status, 401);
   assert.equal((await viewGet(null,{site:false})).status, 200);
+  assert.equal((await viewGet(reauth.viewId)).status, 200);
+  const direct=await navigateGet();
+  assert.equal(direct.status, 401);
+  assert.equal(headerList(direct.headers,'set-cookie').length, 0);
+  const directStale=await navigateGet(second.viewId);
+  assert.equal(directStale.status, 401);
+  assert.equal(headerList(directStale.headers,'set-cookie').length, 0);
+  assert.equal((await navigateGet(reauth.viewId)).status, 200);
+  assert.equal((await viewGet(reauth.viewId)).status, 200);
+  const blankSite=await rawRequest(origin,'/api/tasks',{headers:{Cookie:jarCookie(jar),'Sec-Fetch-Site':''}});
+  assert.equal(blankSite.status, 401);
+  assert.equal(headerList(blankSite.headers,'set-cookie').length, 0);
   assert.equal((await viewGet(reauth.viewId)).status, 200);
 });

@@ -33,7 +33,7 @@ function rawHttp(origin, path, {method='GET', headers={}, body}={}) {
     }},res=>{
       const chunks=[];
       res.on('data',chunk=>chunks.push(chunk));
-      res.on('end',()=>resolve({status:res.statusCode,body:Buffer.concat(chunks).toString('utf8'),path}));
+      res.on('end',()=>resolve({status:res.statusCode,body:Buffer.concat(chunks).toString('utf8'),path,headers:res.headers}));
     });
     req.on('error',reject);
     req.setTimeout(5000,()=>req.destroy(Error('Desktop request timed out')));
@@ -93,6 +93,23 @@ test('desktop bootstrap admits only the first document view',{timeout:10000},asy
   const browser={'Sec-Fetch-Site':'same-origin','Sec-Fetch-Mode':'cors','Sec-Fetch-Dest':'empty',Cookie:cookie,Origin:origin,Accept:'application/json'};
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:browser})).status, 401);
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...browser,'X-Workspace-View':ticket.viewId}})).status, 200);
+  const navigation={
+    'Sec-Fetch-Dest':'document',
+    'Sec-Fetch-Mode':'navigate',
+    'Sec-Fetch-Site':'none',
+    'Sec-Fetch-User':'?1',
+    Accept:'text/html',
+    Cookie:cookie,
+  };
+  const direct=await rawHttp(origin,'/api/tasks',{headers:navigation});
+  assert.equal(direct.path, '/api/tasks');
+  assert.equal(direct.status, 401);
+  assert.equal(direct.headers['set-cookie'], undefined);
+  assert.equal((await rawHttp(origin,'/api/tasks',{headers:{Cookie:cookie,Accept:'application/json'}})).status, 200);
+  assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...navigation,'X-Workspace-View':ticket.viewId}})).status, 200);
+  assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...browser,'X-Workspace-View':ticket.viewId}})).status, 200);
+  const stillSpent=await rawHttp(origin,'/',{headers:documentHeaders});
+  assert.equal(stillSpent.body.includes('bfe-desktop-view'), false);
   const locked=await rawHttp(origin,'/api/session/lock',{method:'POST',body:{},headers:{...browser,'X-Workspace-View':ticket.viewId}});
   assert.equal(locked.status, 200);
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...browser,'X-Workspace-View':ticket.viewId}})).status, 401);

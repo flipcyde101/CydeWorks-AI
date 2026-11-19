@@ -363,11 +363,12 @@ const server=http.createServer(async (req,res) => {
         fail(401,'Unlock this workspace with its local access.key file.');
       }
       if(!presentedSessions.some(value=>equal(value,session))) fail(401,'Unlock this workspace with its local access.key file.');
-      // Same-origin browser tabs share the cookie jar. A view is admitted only when
-      // its own unlock presented the access file. A stale view is 401 and must not rotate the session or expire the cookie.
+      // Browser Fetch Metadata, including Sec-Fetch-Site: none on a direct navigation,
+      // requires this view's admitted id. A stale or missing view is 401 and must not rotate the session or expire the cookie.
       // Callers that send neither Sec-Fetch-Site nor X-Workspace-View stay on the cookie check alone.
+      const fetchSite=req.headers['sec-fetch-site'];
       const presentedView=req.headers['x-workspace-view'];
-      if(req.headers['sec-fetch-site']==='same-origin'||presentedView!==undefined) {
+      if(fetchSite!==undefined||presentedView!==undefined) {
         const viewId=typeof presentedView==='string'?presentedView:'';
         if(!/^[a-f0-9]{32}$/.test(viewId)||!admittedViews.has(viewId)) fail(401,'Unlock this workspace with its local access.key file.');
       }
