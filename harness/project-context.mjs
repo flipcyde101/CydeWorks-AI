@@ -174,7 +174,14 @@ const INPUT_SNAPSHOT_LIMITS = Object.freeze({
   maxNodes: 512,
   maxObjectKeys: 32,
   maxArrayLength: 64,
+  // No accepted string field may exceed maxContentBytes UTF-8 bytes, and every
+  // UTF-16 code unit encodes to at least one UTF-8 byte, so any longer string
+  // is invalid. Rejecting it here, before validation, regex scans or UTF-8
+  // encoding, bounds the work and memory an oversized string can cause.
+  maxStringLength: PROJECT_CONTEXT_LIMITS.maxContentBytes,
 });
+
+const CANONICAL_ARRAY_INDEX_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 
 function snapshotInput(value, label) {
   const budget = { nodes: 0 };
@@ -184,6 +191,9 @@ function snapshotInput(value, label) {
 function snapshotValue(value, label, depth, budget) {
   if (typeof value === 'function') {
     fail(`${label} must be plain data, not a function.`);
+  }
+  if (typeof value === 'string' && value.length > INPUT_SNAPSHOT_LIMITS.maxStringLength) {
+    fail(`${label} exceeds the maximum string length.`);
   }
   if (value === null || typeof value !== 'object') {
     return value;
@@ -227,13 +237,30 @@ function snapshotArray(value, label, depth, budget) {
   if (ownKeys.length !== length + 1) {
     fail(`${label} must be a dense array without extra properties.`);
   }
+  // The reported keys must be exactly "length" plus every canonical index
+  // 0..length-1, each once. A Proxy ownKeys trap could otherwise report
+  // non-index numeric keys such as "-1" or "0.5" in place of real indices.
+  const seenIndexes = new Set();
+  let sawLength = false;
   for (const key of ownKeys) {
     if (key === 'length') {
+      if (sawLength) {
+        fail(`${label} must be a dense array without extra properties.`);
+      }
+      sawLength = true;
       continue;
     }
-    if (typeof key !== 'string' || String(Number(key)) !== key || !(Number(key) < length)) {
+    if (typeof key !== 'string' || !CANONICAL_ARRAY_INDEX_PATTERN.test(key)) {
       fail(`${label} must be a dense array without extra properties.`);
     }
+    const index = Number(key);
+    if (!(index < length) || seenIndexes.has(index)) {
+      fail(`${label} must be a dense array without extra properties.`);
+    }
+    seenIndexes.add(index);
+  }
+  if (!sawLength || seenIndexes.size !== length) {
+    fail(`${label} must be a dense array without extra properties.`);
   }
   const copied = new Array(length);
   for (let i = 0; i < length; i++) {
@@ -353,7 +380,15 @@ function validateSourceRef(value) {
 }
 
 function validateContent(value, label = 'content', maxBytes = PROJECT_CONTEXT_LIMITS.maxContentBytes) {
-  if (typeof value !== 'string' || !hasWellFormedUnicode(value)) {
+  if (typeof value !== 'string') {
+    fail(`Invalid ${label}.`);
+  }
+  // UTF-8 byte length is at least the UTF-16 code unit length, so a longer
+  // string is rejected before any scan or UTF-8 allocation.
+  if (value.length > maxBytes) {
+    fail(`${label} exceeds allowed byte length.`);
+  }
+  if (!hasWellFormedUnicode(value)) {
     fail(`Invalid ${label}.`);
   }
   if (!value.trim() || CONTENT_CONTROL_PATTERN.test(value)) {
