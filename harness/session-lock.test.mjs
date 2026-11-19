@@ -5,8 +5,8 @@ import {writeFile,readFile,access} from 'node:fs/promises';
 import {join} from 'node:path';
 import {terminalWorkspace} from './test-support/terminal-workspace.mjs';
 import {createTerminalControl} from './terminal-control.mjs';
-import {bindWorkspaceLock,createAccessAttempt,createLegacySessionController,createSessionEpoch,createTabAdmission,workspaceLockCopy} from './web/workspace-lock.js';
-import {classifyLockOutcome,createTabAdmission as createExperienceAdmission} from './web-experience/adapters/contract.js';
+import {bindWorkspaceLock,createAccessAttempt,createLegacySessionController,createSessionEpoch,createSharedLockWatch,createTabAdmission,respondToSharedGeneration,workspaceLockCopy} from './web/workspace-lock.js';
+import {classifyLockOutcome,createSharedLockWatch as createExperienceLockWatch,createTabAdmission as createExperienceAdmission,respondToSharedGeneration as respondToExperienceGeneration} from './web-experience/adapters/contract.js';
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(fn) {
@@ -530,6 +530,18 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.ok(access.indexOf('attempt.current()')>0&&access.indexOf('attempt.current()')<postAt);
   assert.ok(access.indexOf('attempt.current()',postAt)>postAt);
   assert.ok(access.indexOf('admission.admit(')>access.indexOf('attempt.current()',postAt));
+  assert.ok(access.indexOf('sharedWatch.observe()')>access.indexOf('admission.admit('));
+  const foreign=app.slice(app.indexOf('function concealForeignGeneration'), app.indexOf('function takeDesktopTicket'));
+  assert.match(foreign,/respondToSharedGeneration\(sharedWatch, sessionGate\)/);
+  assert.doesNotMatch(foreign,/if\(sessionGate\.locked\(\)&&explicitLock\)return/);
+  assert.match(foreign,/if\(wasLocked\)return/);
+  assert.match(foreign,/advance:false/);
+  const boot=app.slice(app.indexOf('function bootWorkspace'), app.indexOf('\nbootWorkspace();'));
+  assert.ok(boot.indexOf('takeDesktopTicket()')>=0&&boot.indexOf('takeDesktopTicket()')<boot.indexOf('mayOpenWorkspace'));
+  assert.match(app,/bfe-desktop-view/);
+  assert.match(app,/createSharedLockWatch\(admission\)/);
+  const localLock=app.slice(app.indexOf('onLocalLock()'), app.indexOf('onOutcome'));
+  assert.ok(localLock.indexOf('admission.promiseLock()')<localLock.indexOf('sharedWatch.observe()'));
   assert.match(app,/X-Workspace-View/);
   assert.match(app,/if\(!sessionUi\.current\(token\)\)return;/);
   assert.match(app,/if\(!sessionUi\.current\(actionToken\)\)return;/);
@@ -544,6 +556,17 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(experience,/addEventListener\('storage'/);
   assert.match(experience,/pageshow/);
   assert.match(experience,/viewStorageKeys\.sharedGeneration/);
+  const foreignExperience=experience.slice(experience.indexOf('function concealForeignGeneration'), experience.indexOf("addEventListener('storage'"));
+  assert.match(foreignExperience,/respondToSharedGeneration\(sharedWatch/);
+  assert.match(foreignExperience,/state\.sessionEpoch = \(state\.sessionEpoch \?\? 0\) \+ 1/);
+  assert.doesNotMatch(foreignExperience,/if \(!state\.session\.unlocked \|\|/);
+  const ticketCall=experience.indexOf('takeDesktopTicket();');
+  assert.ok(experience.indexOf('mode.adapter = readAdapterMode();')<ticketCall);
+  assert.ok(ticketCall<experience.indexOf('state.session = await adapter.session()'));
+  assert.match(experience,/bfe-desktop-view/);
+  assert.match(experience,/experienceAdmission\(\)\.sharedGeneration\(\)/);
+  const conceal=experience.slice(experience.indexOf('function concealSession'), experience.indexOf('function observedAdapter'));
+  assert.ok(conceal.indexOf('admission.promiseLock()')<conceal.indexOf('sharedWatch.observe()'));
   const http=await readFile(new URL('./web-experience/adapters/http.js',import.meta.url),'utf8');
   assert.match(http,/X-Workspace-View/);
   assert.match(http,/mustConceal\(\)/);
@@ -552,6 +575,13 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(server,/admittedViews/);
   assert.match(server,/sec-fetch-site'\]==='same-origin'/);
   assert.match(server,/must not\s+rotate the session or expire the cookie/);
+  assert.match(server,/sec-fetch-dest'\]==='document'/);
+  assert.match(server,/sec-fetch-mode'\]==='navigate'/);
+  assert.match(server,/id="bfe-desktop-view"/);
+  const deliver=server.slice(server.indexOf('function desktopDocumentBody'), server.indexOf('const sessionIdleMs'));
+  assert.ok(deliver.indexOf('ticket.delivered=true')<deliver.indexOf('admittedViews.add(ticket.viewId)'));
+  assert.match(server,/type:'bfe-desktop-ready',port:server\.address\(\)\.port,session\}/);
+  assert.doesNotMatch(server,/desktopSend\(\{type:'bfe-desktop-ready'[^}]*viewId/);
 });
 
 test('a backward session clock ends the workspace session',{timeout:15000},async t=>{
@@ -966,6 +996,118 @@ test('a delayed access-file read does not submit after Lock or a newer selection
   arrived.release({viewId:'c'.repeat(32),viewGeneration:'2'.repeat(32)});
   assert.equal(await inflight, 'dropped-after');
   assert.equal(third.current(), false);
+});
+
+test('a concealed view drops an in-flight unlock when another view locks',async()=>{
+  const interfaces=[
+    {
+      create:createTabAdmission,
+      watch:createSharedLockWatch,
+      respond:respondToSharedGeneration,
+      controller(){
+        const gate=createSessionEpoch();
+        gate.conceal();
+        const attempts=createAccessAttempt(gate);
+        return {
+          epoch:()=>gate.epoch(),
+          begin:()=>attempts.begin(),
+          onStorage(event, watch){
+            if(event.key!=='bfe-shared-generation') return false;
+            return respondToSharedGeneration(watch, gate);
+          },
+        };
+      },
+    },
+    {
+      create:createExperienceAdmission,
+      watch:createExperienceLockWatch,
+      respond:respondToExperienceGeneration,
+      controller(){
+        const state={unlocked:false, sessionEpoch:0};
+        const gate={
+          conceal(){
+            if(state.unlocked) state.sessionEpoch=(state.sessionEpoch??0)+1;
+            else state.sessionEpoch=(state.sessionEpoch??0)+1;
+          },
+        };
+        return {
+          epoch:()=>state.sessionEpoch,
+          begin(){
+            const epoch=state.sessionEpoch;
+            return {current:()=>state.sessionEpoch===epoch};
+          },
+          onStorage(event, watch){
+            if(event.key!=='bfe-shared-generation') return false;
+            return respondToExperienceGeneration(watch, gate);
+          },
+        };
+      },
+    },
+  ];
+  for(const face of interfaces) {
+    const generation='1'.repeat(32);
+    const shared=memoryStore();
+    const writer=face.create({session:memoryStore(), shared});
+    const reader=face.create({session:memoryStore(), shared});
+    assert.equal(writer.admit('a'.repeat(32), generation), true);
+    assert.equal(reader.admit('b'.repeat(32), generation), true);
+    const readerWatch=face.watch(reader);
+    const writerWatch=face.watch(writer);
+    readerWatch.observe();
+    const controller=face.controller();
+    const before=controller.epoch();
+    assert.equal(controller.onStorage({key:'bfe-view-id'}, readerWatch), false);
+    assert.equal(controller.epoch(), before);
+    const attempt=controller.begin();
+    assert.equal(attempt.current(), true);
+    let posts=0;
+    let entered=0;
+    const text=deferred();
+    const pending=(async()=>{
+      const key=await text.promise;
+      if(!attempt.current()) return 'dropped';
+      posts+=1;
+      return key;
+    })();
+    writer.promiseLock();
+    writerWatch.observe();
+    const writerGate=createSessionEpoch();
+    const writerEpoch=writerGate.conceal();
+    assert.equal(face.respond(writerWatch, writerGate), false);
+    assert.equal(writerGate.epoch(), writerEpoch);
+    assert.equal(controller.onStorage({key:'bfe-shared-generation'}, readerWatch), true);
+    const moved=controller.epoch();
+    assert.notEqual(moved, before);
+    assert.equal(controller.onStorage({key:'bfe-shared-generation'}, readerWatch), false);
+    assert.equal(controller.epoch(), moved);
+    text.release('access-key');
+    assert.equal(await pending, 'dropped');
+    assert.equal(posts, 0);
+    assert.equal(attempt.current(), false);
+    const again=controller.begin();
+    const response=deferred();
+    let admitted=false;
+    const inflight=(async()=>{
+      if(!again.current()) return 'dropped-before';
+      posts+=1;
+      const opened=await response.promise;
+      if(!again.current()) return 'dropped-after';
+      admitted=reader.admit(opened.viewId, opened.viewGeneration)===true;
+      if(admitted) entered+=1;
+      return 'opened';
+    })();
+    assert.equal(posts, 1);
+    assert.equal(writer.admit('c'.repeat(32), '2'.repeat(32)), true);
+    writerWatch.observe();
+    assert.equal(face.respond(writerWatch, writerGate), false);
+    assert.equal(writerGate.epoch(), writerEpoch);
+    assert.equal(controller.onStorage({key:'bfe-shared-generation'}, readerWatch), true);
+    response.release({viewId:'d'.repeat(32), viewGeneration:'2'.repeat(32)});
+    assert.equal(await inflight, 'dropped-after');
+    assert.equal(admitted, false);
+    assert.equal(entered, 0);
+    assert.equal(reader.viewId(), 'b'.repeat(32));
+  }
 });
 
 test('a shared cookie jar does not keep a view that did not unlock again',{timeout:15000},async t=>{

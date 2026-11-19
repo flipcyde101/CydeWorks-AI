@@ -117,6 +117,13 @@ export function createLegacySessionController(gate=createSessionEpoch()) {
       view.lease=null;
       return token;
     },
+    // Hide the workspace after the epoch already moved. A second conceal would
+    // drop this view's own lock outcome.
+    concealView() {
+      hideWorkspace();
+      view.lease=null;
+      return {epoch:gate.epoch()};
+    },
     finishLock(token, outcome) {
       if(!token||!gate.outcomeCurrent(token.epoch))return false;
       view.notice=outcome;
@@ -278,4 +285,25 @@ export function createAccessAttempt(gate) {
       return {id, epoch, current(){return id===attempt&&gate.epoch()===epoch;}};
     },
   };
+}
+
+// Another tab's lock or newer generation moves the epoch. A repeated read of the
+// same shared value does not, so the file dialog itself does not drop an unlock.
+export function createSharedLockWatch(admission) {
+  let seen=admission.sharedGeneration();
+  return {
+    observe(){seen=admission.sharedGeneration();},
+    consume(){
+      const next=admission.sharedGeneration();
+      if(next===seen) return false;
+      seen=next;
+      const own=admission.generation();
+      return next==='locked'||(viewToken.test(next??'')&&next!==own);
+    },
+  };
+}
+export function respondToSharedGeneration(watch, gate) {
+  if(!watch.consume()) return false;
+  gate.conceal();
+  return true;
 }

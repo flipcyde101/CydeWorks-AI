@@ -49,13 +49,41 @@ if (database !== ':memory:') {
 }
 if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
 let session=randomBytes(32).toString('hex');
-// Changes when the session ends. A view id is admitted only by the unlock that
-// presented the access file. It is not a cookie, so another tab cannot inherit it.
+// Changes when the session ends. A view id is admitted by the unlock that
+// presented the access file, or once into the first desktop document. It is
+// not a cookie and not a URL, so another tab cannot inherit it.
 let viewGeneration=randomBytes(16).toString('hex');
 const admittedViews=new Set();
 function rotateViewGeneration() {
   viewGeneration=randomBytes(16).toString('hex');
   admittedViews.clear();
+}
+// One desktop document can receive this view. A non-document GET does not take
+// it. Lock or idle before that document spends it and does not mint another.
+let desktopViewTicket=null;
+if(process.env.BFE_DESKTOP_BOOTSTRAP==='1') {
+  desktopViewTicket={viewId:randomBytes(16).toString('hex'),viewGeneration,delivered:false};
+}
+function desktopDocumentNavigation(req) {
+  const site=req.headers['sec-fetch-site'];
+  return req.headers['sec-fetch-dest']==='document'&&req.headers['sec-fetch-mode']==='navigate'&&(site==='none'||site==='same-origin');
+}
+function desktopDocumentBody(req, data) {
+  if(!desktopViewTicket||desktopViewTicket.delivered||!desktopDocumentNavigation(req)) return data;
+  const ticket=desktopViewTicket;
+  const html=data.toString('utf8');
+  const marker='<body>';
+  const at=html.indexOf(marker);
+  const valid=/^[a-f0-9]{32}$/.test(ticket.viewId)&&/^[a-f0-9]{32}$/.test(ticket.viewGeneration);
+  if(ticket.viewGeneration!==viewGeneration||!valid) {
+    ticket.delivered=true;
+    return data;
+  }
+  if(at<0) return data;
+  ticket.delivered=true;
+  admittedViews.add(ticket.viewId);
+  const payload=JSON.stringify({viewId:ticket.viewId,viewGeneration:ticket.viewGeneration});
+  return html.slice(0,at+marker.length)+'<script type="application/json" id="bfe-desktop-view">'+payload+'</script>'+html.slice(at+marker.length);
 }
 // Workspace inactivity deadline. This is not the 15-second terminal control lease.
 // Either clock moving backward ends the session. It does not extend the deadline.
@@ -308,8 +336,9 @@ const server=http.createServer(async (req,res) => {
     }
     if (req.method==='GET' && assets.has(path)) {
       const asset=assets.get(path);
+      const body=path==='/'?desktopDocumentBody(req, asset.data):asset.data;
       res.writeHead(200,{'Content-Type':asset.type+'; charset=utf-8'});
-      return res.end(asset.data);
+      return res.end(body);
     }
     if (req.method==='POST' && req.headers.origin !== origin) fail(403,'A same-origin approval is required.');
     if (req.method==='POST' && path==='/api/session') {

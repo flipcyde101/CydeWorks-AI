@@ -7,7 +7,7 @@ import {diagnosticMessages} from './route-diagnostics.js';
 import {bindProposalEditor} from './proposal-editor.js';
 import {terminalRequest,ownsTerminal} from './terminal-request.js';
 import {bindDraftCopyDialog} from './draft-copy-dialog.js';
-import {bindWorkspaceLock,createAccessAttempt,createLegacySessionController,createTabAdmission,viewStorageKeys,workspaceLockCopy} from './workspace-lock.js';
+import {bindWorkspaceLock,createAccessAttempt,createLegacySessionController,createSharedLockWatch,createTabAdmission,respondToSharedGeneration,viewStorageKeys,workspaceLockCopy} from './workspace-lock.js';
 const $ = id => document.getElementById(id);
 const form = $('create');
 const field = name => form.elements.namedItem(name);
@@ -24,6 +24,7 @@ function browserStores() {
   return {session, shared};
 }
 const admission=createTabAdmission(browserStores());
+const sharedWatch=createSharedLockWatch(admission);
 const resumeKey='bfe-last-task';
 const remember=id=>{try { if (id) sessionStorage.setItem(resumeKey,id); else sessionStorage.removeItem(resumeKey); } catch { /* Storage may be disabled. */ }};
 const remembered=()=>{try { return sessionStorage.getItem(resumeKey); } catch { return null; }};
@@ -108,10 +109,11 @@ function applyConcealedView() {
   cancel.disabled=true;
   $('accept').disabled=true;
 }
-function concealLocalSession() {
+function concealLocalSession(options) {
+  const advance=options?.advance!==false;
   const dialogs=[...document.querySelectorAll('dialog')].map(node=>({open:node.open,inert:false,cached:null,node}));
   sessionUi.useDialogs(dialogs);
-  const token=sessionUi.beginLock();
+  const token=advance?sessionUi.beginLock():sessionUi.concealView();
   for (const dialog of dialogs) {
     dialog.node.inert=true;
     if (dialog.node.open) dialog.node.close();
@@ -179,6 +181,7 @@ bindWorkspaceLock({
   status:$('access-status'),send:body=>api('/api/session/lock',body),focusTarget:$('access-file'),
   onLocalLock() {
     admission.promiseLock();
+    sharedWatch.observe();
     const epoch=concealLocalSession();
     explicitLock='waiting';
     setConnection({phase:'locked'});
@@ -762,6 +765,7 @@ $('access-file').onchange=async()=>{
     const opened=await api('/api/session',{key});
     if(!attempt.current())return;
     if(!admission.admit(opened.viewId, opened.viewGeneration)) throw Error('Choose the workspace access file.');
+    sharedWatch.observe();
     submitted=true;
     await enter();
   } catch(error) {
@@ -778,12 +782,30 @@ function holdConcealed(outcome) {
   setConnection({phase:'locked'});
 }
 function concealForeignGeneration() {
-  if(!admission.mustConceal())return;
-  if(sessionGate.locked()&&explicitLock)return;
+  const wasLocked=sessionGate.locked();
+  if(!respondToSharedGeneration(sharedWatch, sessionGate))return;
   admission.markSharedLocked();
-  holdConcealed('unconfirmed');
+  sharedWatch.observe();
+  if(wasLocked)return;
+  explicitLock='unconfirmed';
+  $('access-status').textContent=workspaceLockCopy.unconfirmed;
+  concealLocalSession({advance:false});
+  $('lock-workspace').hidden=true;
+  setConnection({phase:'locked'});
+}
+function takeDesktopTicket() {
+  const node=document.getElementById('bfe-desktop-view');
+  if(!node) return;
+  let ticket=null;
+  try { ticket=JSON.parse(node.textContent||''); }
+  catch { ticket=null; }
+  node.remove();
+  if(admission.localLock()||admission.mayOpenWorkspace()||admission.mustConceal()) return;
+  admission.admit(ticket?.viewId, ticket?.viewGeneration);
 }
 function bootWorkspace() {
+  takeDesktopTicket();
+  sharedWatch.observe();
   if(admission.mustConceal()||!admission.mayOpenWorkspace()) {
     const stored=admission.localLock();
     if(stored) holdConcealed(stored);
@@ -794,6 +816,9 @@ function bootWorkspace() {
   void enter().catch(()=>{});
 }
 bootWorkspace();
-window.addEventListener('pageshow',()=>{ if(admission.mustConceal()&&!sessionGate.locked()) holdConcealed(admission.localLock()||'unconfirmed'); });
+window.addEventListener('pageshow',()=>{
+  concealForeignGeneration();
+  if(admission.mustConceal()&&!sessionGate.locked()) holdConcealed(admission.localLock()||'unconfirmed');
+});
 window.addEventListener('storage',event=>{ if(event.key===viewStorageKeys.sharedGeneration) concealForeignGeneration(); });
 document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') concealForeignGeneration(); });

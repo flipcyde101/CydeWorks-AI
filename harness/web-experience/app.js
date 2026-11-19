@@ -3,7 +3,7 @@
 
 import {createDemoAdapter} from './demo/adapter.js';
 import {createHttpAdapter} from './adapters/http.js';
-import {classifyError, classifyLockOutcome, createTabAdmission, viewStorageKeys} from './adapters/contract.js';
+import {classifyError, classifyLockOutcome, createSharedLockWatch, createTabAdmission, respondToSharedGeneration, viewStorageKeys} from './adapters/contract.js';
 import {swap, stableKey} from './core/dom.js';
 import {mode, readAdapterMode} from './core/mode.js';
 import {shortHash} from './core/format.js';
@@ -29,6 +29,10 @@ function experienceStores() {
   return {session, shared};
 }
 function experienceAdmission() { return createTabAdmission(experienceStores()); }
+const sharedWatch = createSharedLockWatch({
+  sharedGeneration() { return experienceAdmission().sharedGeneration(); },
+  generation() { return experienceAdmission().generation(); },
+});
 function storedLockNotice(outcome) {
   if (outcome === 'confirmed') return 'Workspace session terminated in every view. Approved work keeps running, and terminal control was released. Unlock with the access file.';
   if (outcome === 'already') return 'The workspace session had already ended. This view is locked.';
@@ -36,7 +40,20 @@ function storedLockNotice(outcome) {
   return null;
 }
 const profile = (() => { try { return storage?.getItem(PROFILE_KEY) === 'first-use' ? 'first-use' : 'returning'; } catch { return 'returning'; } })();
+function takeDesktopTicket() {
+  const node = document.getElementById('bfe-desktop-view');
+  if (!node) return;
+  let ticket = null;
+  try { ticket = JSON.parse(node.textContent || ''); } catch { ticket = null; }
+  node.remove();
+  if (mode.synthetic) return;
+  const admission = experienceAdmission();
+  if (admission.localLock() || admission.mayOpenWorkspace() || admission.mustConceal()) return;
+  admission.admit(ticket?.viewId, ticket?.viewGeneration);
+}
 mode.adapter = readAdapterMode();
+takeDesktopTicket();
+sharedWatch.observe();
 // The HTTP adapter talks to the workspace service that served this page. The demo adapter runs the
 // synthetic in-page workspace. Views behave the same on both; only labels differ.
 const {adapter, demo} = mode.adapter === 'http' ? {adapter: createHttpAdapter(), demo: null} : await createDemoAdapter({profile});
@@ -150,6 +167,7 @@ function concealSession({explicit}) {
     const admission = experienceAdmission();
     if (explicit) admission.promiseLock();
     else admission.markSharedLocked();
+    sharedWatch.observe();
   }
   state.sessionEpoch = (state.sessionEpoch ?? 0) + 1;
   state.lockedTaskId = explicit ? null : state.task?.id ?? state.lockedTaskId ?? null;
@@ -337,9 +355,12 @@ const actions = {
     try {
       opened = await adapter.unlock(key);
       fresh(epoch, opened);
-      if (!mode.synthetic && !experienceAdmission().admit(opened?.viewId, opened?.viewGeneration)) {
-        state.unlockError = 'Choose the workspace access file again.';
-        return;
+      if (!mode.synthetic) {
+        if (!experienceAdmission().admit(opened?.viewId, opened?.viewGeneration)) {
+          state.unlockError = 'Choose the workspace access file again.';
+          return;
+        }
+        sharedWatch.observe();
       }
     }
     catch (error) {
@@ -640,10 +661,21 @@ else {
 window.addEventListener('hashchange', onRoute);
 window.addEventListener('pagehide', releaseView);
 function concealForeignGeneration() {
-  if (!state.session.unlocked || !experienceAdmission().mustConceal()) return;
-  state.lockNotice = storedLockNotice('unconfirmed');
-  concealSession({explicit: false});
-  render();
+  if (!respondToSharedGeneration(sharedWatch, {
+    conceal() {
+      if (state.session.unlocked) {
+        state.lockNotice = storedLockNotice('unconfirmed');
+        concealSession({explicit: false});
+        render();
+      } else {
+        state.sessionEpoch = (state.sessionEpoch ?? 0) + 1;
+        if (!mode.synthetic) {
+          experienceAdmission().markSharedLocked();
+          sharedWatch.observe();
+        }
+      }
+    },
+  })) return;
 }
 window.addEventListener('storage', event => { if (event.key === viewStorageKeys.sharedGeneration) concealForeignGeneration(); });
 window.addEventListener('pageshow', concealForeignGeneration);

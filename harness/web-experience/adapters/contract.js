@@ -149,3 +149,24 @@ export function createTabAdmission({session, shared} = {}) {
     },
   };
 }
+
+// Another tab's lock or newer generation moves the epoch. A repeated read of the
+// same shared value does not, so the file dialog itself does not drop an unlock.
+export function createSharedLockWatch(admission) {
+  let seen = admission.sharedGeneration();
+  return {
+    observe() { seen = admission.sharedGeneration(); },
+    consume() {
+      const next = admission.sharedGeneration();
+      if (next === seen) return false;
+      seen = next;
+      const own = admission.generation();
+      return next === 'locked' || (viewToken.test(next ?? '') && next !== own);
+    },
+  };
+}
+export function respondToSharedGeneration(watch, gate) {
+  if (!watch.consume()) return false;
+  gate.conceal();
+  return true;
+}
