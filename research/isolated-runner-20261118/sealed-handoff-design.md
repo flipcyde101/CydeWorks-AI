@@ -70,10 +70,14 @@ Property: every sealed byte came from an object reached from the pinned root han
 
 `sealed-handoff.mjs` `decodeSealedBundle(raw, {expectedSealDigest})`:
 
-1. Checks the input size against `maxFrameBytes(limits)` before copying anything.
-2. Copies the input.
-3. Re-verifies framing, canonical order, path safety, case collisions, limits, per-file digests and the seal digest.
-4. Returns an opaque frozen handle backed by a module-private `WeakMap`.
+1. Accepts only a genuine `Uint8Array` (including `Buffer`) over a non-shared, non-detached `ArrayBuffer`. It identifies the input by its internal typed-array slot, through the intrinsic `%TypedArray%.prototype[@@toStringTag]` getter. Proxies, look-alike objects, other typed arrays, `DataView`s and `SharedArrayBuffer` backing are rejected.
+2. Reads the backing store, offset and byte length only through intrinsic getters captured at module load. It never reads caller-visible `buffer`, `byteOffset`, `byteLength`, `length`, `slice` or `subarray`, which a caller can shadow. For example, a shadowed `buffer` whose `slice` returns the caller's own backing store previously made the "copy" alias caller memory.
+3. Checks the intrinsic byte length against `maxFrameBytes(limits)` before copying anything.
+4. Copies the bytes into a fresh, unpooled `ArrayBuffer` that only this module references. `readSealedFile` and `sealedConsumerInput` return fresh unpooled copies the same way.
+5. Re-verifies framing, canonical order, path safety, case collisions, limits, per-file digests and the seal digest.
+6. Returns an opaque frozen handle backed by a module-private `WeakMap`.
+
+Code that rewrites built-in prototypes before this module loads is outside its trust boundary.
 
 UTF-8 is decoded with `ignoreBOM: true`, so a leading U+FEFF is preserved rather than silently stripped. Both languages then reject U+FEFF in any path component. The cross-language vectors include a non-ASCII case.
 
@@ -170,7 +174,7 @@ If WQ-01 to WQ-07 cannot all pass, option A is rejected for Windows and option B
 
 - `sealed_handoff.py`: handle-owning reader, codec, materializer and CLI `seal`.
 - `sealed-handoff.mjs`: controller verifier, consumer contract and platform gate.
-- `test_sealed_handoff.py` (31 tests) and `sealed-handoff.test.mjs` (11 tests).
+- `test_sealed_handoff.py` (31 tests) and `sealed-handoff.test.mjs` (15 tests).
 - `sealed-handoff-vector.json`: ASCII and non-ASCII vectors, generated in the sandbox and checked by both languages.
 - `sealed-handoff-sandbox.sh`: runs the Python tests as `nobody` in private user, net, mount and pid namespaces. The source is a read-only bind, scratch is tmpfs, host drives are hidden, and `prlimit` and `timeout` limits apply. A probe aborts the run if any write, network or mount boundary is missing.
 - The Node tests run in an already-present local Node 22 image with `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, tmpfs scratch, memory, pid and CPU limits and a read-only source mount, after a similar probe.

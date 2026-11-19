@@ -159,7 +159,7 @@ class SealTreeTests(Base):
         os.link(t.outside / "a.txt", t.root / "z-hard")
         self.assertCode("SEALED_HARDLINK_REJECTED", t.seal)
         os.unlink(t.root / "z-hard")
-        _write(t.root / "﻿bom.txt", b"x")
+        _write(t.root / "\ufeffbom.txt", b"x")
         self.assertCode("SEALED_PATH_INVALID", t.seal)
 
     def test_file_modified_during_read_fails_closed(self):
@@ -331,8 +331,8 @@ class CodecTests(Base):
 
     def test_bom_path_rejected_in_bundle_and_frame(self):
         self.assertCode("SEALED_PATH_INVALID", sh.build_bundle,
-                        [sh.SealedEntry(sh.KIND_FILE, "﻿a", 0, d(b""), b"")])
-        p = "﻿a".encode()
+                        [sh.SealedEntry(sh.KIND_FILE, "\ufeffa", 0, d(b""), b"")])
+        p = "\ufeffa".encode()
         manifest = sh.MAGIC + (1).to_bytes(4, "big") + bytes([2]) + len(p).to_bytes(4, "big") + p + (0).to_bytes(8, "big") + d(b"")
         dg = hashlib.sha256(manifest).digest()
         self.assertCode("SEALED_PATH_INVALID", sh.decode_bundle, manifest + dg, dg.hex())

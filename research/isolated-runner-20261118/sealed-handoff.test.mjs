@@ -50,22 +50,97 @@ test('decodes the non-ASCII cross-language vector with exact path bytes', () => 
 });
 
 test('a leading UTF-8 BOM in a path is preserved by decoding and then rejected, as in Python', () => {
-  const f = frame([{kind: 2, path: '﻿a', data: Buffer.from('x')}]);
+  const f = frame([{kind: 2, path: '\ufeffa', data: Buffer.from('x')}]);
   assert.ok(f.raw.includes(Buffer.from([0xef, 0xbb, 0xbf, 0x61])));
   assert.throws(() => decodeSealedBundle(f.raw, {expectedSealDigest: f.digest}), code('SEALED_PATH_INVALID'));
-  const inner = frame([{kind: 1, path: 'd'}, {kind: 2, path: 'd/﻿b', data: Buffer.from('x')}]);
+  const inner = frame([{kind: 1, path: 'd'}, {kind: 2, path: 'd/\ufeffb', data: Buffer.from('x')}]);
   assert.throws(() => decodeSealedBundle(inner.raw, {expectedSealDigest: inner.digest}), code('SEALED_PATH_INVALID'));
 });
 
-test('oversized input is refused before it is copied or parsed', () => {
+const shadow = (view, props) => {
+  for (const [key, value] of Object.entries(props)) Object.defineProperty(view, key, {value, configurable: true});
+  return view;
+};
+const accessed = view => {
+  const hits = [];
+  for (const key of ['buffer', 'byteOffset', 'byteLength', 'length', 'subarray', 'slice']) {
+    Object.defineProperty(view, key, {get() { hits.push(key); throw new Error('shadowed ' + key + ' was read'); }});
+  }
+  return hits;
+};
+
+test('size cap uses the intrinsic byte length, not shadowable properties', () => {
   const limits = {maxEntries: 1, maxTotalBytes: 8, maxFileBytes: 8, maxPathBytes: 8};
   const cap = maxFrameBytes({...DEFAULT_LIMITS, ...limits});
-  const big = new Uint8Array(cap + 1);
-  Object.defineProperty(big, 'buffer', {get() { throw new Error('input was copied before the size cap'); }});
+  const big = shadow(new Uint8Array(cap + 1), {length: 64, byteLength: 64});
   assert.throws(() => decodeSealedBundle(big, {expectedSealDigest: '0'.repeat(64), limits}), code('SEALED_LIMIT_EXCEEDED'));
-  const small = new Uint8Array(64);
-  Object.defineProperty(small, 'buffer', {get() { throw new Error('copied'); }});
-  assert.throws(() => decodeSealedBundle(small, {expectedSealDigest: '0'.repeat(64), limits}), /copied/); // positive control
+  const lyingHuge = shadow(Uint8Array.from(raw), {length: cap * 10, byteLength: cap * 10});
+  assert.equal(decodeSealedBundle(lyingHuge, {expectedSealDigest: vector.sealDigest}).sealDigest, vector.sealDigest);
+});
+
+test('a shadowed buffer whose slice returns the caller backing store cannot alias sealed bytes', () => {
+  const view = Uint8Array.from(raw);
+  const original = view.buffer;
+  shadow(view, {buffer: {slice: () => original, byteLength: original.byteLength}, byteOffset: 0, length: view.length});
+  const bundle = decodeSealedBundle(view, {expectedSealDigest: vector.sealDigest});
+  new Uint8Array(original).fill(0x41); // mutate the caller's real storage after verification
+  view.fill(0x42);
+  assert.equal(readSealedFile(bundle, 'limits.py').toString(), 'limit\n');
+  assert.equal(readSealedFile(bundle, 'pkg/m.py').toString(), 'm\n');
+  assert.equal(sha(sealedConsumerInput(bundle)).toString('hex'), sha(raw).toString('hex'));
+});
+
+test('decoding never reads caller-visible typed-array properties', () => {
+  const view = Uint8Array.from(raw);
+  const hits = accessed(view);
+  const bundle = decodeSealedBundle(view, {expectedSealDigest: vector.sealDigest});
+  assert.deepEqual(hits, []);
+  view.fill(0);
+  assert.equal(readSealedFile(bundle, 'limits.py').toString(), 'limit\n');
+});
+
+test('ordinary subviews decode and stay independent of their parent storage', () => {
+  const ab = new ArrayBuffer(raw.length + 23);
+  const parent = new Uint8Array(ab);
+  parent.fill(0xee);
+  parent.set(raw, 7);
+  const sub = new Uint8Array(ab, 7, raw.length);
+  const fromSub = decodeSealedBundle(sub, {expectedSealDigest: vector.sealDigest});
+  const bigBuf = Buffer.concat([Buffer.alloc(11, 0xdd), raw, Buffer.alloc(5, 0xdd)]);
+  const fromBufferSub = decodeSealedBundle(bigBuf.subarray(11, 11 + raw.length), {expectedSealDigest: vector.sealDigest});
+  const pooled = Buffer.from(vector.hex, 'hex'); // small Buffers usually live at an offset in a shared pool
+  const fromPooled = decodeSealedBundle(pooled, {expectedSealDigest: vector.sealDigest});
+  parent.fill(0); bigBuf.fill(0); pooled.fill(0);
+  for (const bundle of [fromSub, fromBufferSub, fromPooled]) {
+    assert.equal(readSealedFile(bundle, 'limits.py').toString(), 'limit\n');
+    assert.equal(sha(sealedConsumerInput(bundle)).toString('hex'), sha(raw).toString('hex'));
+  }
+  const out = sealedConsumerInput(fromSub);
+  assert.equal(out.byteOffset, 0);
+  assert.equal(out.buffer.byteLength, raw.length);
+});
+
+test('shared, detached and look-alike inputs are rejected', () => {
+  const opts = {expectedSealDigest: vector.sealDigest};
+  if (typeof SharedArrayBuffer === 'function') {
+    const shared = new Uint8Array(new SharedArrayBuffer(raw.length));
+    shared.set(raw);
+    assert.throws(() => decodeSealedBundle(shared, opts), code('SEALED_BUNDLE_INVALID'));
+  }
+  const detachable = Uint8Array.from(raw);
+  structuredClone(detachable.buffer, {transfer: [detachable.buffer]});
+  assert.throws(() => decodeSealedBundle(detachable, opts), code('SEALED_BUNDLE_INVALID'));
+  const lookAlikes = [
+    {buffer: Uint8Array.from(raw).buffer, byteOffset: 0, length: raw.length, byteLength: raw.length},
+    new DataView(Uint8Array.from(raw).buffer),
+    new Uint16Array(Uint8Array.from(raw).buffer.slice(0, raw.length - (raw.length % 2))),
+    new Proxy(Uint8Array.from(raw), {}),
+    Array.from(raw),
+    vector.hex,
+  ];
+  for (const value of lookAlikes) assert.throws(() => decodeSealedBundle(value, opts), code('SEALED_BUNDLE_INVALID'));
+  const fake = Object.setPrototypeOf({}, Uint8Array.prototype);
+  assert.throws(() => decodeSealedBundle(fake, opts), code('SEALED_BUNDLE_INVALID'));
 });
 
 test('requires a caller-supplied expected digest and rejects a different one', () => {

@@ -44,7 +44,7 @@ DEFAULT_LIMITS = {
     "max_path_bytes": 1024,
 }
 
-_FORBIDDEN_NAME_CHARS = set("/\\:﻿")
+_FORBIDDEN_NAME_CHARS = set("/\\:\ufeff")
 
 # openat2(2): syscall 437 on x86_64 and aarch64 (unified numbering), struct open_how.
 _SYS_OPENAT2 = 437

@@ -49,7 +49,7 @@ function fail(code, message) {
 function validatePath(path, limits) {
   const parts = path.split('/');
   for (const part of parts) {
-    if (part === '' || part === '.' || part === '..' || /[\\:\u0000-\u001f\u007f﻿]/.test(part) ||
+    if (part === '' || part === '.' || part === '..' || /[\\:\u0000-\u001f\u007f\ufeff]/.test(part) ||
         Buffer.byteLength(part) > 255) {
       fail('SEALED_PATH_INVALID', 'Sealed entry path is not a safe relative path.');
     }
@@ -59,6 +59,64 @@ function validatePath(path, limits) {
 }
 
 const sha256 = data => createHash('sha256').update(data).digest();
+
+// Intrinsics captured at module load. Caller-visible properties such as `buffer`, `length`,
+// `byteOffset` and `byteLength` can be shadowed on a genuine Uint8Array, so they are never
+// read. These getters use the typed array's internal slots instead. (Code that rewrites
+// built-in prototypes before this module loads is outside this module's trust boundary.)
+const TypedArrayProto = Object.getPrototypeOf(Uint8Array.prototype);
+const intrinsic = (proto, key) => Object.getOwnPropertyDescriptor(proto, key).get;
+const taTag = intrinsic(TypedArrayProto, Symbol.toStringTag);
+const taBuffer = intrinsic(TypedArrayProto, 'buffer');
+const taByteOffset = intrinsic(TypedArrayProto, 'byteOffset');
+const taByteLength = intrinsic(TypedArrayProto, 'byteLength');
+const taSet = TypedArrayProto.set;
+const abByteLength = intrinsic(ArrayBuffer.prototype, 'byteLength');
+const sabByteLength = typeof SharedArrayBuffer === 'function'
+  ? intrinsic(SharedArrayBuffer.prototype, 'byteLength') : null;
+const IntrinsicArrayBuffer = ArrayBuffer;
+const IntrinsicUint8Array = Uint8Array;
+const bufferFromArrayBuffer = Buffer.from;
+const ReflectApply = Reflect.apply;
+
+function isArrayBuffer(value) {
+  try { ReflectApply(abByteLength, value, []); return true; } catch { return false; }
+}
+
+function isSharedArrayBuffer(value) {
+  if (!sabByteLength) return false;
+  try { ReflectApply(sabByteLength, value, []); return true; } catch { return false; }
+}
+
+/**
+ * Genuine bounded copy of caller bytes into storage only this module owns.
+ * Accepts only a real Uint8Array (including Buffer) over a non-shared ArrayBuffer; checks
+ * the size cap on the intrinsic byte length before any copy; never returns or retains a
+ * view of the caller's backing store.
+ */
+function copyCallerBytes(raw, cap) {
+  // %TypedArray%.prototype[@@toStringTag] returns undefined for non-typed-arrays (including
+  // Proxies and look-alikes) and reads the internal [[TypedArrayName]] slot otherwise.
+  if (ReflectApply(taTag, raw, []) !== 'Uint8Array') fail('SEALED_BUNDLE_INVALID', 'Sealed bundle must be a Uint8Array.');
+  const backing = ReflectApply(taBuffer, raw, []);
+  if (isSharedArrayBuffer(backing) || !isArrayBuffer(backing)) {
+    fail('SEALED_BUNDLE_INVALID', 'Sealed bundle must not use shared or foreign backing storage.');
+  }
+  const length = ReflectApply(taByteLength, raw, []); // 0 when detached
+  const offset = ReflectApply(taByteOffset, raw, []);
+  if (length > cap) fail('SEALED_LIMIT_EXCEEDED', 'Sealed bundle exceeds the frame limit.');
+  if (length < SEAL_MAGIC.length + 4 + DIGEST_LEN) fail('SEALED_BUNDLE_INVALID', 'Sealed bundle is truncated.');
+  return ownedCopy(new IntrinsicUint8Array(backing, offset, length));
+}
+
+/** Copy into a fresh, unpooled ArrayBuffer that no other view references. */
+function ownedCopy(source) {
+  const length = ReflectApply(taByteLength, source, []);
+  const owned = new IntrinsicArrayBuffer(length);
+  ReflectApply(taSet, new IntrinsicUint8Array(owned), [source]);
+  if (ReflectApply(abByteLength, owned, []) !== length) fail('SEALED_BUNDLE_INVALID', 'Sealed byte copy failed.');
+  return ReflectApply(bufferFromArrayBuffer, Buffer, [owned, 0, length]);
+}
 
 /**
  * Decode and fully verify a CWSEAL1 stream. Returns an opaque frozen handle that only this
@@ -70,11 +128,7 @@ export function decodeSealedBundle(raw, {expectedSealDigest, limits: overrides} 
   if (typeof expectedSealDigest !== 'string' || !/^[0-9a-f]{64}$/.test(expectedSealDigest)) {
     fail('SEALED_EXPECTED_DIGEST_REQUIRED', 'An independently supplied expected seal digest is required.');
   }
-  if (!(raw instanceof Uint8Array)) fail('SEALED_BUNDLE_INVALID', 'Sealed bundle must be bytes.');
-  if (raw.length > maxFrameBytes(limits)) fail('SEALED_LIMIT_EXCEEDED', 'Sealed bundle exceeds the frame limit.');
-  if (raw.length < SEAL_MAGIC.length + 4 + DIGEST_LEN) fail('SEALED_BUNDLE_INVALID', 'Sealed bundle is truncated.');
-  // Bounded above; private copy so later caller mutation cannot change what was verified.
-  const buf = Buffer.from(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.length));
+  const buf = copyCallerBytes(raw, maxFrameBytes(limits));
   if (!buf.subarray(0, SEAL_MAGIC.length).equals(SEAL_MAGIC)) fail('SEALED_BUNDLE_INVALID', 'Unknown sealed bundle format.');
   let pos = SEAL_MAGIC.length;
   const need = n => { if (pos + n > buf.length) fail('SEALED_BUNDLE_INVALID', 'Sealed bundle manifest is truncated.'); };
@@ -167,7 +221,7 @@ export function requireSealedBundle(value) {
 export function readSealedFile(bundle, path) {
   const data = sealed.get(requireSealedBundle(bundle)).files.get(path);
   if (!data) fail('SEALED_ENTRY_MISSING', 'The sealed bundle has no such file.');
-  return Buffer.from(data);
+  return ownedCopy(data);
 }
 
 /**
@@ -175,7 +229,7 @@ export function readSealedFile(bundle, path) {
  * it again and materializes it through handles it creates (sealed_handoff.materialize_bundle).
  */
 export function sealedConsumerInput(bundle) {
-  return Buffer.from(sealed.get(requireSealedBundle(bundle)).bytes);
+  return ownedCopy(sealed.get(requireSealedBundle(bundle)).bytes);
 }
 
 /**
