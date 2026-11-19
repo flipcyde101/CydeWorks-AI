@@ -119,8 +119,13 @@ function resolveAndVerifyRootIdentities(project,roots,{useTime=false}={}) {
   const byPath=new Map();
   for(const root of roots) {
     const identity=verifyContainedRootIdentity(project.root,root,null,{useTime});
-    const mapKey=process.platform==='win32'?identity.path.toLowerCase():identity.path;
-    if(!byPath.has(mapKey))byPath.set(mapKey,identity);
+    // Deduplicate by on-disk identity, never by case-folded path text.
+    const mapKey=identity.dev+':'+identity.ino;
+    const prior=byPath.get(mapKey);
+    if(prior&&prior.path!==identity.path) {
+      fail(useTime?409:400,'INVALID_APPROVED_ROOTS','Approved roots name one directory through different spellings.');
+    }
+    if(!prior)byPath.set(mapKey,identity);
   }
   const sorted=[...byPath.values()].sort((a,b)=>(a.path<b.path?-1:a.path>b.path?1:0));
   return {
@@ -257,6 +262,64 @@ function normalizeDispatchScope(rawScope,{missingStatus=400,missingCode='MISSING
   });
 }
 
+const REQUIRED_ACTION_SCOPE_FIELDS=Object.freeze([
+  'taskId','taskVersion','projectId','projectRevision','sourceHash','routeRevision',
+  'action','target','destination','accountRef','approvedRoots','permissions',
+]);
+const ALLOWED_ACTION_SCOPE_TARGET_FIELDS=new Set(['kind','id','digest']);
+
+/**
+ * Normalizes the host's authoritative current scope for a pending action. Any missing,
+ * malformed, or asynchronous value is reported as an unverified scope (409), because it
+ * comes from host state rather than from the caller.
+ */
+function normalizeActionScope(rawScope) {
+  const unverified=detail=>fail(409,'UNVERIFIED_ACTION_SCOPE','Current action scope from server state is '+detail+'.');
+  if(!isPlainObject(rawScope)||typeof rawScope.then==='function')unverified('unavailable');
+  for(const field of REQUIRED_ACTION_SCOPE_FIELDS) {
+    if(!Object.hasOwn(rawScope,field)||rawScope[field]===undefined)unverified('missing '+field);
+  }
+  try {
+    const taskId=needUuid(rawScope.taskId,'action scope task id');
+    if(!Number.isSafeInteger(rawScope.taskVersion)||rawScope.taskVersion<0)unverified('malformed');
+    if(typeof rawScope.action!=='string'||!ACTION_PATTERN.test(rawScope.action))unverified('malformed');
+    const rawTarget=rawScope.target;
+    if(!isPlainObject(rawTarget)||Object.keys(rawTarget).some(key=>!ALLOWED_ACTION_SCOPE_TARGET_FIELDS.has(key))||
+       typeof rawTarget.kind!=='string'||!KIND_PATTERN.test(rawTarget.kind)) {
+      unverified('malformed');
+    }
+    const targetId=needText(rawTarget.id,120,'action scope target id');
+    let targetDigest=null;
+    if(rawTarget.digest!==undefined&&rawTarget.digest!==null) {
+      if(typeof rawTarget.digest!=='string'||!DIGEST_PATTERN.test(rawTarget.digest))unverified('malformed');
+      targetDigest=rawTarget.digest;
+    }
+    if(typeof rawScope.sourceHash!=='string'||!DIGEST_PATTERN.test(rawScope.sourceHash))unverified('malformed');
+    if(typeof rawScope.routeRevision!=='string'||!DIGEST_PATTERN.test(rawScope.routeRevision))unverified('malformed');
+    if(!Array.isArray(rawScope.approvedRoots)||rawScope.approvedRoots.length>64)unverified('malformed');
+    for(const root of rawScope.approvedRoots) {
+      validateLocalPathSyntax(root,'INVALID_APPROVED_ROOTS','approved root path');
+    }
+    return Object.freeze({
+      taskId,
+      taskVersion:rawScope.taskVersion,
+      projectId:normalizeProjectId(rawScope.projectId),
+      projectRevision:normalizeProjectRevision(rawScope.projectRevision),
+      sourceHash:rawScope.sourceHash,
+      routeRevision:rawScope.routeRevision,
+      action:rawScope.action,
+      target:Object.freeze({kind:rawTarget.kind,id:targetId,digest:targetDigest}),
+      destination:normalizeDestination(rawScope.destination),
+      accountRef:normalizeAccountRef(rawScope.accountRef),
+      approvedRoots:rawScope.approvedRoots,
+      permissions:normalizePermissions(rawScope.permissions),
+    });
+  } catch(error) {
+    if(error.code==='UNVERIFIED_ACTION_SCOPE')throw error;
+    unverified('malformed');
+  }
+}
+
 function attemptBindingKey(grant) {
   return JSON.stringify({
     submissionFingerprint:grant.submissionFingerprint,
@@ -359,9 +422,19 @@ export function projectGrantRecord(raw) {
  * Offline transactional approval grant and audit store (RB-P02-A).
  *
  * Host integration contract for Wave 2 (RB-P02-B) and Wave 3 (RB-P03-A):
- * - `scopeResolver({ grantId, claimId, attemptId, taskId, projectId, grantKind })`:
- *   Must derive current dispatch scope from independent server task/route/project state
- *   (never reconstructed from the grant). When absent, `beginDispatch` retains a fail-closed hold.
+ * - `scopeResolver({ grantId, claimId, attemptId, taskId, projectId, grantKind, action })`:
+ *   Must derive current scope from independent server task/route/project state
+ *   (never reconstructed from the grant). When absent, `beginDispatch` and `consumeActionGrant`
+ *   retain a fail-closed hold. For `grantKind: 'attempt'` it returns the dispatch scope
+ *   (REQUIRED_DISPATCH_SCOPE_FIELDS). For `grantKind: 'action'` it returns the pending action's
+ *   scope: taskId, taskVersion, projectId, projectRevision, sourceHash, routeRevision, action,
+ *   target { kind, id, digest? }, destination, accountRef, approvedRoots, permissions. It must be
+ *   synchronous so the check stays inside the consuming SQLite transaction.
+ *
+ * Known limitation: approved roots are re-verified by pathname, and dispatch or action results
+ * hand pathnames downstream (`sealedHandoff: false`). node:fs offers no openat-style handle
+ * pinning, so a directory swapped between this check and downstream use is not prevented here.
+ * Integration must not treat these results as a sealed handoff.
  * - `hostVerifiers.verifyControllerStopped({ controllerId, ownerGeneration, acquiredAt, expiresAt })`:
  *   Required to take over an active, unexpired controller lease on restart.
  * - `hostVerifiers.verifyWorkerStopped({ claimId, grantId, attemptId, workerId, controllerId, ownerGeneration })`:
@@ -818,6 +891,65 @@ export class ApprovalAuditStore {
     return resolved.digest;
   }
 
+  #verifyAuthoritativeActionScope(grant,project) {
+    if(typeof this.scopeResolver!=='function') {
+      fail(
+        409,
+        'UNVERIFIED_ACTION_SCOPE',
+        'Action grant cannot be consumed without a trusted host scopeResolver bound to server state.'
+      );
+    }
+    let rawScope;
+    try {
+      // Only identifiers are passed, so the host must look up current state rather than echo the grant.
+      rawScope=this.scopeResolver({
+        grantId:grant.grantId,
+        claimId:null,
+        attemptId:null,
+        taskId:grant.taskId,
+        projectId:grant.projectId,
+        grantKind:'action',
+        action:grant.action,
+      });
+    } catch {
+      fail(409,'UNVERIFIED_ACTION_SCOPE','Trusted host scopeResolver failed to resolve the current action scope.');
+    }
+    const scope=normalizeActionScope(rawScope);
+    if(scope.taskId!==grant.taskId||scope.taskVersion!==grant.taskVersion||scope.projectId!==grant.projectId) {
+      fail(409,'SCOPE_CHANGED','The task, task version, or project changed after the action grant was issued.');
+    }
+    if(scope.projectRevision!==grant.projectRevision||project.revision!==grant.projectRevision) {
+      fail(409,'PROJECT_REVISION_CHANGED','The project revision changed after the action grant was issued.');
+    }
+    if(scope.action!==grant.action) {
+      fail(409,'ACTION_MISMATCH','The pending server action no longer matches the action grant.');
+    }
+    if(scope.target.kind!==grant.target.kind||scope.target.id!==grant.target.id||
+       (scope.target.digest!==null&&scope.target.digest!==grant.target.digest)) {
+      fail(409,'TARGET_MISMATCH','The pending server target no longer matches the action grant.');
+    }
+    if(scope.sourceHash!==grant.sourceHash) {
+      fail(409,'SCOPE_CHANGED','The approved source snapshot changed after the action grant was issued.');
+    }
+    if(scope.routeRevision!==grant.routeRevision) {
+      fail(409,'ROUTE_CHANGED','The selected route revision changed after the action grant was issued.');
+    }
+    if(JSON.stringify(scope.destination)!==JSON.stringify(grant.destination)) {
+      fail(409,'DESTINATION_CHANGED','The server destination changed after the action grant was issued.');
+    }
+    if(scope.accountRef!==grant.accountRef) {
+      fail(409,'SCOPE_CHANGED','The account reference changed after the action grant was issued.');
+    }
+    if(JSON.stringify(scope.permissions)!==JSON.stringify(grant.permissions)) {
+      fail(409,'SCOPE_CHANGED','The approved permissions changed after the action grant was issued.');
+    }
+    const {approvedRoots:scopeRoots}=resolveAndVerifyRootIdentities(project,scope.approvedRoots,{useTime:true});
+    if(JSON.stringify(scopeRoots)!==JSON.stringify(grant.approvedRoots)) {
+      fail(409,'SCOPE_CHANGED','The approved roots changed after the action grant was issued.');
+    }
+    return scope;
+  }
+
   #verifyControllerOwnership(ownership,nowMs,{minGeneration=null}={}) {
     if(!isPlainObject(ownership)||
        typeof ownership.controllerId!=='string'||!OPAQUE_ID_PATTERN.test(ownership.controllerId)||
@@ -850,11 +982,7 @@ export class ApprovalAuditStore {
         fail(409,'PROJECT_ROOT_REPLACED','Registered project root is missing after approval.');
       }
       const currentProjectRoot=this.projects.verifyProjectRootIdentity(project,{useTime:true});
-      const expectedPath=grant.projectRootIdentity.path;
-      const samePath=process.platform==='win32'
-        ?currentProjectRoot.path.toLowerCase()===expectedPath.toLowerCase()
-        :currentProjectRoot.path===expectedPath;
-      if(!samePath||
+      if(currentProjectRoot.path!==grant.projectRootIdentity.path||
          currentProjectRoot.dev!==grant.projectRootIdentity.dev||
          currentProjectRoot.ino!==grant.projectRootIdentity.ino) {
         fail(409,'PROJECT_ROOT_REPLACED','Registered project root directory identity changed after approval.');
@@ -1274,6 +1402,7 @@ export class ApprovalAuditStore {
         claim:rowToClaim(updatedClaim),
         dispatch:rowToDispatch(dispatchRow),
         verifiedOperation:deepFreeze(verifiedScope),
+        sealedHandoff:false,
       });
     });
   }
@@ -1706,13 +1835,17 @@ export class ApprovalAuditStore {
 
       this.#verifyTargetDigest(input.action,target,project,grant.approvedRoots);
 
+      // Caller-supplied scope above is defense in depth only. Consumption requires the host's
+      // independently resolved current scope for this pending action and fails closed without it.
+      this.#verifyAuthoritativeActionScope(grant,project);
+
       this.db.prepare(
         'INSERT INTO approval_action_consumptions (grant_id,consumed_at,consumed_at_ms) VALUES (?,?,?)'
       ).run(grantId,nowIso,nowMs);
       this.#audit(grantId,null,'action_grant.consumed',nowIso,{
         action:grant.action,target:grant.target,destination:grant.destination,sessionId:grant.sessionId,
       });
-      return Object.freeze({consumed:true,grant});
+      return Object.freeze({consumed:true,grant,sealedHandoff:false});
     });
   }
 
