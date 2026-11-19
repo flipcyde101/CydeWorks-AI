@@ -35,6 +35,20 @@ test('the host claim timestamp before dispatch is valid while waiting for first 
   assert.equal(impossible.clockAnomaly, true);
 });
 
+test('a review sample recorded during a poll never announces ready from a stale clock', () => {
+  const start = '2026-11-14T12:00:00.000Z';
+  const then = Date.parse(start);
+  const attempt = {status: 'completed', started: start, ended: new Date(then + 4500).toISOString(),
+    execution: {phase: 'dispatching', dispatchedAt: start},
+    progress: {measured: true, source: 'worker', completed: 2, total: 5,
+      samples: [{at: start, done: 0}, {at: new Date(then + 4000).toISOString(), done: 2}]}};
+  const task = {status: 'review', attempts: [attempt], live: null};
+  const stale = progressUiState(task, then + 3000, 'connected').announcement;
+  const fresh = progressUiState(task, then + 5000, 'connected').announcement;
+  assert.doesNotMatch(stale, /ready for review/i);
+  assert.match(fresh, /incomplete termination/i);
+});
+
 class TestNode {
   constructor(tag, text = '') {
     this.tagName = tag;
