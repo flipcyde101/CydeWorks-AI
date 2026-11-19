@@ -36,6 +36,7 @@ export const PROJECT_CONTEXT_LIMITS = deepFreeze({
   maxTemplatesPerProject: 64,
   maxRequestTextBytes: 16384,
   maxScopeLabels: 32,
+  maxPreviewPromptBytes: LIMITS.maxArtifactBytes,
 });
 
 const PROTOTYPE_KEY_SET = new Set(PROTOTYPE_KEYS);
@@ -129,6 +130,28 @@ function assertPlainObject(value, label, allowedKeys) {
 function readOwnValue(obj, key) {
   const desc = Object.getOwnPropertyDescriptor(obj, key);
   return desc ? desc.value : undefined;
+}
+
+function readDenseArray(value, label, maxLength) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    fail(`${label} must be a dense plain array.`);
+  }
+  if (value.length > maxLength) {
+    fail(`${label} exceeds maximum length.`);
+  }
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== value.length + 1) {
+    fail(`${label} must be a dense array without extra properties.`);
+  }
+  const copied = new Array(value.length);
+  for (let i = 0; i < value.length; i++) {
+    const desc = Object.getOwnPropertyDescriptor(value, String(i));
+    if (!desc || !('value' in desc) || desc.get !== undefined || desc.set !== undefined) {
+      fail(`${label} must be a dense array without holes or accessor properties.`);
+    }
+    copied[i] = desc.value;
+  }
+  return copied;
 }
 
 function validateIdentifier(value, label) {
@@ -240,19 +263,18 @@ function validateCapabilities(kind, rawCapabilities) {
   if (rawCapabilities === undefined) {
     return [];
   }
-  if (!Array.isArray(rawCapabilities) || Object.getPrototypeOf(rawCapabilities) !== Array.prototype) {
-    fail('requestedCapabilities must be an array.');
-  }
-  if (kind === 'memory' && rawCapabilities.length > 0) {
+  const capabilities = readDenseArray(
+    rawCapabilities,
+    'requestedCapabilities',
+    PROJECT_CONTEXT_LIMITS.maxCapabilities,
+  );
+  if (kind === 'memory' && capabilities.length > 0) {
     fail('Memory entries cannot declare requestedCapabilities.');
-  }
-  if (rawCapabilities.length > PROJECT_CONTEXT_LIMITS.maxCapabilities) {
-    fail('Too many requestedCapabilities.');
   }
   const seen = new Set();
   const normalized = [];
-  for (let i = 0; i < rawCapabilities.length; i++) {
-    const cap = validateIdentifier(rawCapabilities[i], `requestedCapabilities[${i}]`);
+  for (let i = 0; i < capabilities.length; i++) {
+    const cap = validateIdentifier(capabilities[i], `requestedCapabilities[${i}]`);
     if (seen.has(cap)) {
       fail('Duplicate requestedCapabilities are not allowed.');
     }
@@ -298,16 +320,45 @@ function validateProvenance(rawProvenance) {
   };
 }
 
-function computeApprovalDigest(record) {
+function snapshotProvenance(provenance) {
+  return {
+    ...provenance,
+    sourceHashStatus: provenance.sourceHash === null ? 'not-provided' : 'claimed-unverified',
+    sourceHashVerified: false,
+  };
+}
+
+function computeRevisionId(record) {
   const payload = JSON.stringify([
     record.projectId,
     record.entryId,
     record.kind,
+    record.revisionNumber,
     record.provenance.version,
     record.contentSha256,
     record.requestedCapabilities,
     record.provenance.sourceKind,
     record.provenance.sourceRef,
+    record.provenance.sourceHash,
+    record.expiresAt,
+    record.updatedAt,
+  ]);
+  return sha256Hex(utf8Bytes(payload));
+}
+
+function computeApprovalDigest(record) {
+  const payload = JSON.stringify([
+    record.projectId,
+    record.entryId,
+    record.kind,
+    record.revisionId,
+    record.revisionNumber,
+    record.provenance.version,
+    record.contentSha256,
+    record.requestedCapabilities,
+    record.provenance.sourceKind,
+    record.provenance.sourceRef,
+    record.provenance.sourceHash,
     record.expiresAt,
   ]);
   return sha256Hex(utf8Bytes(payload));
@@ -324,6 +375,8 @@ function resolveEntryStatus(record, now) {
     return 'pending-approval';
   }
   if (
+    record.approval.revisionId !== record.revisionId ||
+    record.approval.revisionNumber !== record.revisionNumber ||
     record.approval.version !== record.provenance.version ||
     record.approval.approvalDigest !== record.approvalDigest
   ) {
@@ -343,11 +396,14 @@ function cloneEntrySnapshot(record, now) {
     kind: record.kind,
     purposeLabel: record.purposeLabel,
     version: record.provenance.version,
+    revisionId: record.revisionId,
+    revisionNumber: record.revisionNumber,
+    usedVersions: [...record.usedVersions],
     content: record.content,
     contentSha256: record.contentSha256,
     approvalDigest: record.approvalDigest,
     requestedCapabilities: [...record.requestedCapabilities],
-    provenance: { ...record.provenance },
+    provenance: snapshotProvenance(record.provenance),
     expiresAt: record.expiresAt,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
@@ -463,6 +519,9 @@ export class ProjectContextLibrary {
       expiresAt,
       createdAt: now,
       updatedAt: now,
+      revisionNumber: 1,
+      revisionId: '',
+      usedVersions: new Set([provenance.version]),
       previousApprovalInvalidated: false,
       revoked: false,
       revokedAt: null,
@@ -471,6 +530,7 @@ export class ProjectContextLibrary {
       approval: null,
       approvalDigest: '',
     };
+    record.revisionId = computeRevisionId(record);
     record.approvalDigest = computeApprovalDigest(record);
 
     this.#entries.set(key, record);
@@ -504,6 +564,9 @@ export class ProjectContextLibrary {
     if (provenance.version === existing.provenance.version) {
       fail('Version must change when proposing an updated entry.');
     }
+    if (existing.usedVersions.has(provenance.version)) {
+      fail('Entry versions are immutable and cannot reuse a previously used version.');
+    }
 
     const rawLabel = readOwnValue(input, 'purposeLabel');
     const purposeLabel =
@@ -521,13 +584,16 @@ export class ProjectContextLibrary {
     }
 
     const hadApproval = existing.approval !== null || existing.previousApprovalInvalidated;
+    existing.revisionNumber += 1;
     existing.purposeLabel = purposeLabel;
     existing.content = content;
     existing.contentSha256 = sha256Hex(contentBytes);
     existing.requestedCapabilities = requestedCapabilities;
     existing.provenance = provenance;
+    existing.usedVersions.add(provenance.version);
     existing.expiresAt = expiresAt;
     existing.updatedAt = now;
+    existing.revisionId = computeRevisionId(existing);
     existing.approval = null;
     existing.previousApprovalInvalidated = hadApproval;
     existing.approvalDigest = computeApprovalDigest(existing);
@@ -543,6 +609,7 @@ export class ProjectContextLibrary {
       'approvedBy',
       'expiresAt',
       'expectedDigest',
+      'expectedRevisionId',
     ]);
     const now = this.#now();
     const projectId = validateIdentifier(readOwnValue(input, 'projectId'), 'projectId');
@@ -551,6 +618,7 @@ export class ProjectContextLibrary {
     const approvedBy = validateIdentifier(readOwnValue(input, 'approvedBy'), 'approvedBy');
     const expiresAt = validateOptionalTimestamp(readOwnValue(input, 'expiresAt'), 'approval.expiresAt');
     const expectedDigest = readOwnValue(input, 'expectedDigest');
+    const expectedRevisionId = readOwnValue(input, 'expectedRevisionId');
 
     const record = this.#entries.get(entryKey(projectId, entryId));
     if (!record) {
@@ -565,12 +633,21 @@ export class ProjectContextLibrary {
     if (record.provenance.version !== version) {
       fail('Approval version does not match the current entry version.');
     }
-    if (expectedDigest !== undefined) {
-      if (typeof expectedDigest !== 'string' || !SHA256_PATTERN.test(expectedDigest)) {
-        fail('Invalid expectedDigest.');
+    if (expectedDigest === undefined || expectedDigest === null) {
+      fail('expectedDigest is required for entry approval.');
+    }
+    if (typeof expectedDigest !== 'string' || !SHA256_PATTERN.test(expectedDigest)) {
+      fail('Invalid expectedDigest.');
+    }
+    if (expectedDigest !== record.approvalDigest) {
+      fail('Approval digest does not match the current entry.');
+    }
+    if (expectedRevisionId !== undefined) {
+      if (typeof expectedRevisionId !== 'string' || !SHA256_PATTERN.test(expectedRevisionId)) {
+        fail('Invalid expectedRevisionId.');
       }
-      if (expectedDigest !== record.approvalDigest) {
-        fail('Approval digest does not match the current entry.');
+      if (expectedRevisionId !== record.revisionId) {
+        fail('Approval expectedRevisionId does not match the current entry revision.');
       }
     }
     if (expiresAt !== null && expiresAt <= now) {
@@ -583,6 +660,8 @@ export class ProjectContextLibrary {
       projectId,
       entryId,
       version,
+      revisionId: record.revisionId,
+      revisionNumber: record.revisionNumber,
       contentSha256: record.contentSha256,
       approvalDigest: record.approvalDigest,
       approvedBy,
@@ -662,21 +741,23 @@ export class ProjectContextLibrary {
   previewPromptContext(input) {
     assertPlainObject(input, 'previewPromptContext', ['projectId', 'entryIds']);
     const now = this.#now();
+    return this.#previewPromptContextAt(input, now);
+  }
+
+  #previewPromptContextAt(input, now) {
     const projectId = validateIdentifier(readOwnValue(input, 'projectId'), 'projectId');
-    const rawEntryIds = readOwnValue(input, 'entryIds');
-    if (!Array.isArray(rawEntryIds) || Object.getPrototypeOf(rawEntryIds) !== Array.prototype) {
-      fail('entryIds must be an array.');
-    }
-    if (rawEntryIds.length > PROJECT_CONTEXT_LIMITS.maxSelectedEntries) {
-      fail('Too many selected entries.');
-    }
+    const entryIds = readDenseArray(
+      readOwnValue(input, 'entryIds'),
+      'entryIds',
+      PROJECT_CONTEXT_LIMITS.maxSelectedEntries,
+    );
 
     const seenSelectionKeys = new Set();
     const included = [];
     const excluded = [];
 
-    for (let i = 0; i < rawEntryIds.length; i++) {
-      const item = rawEntryIds[i];
+    for (let i = 0; i < entryIds.length; i++) {
+      const item = entryIds[i];
       let targetProjectId = projectId;
       let entryId;
 
@@ -732,6 +813,8 @@ export class ProjectContextLibrary {
       }
 
       if (
+        record.approval.revisionId !== record.revisionId ||
+        record.approval.revisionNumber !== record.revisionNumber ||
         record.approval.version !== record.provenance.version ||
         record.approval.approvalDigest !== record.approvalDigest
       ) {
@@ -759,11 +842,13 @@ export class ProjectContextLibrary {
         kind: record.kind,
         purposeLabel: record.purposeLabel,
         version: record.provenance.version,
+        revisionId: record.revisionId,
+        revisionNumber: record.revisionNumber,
         contentSha256: record.contentSha256,
         approvalId: record.approval.approvalId,
         approvalDigest: record.approvalDigest,
         requestedCapabilities: [...record.requestedCapabilities],
-        provenance: { ...record.provenance },
+        provenance: snapshotProvenance(record.provenance),
         content: record.content,
       });
     }
@@ -784,22 +869,33 @@ export class ProjectContextLibrary {
     });
 
     const promptText = promptBlocks.join('\n\n');
-    const promptSha256 = sha256Hex(utf8Bytes(promptText));
-    const previewDigest = sha256Hex(
-      utf8Bytes(
-        JSON.stringify([
-          projectId,
-          included.map((entry) => [
-            entry.entryId,
-            entry.kind,
-            entry.version,
-            entry.approvalDigest,
-            entry.contentSha256,
-          ]),
-          promptSha256,
+    const promptBytes = utf8Bytes(promptText);
+    if (promptBytes.byteLength > PROJECT_CONTEXT_LIMITS.maxPreviewPromptBytes) {
+      fail(
+        `Prompt preview exceeds maxPreviewPromptBytes (${promptBytes.byteLength} > ${PROJECT_CONTEXT_LIMITS.maxPreviewPromptBytes}).`,
+      );
+    }
+    const promptSha256 = sha256Hex(promptBytes);
+    const previewDigestBytes = utf8Bytes(
+      JSON.stringify([
+        projectId,
+        included.map((entry) => [
+          entry.entryId,
+          entry.kind,
+          entry.revisionId,
+          entry.version,
+          entry.approvalDigest,
+          entry.contentSha256,
         ]),
-      ),
+        promptSha256,
+      ]),
     );
+    if (previewDigestBytes.byteLength > PROJECT_CONTEXT_LIMITS.maxPreviewPromptBytes) {
+      fail(
+        `Prompt preview digest payload exceeds maxPreviewPromptBytes (${previewDigestBytes.byteLength} > ${PROJECT_CONTEXT_LIMITS.maxPreviewPromptBytes}).`,
+      );
+    }
+    const previewDigest = sha256Hex(previewDigestBytes);
 
     return deepFreeze({
       projectId,
@@ -852,27 +948,37 @@ export class ProjectContextLibrary {
       PROJECT_CONTEXT_LIMITS.maxRequestTextBytes,
     );
 
-    const rawScopeLabels = readOwnValue(rawInputs, 'targetScopeLabels') ?? [];
-    if (!Array.isArray(rawScopeLabels) || Object.getPrototypeOf(rawScopeLabels) !== Array.prototype) {
-      fail('template.inputs.targetScopeLabels must be an array.');
-    }
-    if (rawScopeLabels.length > PROJECT_CONTEXT_LIMITS.maxScopeLabels) {
-      fail('Too many template targetScopeLabels.');
-    }
-    const targetScopeLabels = rawScopeLabels.map((item, idx) =>
+    const rawScopeLabels = readOwnValue(rawInputs, 'targetScopeLabels');
+    const scopeLabels =
+      rawScopeLabels === undefined
+        ? []
+        : readDenseArray(
+            rawScopeLabels,
+            'template.inputs.targetScopeLabels',
+            PROJECT_CONTEXT_LIMITS.maxScopeLabels,
+          );
+    const targetScopeLabels = scopeLabels.map((item, idx) =>
       validateSingleLineLabel(item, `targetScopeLabels[${idx}]`),
     );
 
-    const rawRefs = readOwnValue(rawInputs, 'selectedEntryRefs') ?? [];
-    if (!Array.isArray(rawRefs) || Object.getPrototypeOf(rawRefs) !== Array.prototype) {
-      fail('template.inputs.selectedEntryRefs must be an array.');
-    }
-    if (rawRefs.length > PROJECT_CONTEXT_LIMITS.maxSelectedEntries) {
-      fail('Too many template selectedEntryRefs.');
-    }
+    const rawRefs = readOwnValue(rawInputs, 'selectedEntryRefs');
+    const refs =
+      rawRefs === undefined
+        ? []
+        : readDenseArray(
+            rawRefs,
+            'template.inputs.selectedEntryRefs',
+            PROJECT_CONTEXT_LIMITS.maxSelectedEntries,
+          );
     const seenRefIds = new Set();
-    const selectedEntryRefs = rawRefs.map((ref, idx) => {
-      assertPlainObject(ref, `selectedEntryRefs[${idx}]`, ['entryId', 'kind', 'pinnedVersion']);
+    const selectedEntryRefs = refs.map((ref, idx) => {
+      assertPlainObject(ref, `selectedEntryRefs[${idx}]`, [
+        'entryId',
+        'kind',
+        'pinnedVersion',
+        'pinnedDigest',
+        'pinnedRevisionId',
+      ]);
       const entryId = validateIdentifier(readOwnValue(ref, 'entryId'), `selectedEntryRefs[${idx}].entryId`);
       if (seenRefIds.has(entryId)) {
         fail('Duplicate selectedEntryRefs in template.');
@@ -885,10 +991,28 @@ export class ProjectContextLibrary {
       }
       const rawPinnedVersion = readOwnValue(ref, 'pinnedVersion');
       const pinnedVersion = rawPinnedVersion === undefined ? null : validateVersion(rawPinnedVersion);
+      const rawPinnedDigest = readOwnValue(ref, 'pinnedDigest');
+      let pinnedDigest = null;
+      if (rawPinnedDigest !== undefined && rawPinnedDigest !== null) {
+        if (typeof rawPinnedDigest !== 'string' || !SHA256_PATTERN.test(rawPinnedDigest)) {
+          fail(`Invalid selectedEntryRefs[${idx}].pinnedDigest.`);
+        }
+        pinnedDigest = rawPinnedDigest;
+      }
+      const rawPinnedRevisionId = readOwnValue(ref, 'pinnedRevisionId');
+      let pinnedRevisionId = null;
+      if (rawPinnedRevisionId !== undefined && rawPinnedRevisionId !== null) {
+        if (typeof rawPinnedRevisionId !== 'string' || !SHA256_PATTERN.test(rawPinnedRevisionId)) {
+          fail(`Invalid selectedEntryRefs[${idx}].pinnedRevisionId.`);
+        }
+        pinnedRevisionId = rawPinnedRevisionId;
+      }
       return {
         entryId,
         kind,
         pinnedVersion,
+        pinnedDigest,
+        pinnedRevisionId,
       };
     });
 
@@ -957,6 +1081,22 @@ export class ProjectContextLibrary {
         });
         continue;
       }
+      if (ref.pinnedDigest !== null && record.approvalDigest !== ref.pinnedDigest) {
+        entryChecks.push({
+          entryId: ref.entryId,
+          eligible: false,
+          reason: 'pinned-digest-mismatch',
+        });
+        continue;
+      }
+      if (ref.pinnedRevisionId !== null && record.revisionId !== ref.pinnedRevisionId) {
+        entryChecks.push({
+          entryId: ref.entryId,
+          eligible: false,
+          reason: 'pinned-revision-mismatch',
+        });
+        continue;
+      }
       const status = resolveEntryStatus(record, now);
       if (status !== 'approved') {
         entryChecks.push({
@@ -980,10 +1120,13 @@ export class ProjectContextLibrary {
       });
     }
 
-    const contextPreview = this.previewPromptContext({
-      projectId,
-      entryIds: eligibleEntryIds,
-    });
+    const contextPreview = this.#previewPromptContextAt(
+      {
+        projectId,
+        entryIds: eligibleEntryIds,
+      },
+      now,
+    );
 
     return deepFreeze({
       draftOnly: true,
@@ -991,6 +1134,7 @@ export class ProjectContextLibrary {
       templateId: template.templateId,
       title: template.title,
       workflowKind: template.workflowKind,
+      evaluatedAt: now,
       inputs: {
         requestText: template.inputs.requestText,
         targetScopeLabels: [...template.inputs.targetScopeLabels],
