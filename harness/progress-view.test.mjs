@@ -172,7 +172,12 @@ test('measured counts and separate current-step vs overall estimates render accu
   assert.equal(view.counts.unitSingular,stateHasUnit ? 'step' : null);
   assert.equal(view.counts.percent,40);
 
-  assert.equal(rowByKey(view,'status').value,'Running step 3 of 5');
+  const hasOrdinalStatus=/^Running step \d+ of \d+$/i.test(state.status);
+  const expectedStatus=hasOrdinalStatus
+    ? 'Running step 3 of 5'
+    : 'Running protected checks (2 of 5 steps complete)';
+  assert.equal(rowByKey(view,'status').value,expectedStatus);
+  assert.doesNotMatch(rowByKey(view,'status').value,/\bRunning\s+Run\b/i);
   assert.equal(rowByKey(view,'currentStep').value,`Step 3: Run protected checks (2/8, 25%; 4 ${stateExpectedSubUnit}/s)`);
   assert.equal(rowByKey(view,'completed').value,`2 of 5 ${stateExpectedUnit} (2/5, 40%)`);
   assert.equal(rowByKey(view,'remaining').value,`3 of 5 ${stateExpectedUnit} remaining`);
@@ -192,7 +197,8 @@ test('measured counts and separate current-step vs overall estimates render accu
     assert.equal(typeof value,'string');
     assert.ok(label.length>0&&value.length>0);
   }
-  assert.match(view.announcement,/running step 3 of 5 \(2\/5\)/i);
+  assert.equal(view.announcement,`${expectedStatus} (2/5). ${view.explanation}`);
+  assert.doesNotMatch(view.announcement,/\bRunning\s+Run\b/i);
 
   // When current-step sub-progress is unmeasured, Current step ETA is unavailable while Overall ETA stays 6.0 s.
   const withoutSub=describeProgress({
@@ -755,7 +761,9 @@ test('completion renders 100%, zero remaining, recorded completion clock, and pr
   assert.equal(rowByKey(completeView,'completed').value,`4 of 4 ${completeUnit} (4/4, 100%)`);
   assert.equal(rowByKey(completeView,'remaining').value,`0 of 4 ${completeUnit} remaining`);
   assert.equal(rowByKey(completeView,'elapsed').value,'8.0 s');
-  assert.equal(rowByKey(completeView,'currentStepEta').value,'Complete. No remaining work.');
+  assert.equal(rowByKey(completeView,'currentStepEta').available,false);
+  assert.match(rowByKey(completeView,'currentStepEta').value,/^Unavailable[: ]+.*current-step sub-progress is not measured\.?$/i);
+  assert.doesNotMatch(rowByKey(completeView,'currentStepEta').value,/complete\.|no remaining work|0 ms/i);
   assert.equal(rowByKey(completeView,'overallEta').value,'Complete. No remaining time.');
   assert.equal(rowByKey(completeView,'completion').value,'Completed at 12:00:08 UTC.');
 
@@ -1173,5 +1181,88 @@ test('validated unit contract formats allowlisted units accurately and falls bac
     '240.0 UTF-16 code units/s (file rate unavailable: Insufficient measured file samples to calculate rate.)',
   );
   assert.doesNotMatch(rowByKey(charsWithMeasuredFilesView,'rate').value,/\bstep\b/i);
+
+  // Latest helper rate jargon ('No measured counters were supplied.') is translated cleanly
+  const noSuppliedCountersView=presentProgress({
+    phase:'waiting',
+    waiting:true,
+    status:'Waiting',
+    unavailableReasons:{
+      rate:'No measured counters were supplied.',
+    },
+  });
+  assert.equal(rowByKey(noSuppliedCountersView,'rate').value,'Unavailable: No measured work counters.');
+  assert.doesNotMatch(noSuppliedCountersView.text,/supplied/i);
+
+  // Doubled 'Running Run' and 'Running Running' prefixes are eliminated without inventing an ordinal
+  const doubledRunView=presentProgress({
+    phase:'active',
+    status:'Running Run protected checks (2 of 5 steps complete)',
+    totalKnown:true,
+    unit:'steps',
+    unitSingular:'step',
+    completedSteps:2,
+    totalSteps:5,
+    remainingSteps:3,
+  });
+  assert.equal(rowByKey(doubledRunView,'status').value,'Running protected checks (2 of 5 steps complete)');
+  assert.doesNotMatch(doubledRunView.text,/\bRunning\s+Run\b|step \d+ of \d+/i);
+
+  const doubledRunningView=presentProgress({
+    phase:'active',
+    status:'Running Running checks (1 of 3 checks complete)',
+    totalKnown:true,
+    unit:'checks',
+    unitSingular:'check',
+    completedSteps:1,
+    totalSteps:3,
+    remainingSteps:2,
+  });
+  assert.equal(rowByKey(doubledRunningView,'status').value,'Running checks (1 of 3 checks complete)');
+
+  // Unmeasured current-step ETA on complete never renders zero even if older helper passed 0, whereas measured 3/3 sub-progress does
+  const unmeasuredCompleteSubEta=presentProgress({
+    phase:'complete',
+    complete:true,
+    status:'Complete',
+    totalKnown:true,
+    unit:'steps',
+    unitSingular:'step',
+    completedSteps:4,
+    totalSteps:4,
+    remainingSteps:0,
+    overallEtaMs:0,
+    currentStepEtaMs:0,
+    currentStepEta:'Complete. No remaining work.',
+  });
+  assert.equal(rowByKey(unmeasuredCompleteSubEta,'currentStepEta').available,false);
+  assert.equal(rowByKey(unmeasuredCompleteSubEta,'currentStepEta').value,'Unavailable because current-step sub-progress is not measured.');
+  assert.doesNotMatch(rowByKey(unmeasuredCompleteSubEta,'currentStepEta').value,/complete\.|no remaining work|0 ms/i);
+
+  const measuredCompleteSubEta=presentProgress({
+    phase:'complete',
+    complete:true,
+    status:'Complete',
+    totalKnown:true,
+    unit:'steps',
+    unitSingular:'step',
+    completedSteps:4,
+    totalSteps:4,
+    remainingSteps:0,
+    overallEtaMs:0,
+    currentStepEtaMs:0,
+    currentStep:{
+      label:'Finalize checks',
+      unit:'checks',
+      unitSingular:'check',
+      completed:3,
+      total:3,
+      remaining:0,
+      etaMs:0,
+    },
+  });
+  assert.equal(rowByKey(measuredCompleteSubEta,'currentStepEta').available,true);
+  assert.equal(rowByKey(measuredCompleteSubEta,'currentStepEta').value,'Complete. No remaining work.');
 });
+
 

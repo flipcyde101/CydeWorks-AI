@@ -235,20 +235,20 @@ function ensureUnavailablePrefix(reason, fallback) {
 
 function formatWorkRateReason(reason, unitPair) {
   if (!reason) return null;
-  if (reason === 'No measured step counters were supplied.') {
+  if (/^No measured(?: [a-z-]+)? counters were supplied\.?$/i.test(reason)) {
     return 'No measured work counters.';
   }
-  if (reason === 'Insufficient measured step samples to calculate rate.') {
+  if (/^Insufficient measured (?:step|[a-z-]+) samples to calculate rate\.?$/i.test(reason)) {
     return unitPair.known
       ? `Insufficient measured ${unitPair.singular} samples to calculate rate.`
       : 'Insufficient measured work samples to calculate rate.';
   }
-  if (reason === 'Step samples do not span a positive elapsed interval.') {
+  if (/^(?:Step|[A-Z][a-z-]+) samples do not span a positive elapsed interval\.?$/i.test(reason)) {
     if (!unitPair.known) return 'Work samples do not span a positive elapsed interval.';
     const cap = unitPair.singular.charAt(0).toUpperCase() + unitPair.singular.slice(1);
     return `${cap} samples do not span a positive elapsed interval.`;
   }
-  return reason;
+  return reason.replace(/\s+were supplied\b/gi, '');
 }
 
 function row(key, label, value, available, reason = null) {
@@ -444,6 +444,15 @@ function normalizePhase(raw) {
 function formatStatusValue(phase, rawStatus) {
   const label = PHASE_LABELS[phase] ?? PHASE_LABELS.unavailable;
   if (!rawStatus) return label;
+  if (phase === 'active') {
+    if (/^Running\s+Running\b(?!-)/i.test(rawStatus)) {
+      return rawStatus.replace(/^Running\s+Running\b/i, 'Running');
+    }
+    if (/^Running\s+Run(?=\s+[a-z0-9]|\s*\(|$)/i.test(rawStatus)) {
+      return rawStatus.replace(/^Running\s+Run\b/i, 'Running');
+    }
+    return rawStatus;
+  }
   if (phase === 'waiting' && !/^waiting\b/i.test(rawStatus)) return `Waiting: ${rawStatus}`;
   if (phase === 'stalled' && !/stalled/i.test(rawStatus)) return `Possibly stalled: ${rawStatus}`;
   if (phase === 'failed' && !/(?:failed|incomplete)/i.test(rawStatus)) return `Failed: ${rawStatus}`;
@@ -663,16 +672,19 @@ export function presentProgress(progress, options = undefined) {
     }
   }
 
+  const hasMeasuredCurrentSub = currentStep !== null
+    && currentStep.total !== null
+    && currentStep.completed !== null
+    && currentStep.remaining !== null;
   const currentExplicitlyUnavailable = reasonCurrentEta !== null
     || (rawCurrentEtaText !== null && /^unavailable/i.test(rawCurrentEtaText));
   let currentStepEtaMs = null;
   if (!isBlocked && !currentExplicitlyUnavailable) {
     if (phase === 'complete') {
-      const subOpen = currentStep !== null && currentStep.total === null && currentStep.completed !== null;
-      if (!missingOverallDone && !missingSubDone && !subOpen && (raw.currentStepEtaMs === 0 || (currentStep !== null && currentStep.etaMs === 0))) {
+      if (!missingOverallDone && hasMeasuredCurrentSub && currentStep.remaining === 0 && (raw.currentStepEtaMs === 0 || currentStep.etaMs === 0)) {
         currentStepEtaMs = 0;
       }
-    } else if (currentStep && currentStep.total !== null && currentStep.completed !== null && currentStep.remaining !== null) {
+    } else if (hasMeasuredCurrentSub) {
       const authoritativeSubEtaMs = raw.currentStepEtaMs ?? currentStep.etaMs;
       if (currentStep.remaining === 0) {
         if (authoritativeSubEtaMs === 0) {
@@ -904,8 +916,13 @@ export function presentProgress(progress, options = undefined) {
       ? (overallUnit.known
         ? `Unavailable because completed ${overallUnit.singular} count is not recorded.`
         : 'Unavailable because completed count is not recorded.')
-      : 'Unavailable because current-step sub-progress is not measured.';
-    const reason = reasonCurrentEta ?? rawCurrentEtaText ?? fallbackReason;
+      : missingSubDone
+        ? 'Unavailable because completed current-step count is not recorded.'
+        : 'Unavailable because current-step sub-progress is not measured.';
+    const safeRawCurrentEta = rawCurrentEtaText && !/^complete\b/i.test(rawCurrentEtaText)
+      ? rawCurrentEtaText
+      : null;
+    const reason = reasonCurrentEta ?? safeRawCurrentEta ?? fallbackReason;
     rows.push(row('currentStepEta', 'Current step ETA', ensureUnavailablePrefix(reason, fallbackReason), false, reason));
   }
 
