@@ -1135,3 +1135,151 @@ test('progressAnnouncement agrees with conservative incomplete termination for c
   assert.match(reviewWithoutState,/3 of 5 steps remaining/i);
   assert.doesNotMatch(reviewWithoutState,/ready for review/i);
 });
+
+test('declared completion with missing overall done or partial current-step counters never renders zero remaining work',()=>{
+  const attempt={started:start,status:'completed',execution:{phase:'settled',dispatchedAt:start}};
+
+  const missingOverallDoneTask={
+    status:'complete',
+    live:{
+      complete:true,
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4000).toISOString(),
+      steps:{
+        measured:true,
+        total:5,
+        currentStep:'Finalize',
+      },
+    },
+  };
+  const missingDoneState=describeProgress(missingOverallDoneTask,attempt,then+5000);
+  assert.equal(missingDoneState.complete,true);
+  assert.equal(missingDoneState.failed,false);
+  assert.equal(missingDoneState.phase,'complete');
+  assert.equal(missingDoneState.totalKnown,true);
+  assert.equal(missingDoneState.totalSteps,5);
+  assert.equal(missingDoneState.completedSteps,null);
+  assert.equal(missingDoneState.remainingSteps,null);
+  assert.equal(missingDoneState.doneTotal,null);
+  assert.equal(missingDoneState.percent,null);
+  assert.doesNotMatch(missingDoneState.remaining,/0 of 5|no remaining work/i);
+  assert.match(missingDoneState.remaining,/not recorded/i);
+  assert.equal(missingDoneState.overallEtaMs,null);
+  assert.equal(missingDoneState.currentStepEtaMs,null);
+  assert.equal(missingDoneState.currentStep.etaMs,null);
+  assert.equal(missingDoneState.eta,missingDoneState.currentStepEta);
+  assert.doesNotMatch(missingDoneState.overallEta,/no remaining|0\s*s/i);
+  assert.match(missingDoneState.overallEta,/not recorded/i);
+  assert.doesNotMatch(missingDoneState.currentStepEta,/no remaining work/i);
+  assert.match(missingDoneState.unavailableReasons.overallEta,/not recorded/i);
+  assert.match(missingDoneState.unavailableReasons.currentStepEta,/not recorded/i);
+
+  const missingDoneNoSubState=describeProgress({
+    status:'review',
+    live:{
+      steps:{
+        measured:true,
+        total:5,
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(missingDoneNoSubState.complete,true);
+  assert.equal(missingDoneNoSubState.phase,'complete');
+  assert.equal(missingDoneNoSubState.status,'Complete, ready for review');
+  assert.equal(missingDoneNoSubState.totalSteps,5);
+  assert.equal(missingDoneNoSubState.completedSteps,null);
+  assert.equal(missingDoneNoSubState.remainingSteps,null);
+  assert.equal(missingDoneNoSubState.percent,null);
+  assert.doesNotMatch(missingDoneNoSubState.remaining,/0 of 5|no remaining work/i);
+  assert.match(missingDoneNoSubState.remaining,/not recorded/i);
+  assert.equal(missingDoneNoSubState.overallEtaMs,null);
+  assert.equal(missingDoneNoSubState.currentStepEtaMs,null);
+  assert.doesNotMatch(missingDoneNoSubState.currentStepEta,/no remaining work/i);
+  assert.match(missingDoneNoSubState.unavailableReasons.overallEta,/not recorded/i);
+  assert.match(missingDoneNoSubState.unavailableReasons.currentStepEta,/not recorded/i);
+
+  const partialSubCompleteTask={
+    status:'complete',
+    live:{
+      complete:true,
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4000).toISOString(),
+      steps:{
+        measured:true,
+        completed:5,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:5},
+        ],
+        currentStep:{
+          label:'Verify',
+          startedAt:new Date(then+3000).toISOString(),
+          measured:true,
+          completed:1,
+          total:4,
+          samples:[
+            {at:new Date(then+3000).toISOString(),done:0},
+            {at:new Date(then+4000).toISOString(),done:1},
+          ],
+        },
+      },
+    },
+  };
+  const partialSubState=describeProgress(partialSubCompleteTask,attempt,then+5000);
+  assert.equal(partialSubState.complete,false);
+  assert.equal(partialSubState.failed,true);
+  assert.equal(partialSubState.phase,'failed');
+  assert.equal(partialSubState.status,'Incomplete termination');
+  assert.equal(partialSubState.doneTotal,'5/5');
+  assert.equal(partialSubState.currentStep.completed,1);
+  assert.equal(partialSubState.currentStep.total,4);
+  assert.equal(partialSubState.currentStep.remaining,3);
+  assert.equal(partialSubState.currentStep.doneTotal,'1/4');
+  assert.equal(partialSubState.currentStep.etaMs,null);
+  assert.equal(partialSubState.currentStepEtaMs,null);
+  assert.equal(partialSubState.overallEtaMs,null);
+  assert.equal(partialSubState.projectedCompletionMs,null);
+  assert.equal(partialSubState.eta,partialSubState.currentStepEta);
+  assert.doesNotMatch(partialSubState.currentStepEta,/no remaining work/i);
+  assert.doesNotMatch(partialSubState.currentStep.eta,/no remaining work/i);
+  assert.match(partialSubState.remaining,/3 of 4/);
+  const partialSubAnnounced=progressAnnouncement(partialSubCompleteTask,partialSubState,'connected');
+  assert.match(partialSubAnnounced,/incomplete termination/i);
+  assert.match(partialSubAnnounced,/3 of 4/);
+  assert.doesNotMatch(partialSubAnnounced,/attempt complete|ready for review/i);
+  const partialSubAnnouncedNoState=progressAnnouncement(partialSubCompleteTask,null,'connected');
+  assert.match(partialSubAnnouncedNoState,/incomplete termination/i);
+  assert.match(partialSubAnnouncedNoState,/3 of 4/);
+  assert.doesNotMatch(partialSubAnnouncedNoState,/attempt complete|ready for review/i);
+
+  const partialSubReviewTask={...partialSubCompleteTask,status:'review'};
+  const partialSubReviewAnnounced=progressAnnouncement(partialSubReviewTask,null,'connected');
+  assert.match(partialSubReviewAnnounced,/incomplete termination/i);
+  assert.match(partialSubReviewAnnounced,/3 of 4/);
+  assert.doesNotMatch(partialSubReviewAnnounced,/ready for review/i);
+
+  const missingSubDoneState=describeProgress({
+    status:'complete',
+    live:{
+      complete:true,
+      steps:{
+        measured:true,
+        completed:5,
+        total:5,
+        currentStep:{
+          label:'Verify',
+          measured:true,
+          total:4,
+        },
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(missingSubDoneState.complete,true);
+  assert.equal(missingSubDoneState.overallEtaMs,0);
+  assert.equal(missingSubDoneState.currentStep.remaining,null);
+  assert.equal(missingSubDoneState.currentStep.etaMs,null);
+  assert.equal(missingSubDoneState.currentStepEtaMs,null);
+  assert.doesNotMatch(missingSubDoneState.currentStepEta,/no remaining work/i);
+  assert.match(missingSubDoneState.unavailableReasons.currentStepEta,/missing/i);
+});
