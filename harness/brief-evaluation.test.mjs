@@ -52,6 +52,14 @@ test('exports frozen contract constants', () => {
   assert.deepEqual(VALID_SUITE_KINDS, ['tracked', 'holdout', 'ad-hoc']);
   assert.ok(Object.isFrozen(TRACKED_SYNTHETIC_CASE_IDS));
   assert.ok(Object.isFrozen(CLAIM_VERIFICATION_KINDS));
+  assert.deepEqual(CLAIM_VERIFICATION_KINDS, [
+    'structurally-cited',
+    'not-classified-as-factual',
+    'unsupported',
+    'missing-evidence',
+  ]);
+  assert.equal(CLAIM_VERIFICATION_KINDS.includes('verified-by-anchor'), false);
+  assert.equal(Object.hasOwn(BRIEF_EVALUATION_LIMITS, 'factualAnchorOverlapMinimum'), false);
   assert.deepEqual(RUBRIC_DIMENSIONS.length, 5);
   assert.match(STRUCTURAL_CHECK_DISCLAIMER, /structural check only/i);
   assert.match(HUMAN_SEMANTIC_REVIEW_REQUIRED, /human semantic review/i);
@@ -93,19 +101,85 @@ test('explicit line references resolve to a single source line excerpt', () => {
   assert.ok(lineAnchor.excerpt.length <= 120);
 });
 
-test('factual claims with weak anchor overlap require human semantic review instead of verified status', () => {
-  const spec = getTrackedSyntheticCaseDefinition('B01');
-  const result = evaluateBrief({
-    caseId: 'B01',
+function evaluateTrackedBrief(caseId, briefText) {
+  const spec = getTrackedSyntheticCaseDefinition(caseId);
+  return evaluateBrief({
+    caseId,
     suiteKind: 'tracked',
     taskText: spec.taskText,
     sourceText: spec.sourceText,
-    briefText: 'The workshop is on Mars next week according to hidden plans [1][2][3].',
+    briefText,
   });
-  const claim = result.claims[0];
+}
+
+function assertStructurallyCitedAndUnproven(claim) {
+  assert.equal(claim.verificationKind, 'structurally-cited');
   assert.notEqual(claim.verificationKind, 'verified-by-anchor');
+  assert.notEqual(claim.verificationKind, 'unsupported');
+  assert.notEqual(claim.verificationKind, 'missing-evidence');
   assert.equal(claim.requiresHumanSemanticReview, true);
-  assert.equal(claim.verificationKind, 'missing-evidence');
+  assert.equal(claim.factualVerificationPerformed, false);
+  assert.equal(claim.structuralOnly, true);
+}
+
+test('same words with opposite meaning stay structurally cited and unproven', () => {
+  const result = evaluateTrackedBrief('B01', '28 people have not confirmed [2].');
+  const claim = result.claims[0];
+  assertStructurallyCitedAndUnproven(claim);
+  assert.match(claim.sourceLineAnchors[0].excerpt, /28 people have confirmed/i);
+  assert.equal(result.factsProven, false);
+  assert.equal(result.materialErrors.length, 0);
+});
+
+test('invented numbers and invented details stay structurally cited and unproven', () => {
+  const inventedNumber = evaluateTrackedBrief('B01', 'Room Cedar holds 240 and costs $180 [1].');
+  assertStructurallyCitedAndUnproven(inventedNumber.claims[0]);
+  assert.match(inventedNumber.claims[0].sourceLineAnchors[0].excerpt, /holds 24/i);
+  assert.doesNotMatch(inventedNumber.claims[0].sourceLineAnchors[0].excerpt, /holds 240/i);
+
+  const inventedDay = evaluateTrackedBrief('B01', 'Nia will ask Maple for a discount by Wednesday [3].');
+  assertStructurallyCitedAndUnproven(inventedDay.claims[0]);
+  assert.match(inventedDay.claims[0].sourceLineAnchors[0].excerpt, /Tuesday/i);
+  assert.equal(inventedDay.materialErrors.length, 0);
+});
+
+test('an unrelated resolved anchor is structurally cited, not missing and not fabricated', () => {
+  const result = evaluateTrackedBrief(
+    'B01',
+    'The workshop is on Mars next week according to hidden plans [1].',
+  );
+  const claim = result.claims[0];
+  assertStructurallyCitedAndUnproven(claim);
+  assert.equal(claim.citedNoteIds[0], 1);
+  assert.match(claim.sourceLineAnchors[0].excerpt, /Cedar/i);
+  assert.equal(result.materialErrors.length, 0);
+});
+
+test('a truthful anchored claim still requires human semantic review', () => {
+  const result = evaluateTrackedBrief('B01', 'Room Cedar holds 24 and costs $180 [1].');
+  const claim = result.claims[0];
+  assertStructurallyCitedAndUnproven(claim);
+  assert.match(claim.sourceLineAnchors[0].excerpt, /Room Cedar holds 24 and costs \$180/i);
+  assert.equal(result.factualVerificationPerformed, false);
+  assert.equal(result.rubric.usability.factsProven, false);
+  assert.equal(result.rubric.usability.passLabel, 'structural-rubric-only');
+});
+
+test('caller assertion cannot mark a factual claim verified', () => {
+  const spec = getTrackedSyntheticCaseDefinition('B01');
+  assert.throws(
+    () =>
+      evaluateBrief({
+        caseId: 'B01',
+        suiteKind: 'tracked',
+        taskText: spec.taskText,
+        sourceText: spec.sourceText,
+        briefText: 'Room Cedar holds 24 and costs $180 [1].',
+        verificationKind: 'verified-by-anchor',
+        factualVerificationPerformed: true,
+      }),
+    /unknown field/i,
+  );
 });
 
 test('empty source marks invented facts unsupported', () => {
@@ -120,27 +194,30 @@ test('B20 note request earns full traceability credit without citations', () => 
   assert.equal(good.materialErrors.length, 0);
 });
 
-test('distinguishes verified-by-anchor, unsupported, and missing-evidence claims', () => {
+test('distinguishes structurally cited, unsupported, and missing-evidence claims', () => {
   const good = scoreTrackedSyntheticCase('B01', { briefText: BRIEF_EVALUATION_GOOD_B01 });
-  assert.ok(
-    good.claims.some(
-      (claim) =>
-        claim.verificationKind === 'missing-evidence' ||
-        (claim.verificationKind === 'verified-by-anchor' && claim.requiresHumanSemanticReview === true),
-    ),
-  );
+  assert.ok(good.claims.some((claim) => claim.verificationKind === 'structurally-cited'));
+  assert.ok(good.claims.some((claim) => claim.verificationKind === 'missing-evidence'));
+  assert.ok(good.claims.every((claim) => claim.verificationKind !== 'verified-by-anchor'));
+  assert.ok(good.claims.every((claim) => claim.requiresHumanSemanticReview === true));
+  assert.equal(good.factsProven, false);
+  assert.equal(good.rubric.usability.passLabel, 'structural-rubric-only');
+  assert.match(good.rubric.scoringLimit, /do not prove factual claims/i);
 
   const bad = scoreTrackedSyntheticCase('B01', { briefText: BRIEF_EVALUATION_BAD_B01_BOOKED });
   assert.ok(bad.materialErrors.length > 0);
+  assert.ok(bad.claims.some((claim) => claim.verificationKind === 'unsupported'));
 
-  const missingEvidence = evaluateBrief({
-    caseId: 'B01',
-    suiteKind: 'tracked',
-    taskText: getTrackedSyntheticCaseDefinition('B01').taskText,
-    sourceText: getTrackedSyntheticCaseDefinition('B01').sourceText,
-    briefText: 'Maple exceeds budget without citation.',
-  });
-  assert.ok(missingEvidence.claims.some((claim) => claim.verificationKind === 'missing-evidence'));
+  const missingEvidence = evaluateTrackedBrief('B01', 'Maple exceeds budget without citation.');
+  assert.ok(missingEvidence.claims.every((claim) => claim.verificationKind === 'missing-evidence'));
+  assert.ok(missingEvidence.claims.every((claim) => claim.verificationKind !== 'unsupported'));
+
+  const invalidCitation = evaluateTrackedBrief('B01', 'Unknown fact from note [99].');
+  assert.ok(invalidCitation.claims.every((claim) => claim.verificationKind === 'unsupported'));
+  assert.equal(
+    invalidCitation.structuralChecks.find((check) => check.name.includes('citation references'))?.pass,
+    false,
+  );
 });
 
 test('structural checks carry human semantic review guidance', () => {
@@ -240,6 +317,22 @@ test('runTwentyPlusFiveEvaluation returns tracked plus holdout sections', () => 
   });
   assert.equal(report.tracked.summary.count, 20);
   assert.equal(report.holdout.summary.count, 5);
+  assert.equal(report.tracked.summary.factsProven, false);
+  assert.equal(report.tracked.gates.factsProven, false);
+  assert.equal(report.tracked.gates.factualVerificationPerformed, false);
+  assert.equal(report.holdout.summary.factsProven, false);
+  for (const item of [...report.tracked.cases, ...report.holdout.cases]) {
+    assert.equal(item.factsProven, false, item.caseId);
+    assert.equal(item.factualVerificationPerformed, false, item.caseId);
+    assert.equal(item.rubric.usability.factsProven, false, item.caseId);
+    assert.equal(item.rubric.usability.passLabel, 'structural-rubric-only', item.caseId);
+    for (const claim of item.claims) {
+      assert.notEqual(claim.verificationKind, 'verified-by-anchor', `${item.caseId}:${claim.claimId}`);
+      assert.equal(claim.requiresHumanSemanticReview, true, item.caseId);
+      assert.equal(claim.factualVerificationPerformed, false, item.caseId);
+      assert.ok(CLAIM_VERIFICATION_KINDS.includes(claim.verificationKind), claim.verificationKind);
+    }
+  }
 });
 
 test('fail closed on unknown case ids and invalid suite kinds', () => {
