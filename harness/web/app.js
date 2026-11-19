@@ -799,8 +799,10 @@ function documentHasOpener() {
 }
 async function takeDesktopTicket() {
   if(admission.localLock()||admission.mayOpenWorkspace()||admission.mustConceal()) return;
+  const claim=globalThis.bfeDesktop?.claimDocument;
+  if(typeof claim!=='function') return;
   let ticket=null;
-  try { ticket=await api('/api/desktop-view',{}); }
+  try { ticket=await claim(); }
   catch { return; }
   if(admission.localLock()||admission.mayOpenWorkspace()||admission.mustConceal()) return;
   admission.admit(ticket?.viewId, ticket?.viewGeneration);

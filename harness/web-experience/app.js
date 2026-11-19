@@ -47,15 +47,11 @@ async function takeDesktopTicket() {
   if (mode.synthetic) return;
   const admission = experienceAdmission();
   if (admission.localLock() || admission.mayOpenWorkspace() || admission.mustConceal()) return;
+  const claim = globalThis.bfeDesktop?.claimDocument;
+  if (typeof claim !== 'function') return;
   let ticket = null;
-  try {
-    const response = await fetch('/api/desktop-view', {
-      method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'application/json'},
-      body: '{}', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
-    });
-    if (!response.ok) return;
-    ticket = await response.json();
-  } catch { return; }
+  try { ticket = await claim(); }
+  catch { return; }
   const again = experienceAdmission();
   if (again.localLock() || again.mayOpenWorkspace() || again.mustConceal()) return;
   again.admit(ticket?.viewId, ticket?.viewGeneration);

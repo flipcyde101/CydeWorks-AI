@@ -50,18 +50,20 @@ if (database !== ':memory:') {
 if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
 let session=randomBytes(32).toString('hex');
 // Changes when the session ends. A view id is admitted by the unlock that
-// presented the access file, or once by POST /api/desktop-view with the
-// launcher cookie. It is not a cookie and not a URL.
+// presented the access file, or once by the launcher's bound claim. It is not
+// a cookie and not a URL.
 let viewGeneration=randomBytes(16).toString('hex');
 const admittedViews=new Set();
 function rotateViewGeneration() {
   viewGeneration=randomBytes(16).toString('hex');
   admittedViews.clear();
 }
-// One launcher claim can receive this view. A document navigation does not take
-// it. Lock or idle rotates the generation first, so a later claim is not
-// admitted and does not mint another view.
+// One launcher claim can receive this view. The launcher binds a one-time proof
+// over its parent channel. A document navigation does not take the view, and a
+// cookie without that proof does not take it. Lock or idle rotates the
+// generation first, so a later claim is not admitted and does not mint another.
 let desktopViewTicket=null;
+let desktopClaimProof=null;
 if(process.env.BFE_DESKTOP_BOOTSTRAP==='1') {
   desktopViewTicket={viewId:randomBytes(16).toString('hex'),viewGeneration,delivered:false};
 }
@@ -344,6 +346,8 @@ const server=http.createServer(async (req,res) => {
         fail(401,'Unlock this workspace with its local access.key file.');
       }
       if(!presented.some(value=>equal(value,session))) fail(401,'Unlock this workspace with its local access.key file.');
+      const proof=req.headers['x-desktop-claim'];
+      if(typeof proof!=='string'||desktopClaimProof===null||!equal(proof,desktopClaimProof)) fail(401,'Unlock this workspace with its local access.key file.');
       const claimed=claimDesktopView(res);
       if(!claimed) fail(404,'The desktop view is not available.');
       return send(200,claimed);
@@ -666,6 +670,17 @@ function closeOrphanedWorkspace() {
 function desktopMessage(message) {
     if(ownerLease?.expired()){closeOrphanedWorkspace();return;}
     if(message?.type==='bfe-owner-heartbeat' && ownerLease && !ownerLease.renew()){closeOrphanedWorkspace();return;}
+    if(message?.type==='bfe-desktop-claim-bind') {
+      const proof=message.proof;
+      if(!desktopViewTicket||!equal(proof,proof)) {
+        desktopSend({type:'bfe-desktop-claim-bound',ok:false});
+        return;
+      }
+      if(desktopClaimProof===null)desktopClaimProof=proof;
+      const sameProof=equal(proof,desktopClaimProof);
+      desktopSend({type:'bfe-desktop-claim-bound',ok:sameProof});
+      return;
+    }
     if(message?.type==='bfe-status-query' && typeof message.id==='string' &&
       /^[a-f0-9-]{36}$/.test(message.id)) {
       desktopSend({type:'bfe-status-result',id:message.id,active:!!active});
