@@ -631,19 +631,37 @@ test('concurrent observation memory and active entry limits keep outcomes unknow
   const broker=await createInferenceBroker(target,{model:'synthetic-model'});
   t.after(()=>broker.close());
 
-  const largeFetches=[0,1,2].map(async()=>{
+  const largeResponses=await Promise.all([0,1,2].map(async()=>{
     const r=await fetch(broker.endpoint+'/v1/chat/completions',{method:'POST',
       body:JSON.stringify({model:'synthetic-model',hold:false}),
       headers:{'x-cydeworks-local':broker.token}});
     assert.equal(r.status,200);
-    const json=await r.json();
+    const reader=r.body.getReader();
+    const parts=[];
+    let bytes=0;
+    while(bytes<1500000) {
+      const {done,value}=await reader.read();
+      assert.equal(done,false,'response must remain open while each prefix is observed');
+      parts.push(value);
+      bytes+=value.byteLength;
+    }
+    return {reader,parts};
+  }));
+  assert.equal(pendingLarge.length,3);
+  const midLarge=broker.settlement();
+  assert.equal(midLarge.inFlight,3);
+  assert.ok(midLarge.observationBytes>0&&midLarge.observationBytes<=4000000);
+  for(const finish of pendingLarge)finish();
+  const concurrent=await Promise.all(largeResponses.map(async({reader,parts})=>{
+    while(true) {
+      const {done,value}=await reader.read();
+      if(done)break;
+      parts.push(value);
+    }
+    const json=JSON.parse(Buffer.concat(parts).toString('utf8'));
     assert.equal(json.choices[0].message.content.length,padding.length);
     return json;
-  });
-  while(pendingLarge.length<3)await new Promise(resolve=>setTimeout(resolve,5));
-  await new Promise(resolve=>setTimeout(resolve,20));
-  for(const finish of pendingLarge)finish();
-  const concurrent=await Promise.all(largeFetches);
+  }));
   assert.equal(concurrent.length,3);
   const memSnap=broker.settlement();
   assert.equal(memSnap.state,'unknown');
