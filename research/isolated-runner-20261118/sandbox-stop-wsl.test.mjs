@@ -13,3 +13,20 @@ test('Windows qualification reports evidence or concrete blocker', async () => {
   else assert.ok(result.blocker);
   console.log(JSON.stringify(result));
 });
+
+test('startup interruption remains fail-closed and replay never relaunches', async () => {
+  const requestId = 'startup-test';
+  const pending = qualifySandboxStop({requestId, interrupt: 'startup'});
+  const held = await qualifySandboxStop({requestId, interrupt: 'startup'});
+  assert.equal(held.state, 'held');
+  assert.equal(held.replay, true);
+  const first = await pending;
+  const replay = await qualifySandboxStop({requestId, interrupt: 'startup'});
+  assert.deepEqual(replay, {...first, replay: true});
+  assert.equal(first.cleanup, 'unknown');
+  assert.ok(first.blocker);
+});
+
+test('invalid interruption cannot reserve or launch', async () => {
+  await assert.rejects(qualifySandboxStop({interrupt: 'invalid'}), /Invalid interruption/);
+});

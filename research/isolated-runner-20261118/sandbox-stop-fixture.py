@@ -28,6 +28,10 @@ def identity(pid):
 
 def main():
     binary = pinned()
+    print(json.dumps({'event': 'starting'}), flush=True)
+    if select.select([sys.stdin], [], [], 0.2)[0]:
+        print(json.dumps({'event': 'blocked', 'reason': 'Interrupted before launch'}), flush=True)
+        return
     args = [binary, '--unshare-all', '--unshare-user', '--disable-userns', '--die-with-parent',
             '--new-session', '--clearenv']
     for path in ('/usr/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib/python3.12', '/usr/bin/python3.12'):
@@ -70,7 +74,17 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        if sys.argv[1:] == ['--confirm']:
+            identities = json.loads(sys.stdin.readline())
+            absent = True
+            for expected in identities:
+                try:
+                    absent = absent and identity(expected['pid']) != expected
+                except FileNotFoundError:
+                    pass
+            print(json.dumps({'event': 'confirmed', 'absent': absent}), flush=True)
+        else:
+            main()
     except Exception as error:
         print(json.dumps({'event': 'blocked', 'reason': str(error)}), flush=True)
         sys.exit(1)
