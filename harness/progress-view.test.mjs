@@ -86,12 +86,16 @@ test('unknown totals and missing runner counters never invent percentages, rates
     },
   },attempt,then+5000);
   const openView=presentProgress(openSteps,{formatLocalTime:fixedClock});
+  const openHasUnit='unit' in openSteps;
+  const openExpectedUnit=openHasUnit ? 'steps' : 'units';
   assert.equal(openView.counts.completedSteps,2);
   assert.equal(openView.counts.totalKnown,false);
+  assert.equal(openView.counts.unit,openHasUnit ? 'steps' : null);
+  assert.equal(openView.counts.unitSingular,openHasUnit ? 'step' : null);
   assert.equal(openView.counts.percent,null);
-  assert.match(rowByKey(openView,'completed').value,/2 units completed \(total unknown\)/i);
+  assert.equal(rowByKey(openView,'completed').value,`2 ${openExpectedUnit} completed (total unknown)`);
   assert.match(rowByKey(openView,'remaining').value,/unknown/i);
-  assert.match(rowByKey(openView,'rate').value,/0\.5 units\/s/i);
+  assert.equal(rowByKey(openView,'rate').value,`0.5 ${openExpectedUnit}/s`);
   assert.match(rowByKey(openView,'overallEta').value,/unknown/i);
   assert.match(rowByKey(openView,'completion').value,/unavailable/i);
   assert.doesNotMatch(openView.text,/\d+%|projected around/i);
@@ -116,6 +120,8 @@ test('unknown totals and missing runner counters never invent percentages, rates
   },attempt,then+10000);
   const rejectedView=presentProgress(rejectedSteps,{formatLocalTime:fixedClock});
   assert.equal(rejectedView.counts.totalKnown,false);
+  assert.equal(rejectedView.counts.unit,null);
+  assert.equal(rejectedView.counts.unitSingular,null);
   assert.match(rowByKey(rejectedView,'completed').value,/character/i);
   assert.match(rowByKey(rejectedView,'rate').value,/240\.0 UTF-16 code units\/s.*rejected/i);
   assert.match(rowByKey(rejectedView,'overallEta').value,/character/i);
@@ -154,17 +160,22 @@ test('measured counts and separate current-step vs overall estimates render accu
   },attempt,then+5000);
 
   const view=presentProgress(state,{formatLocalTime:fixedClock});
+  const stateHasUnit='unit' in state;
+  const stateExpectedUnit=stateHasUnit ? 'steps' : 'units';
+  const stateExpectedSubUnit=stateHasUnit ? 'sub-steps' : 'units';
   assert.equal(view.available,true);
   assert.equal(view.phase,'active');
   assert.equal(view.stateLabel,'Running');
   assert.equal(view.counts.doneTotal,'2/5');
+  assert.equal(view.counts.unit,stateHasUnit ? 'steps' : null);
+  assert.equal(view.counts.unitSingular,stateHasUnit ? 'step' : null);
   assert.equal(view.counts.percent,40);
 
   assert.equal(rowByKey(view,'status').value,'Running step 3 of 5');
-  assert.equal(rowByKey(view,'currentStep').value,'Step 3: Run protected checks (2/8, 25%; 4 units/s)');
-  assert.equal(rowByKey(view,'completed').value,'2 of 5 units (2/5, 40%)');
-  assert.equal(rowByKey(view,'remaining').value,'3 of 5 units remaining');
-  assert.equal(rowByKey(view,'rate').value,'0.5 units/s (current step: 4 units/s)');
+  assert.equal(rowByKey(view,'currentStep').value,`Step 3: Run protected checks (2/8, 25%; 4 ${stateExpectedSubUnit}/s)`);
+  assert.equal(rowByKey(view,'completed').value,`2 of 5 ${stateExpectedUnit} (2/5, 40%)`);
+  assert.equal(rowByKey(view,'remaining').value,`3 of 5 ${stateExpectedUnit} remaining`);
+  assert.equal(rowByKey(view,'rate').value,`0.5 ${stateExpectedUnit}/s (current step: 4 ${stateExpectedSubUnit}/s)`);
   assert.equal(rowByKey(view,'elapsed').value,'5.0 s');
   assert.equal(rowByKey(view,'lastActivity').value,'12:00:04 UTC (500 ms ago)');
   assert.equal(rowByKey(view,'heartbeat').value,'12:00:04 UTC (200 ms ago)');
@@ -224,9 +235,10 @@ test('measured counts and separate current-step vs overall estimates render accu
     },
   },attempt,then+11000);
   const nearlyView=presentProgress(nearlyDone,{formatLocalTime:fixedClock});
+  const nearlyUnit='unit' in nearlyDone ? 'steps' : 'units';
   assert.equal(rowByKey(nearlyView,'currentStep').value,'Unavailable (current step not reported)');
-  assert.equal(rowByKey(nearlyView,'rate').value,'9999.9 units/s');
-  assert.equal(rowByKey(nearlyView,'completed').value,'99999 of 100000 units (99999/100000, 99.99%)');
+  assert.equal(rowByKey(nearlyView,'rate').value,`9999.9 ${nearlyUnit}/s`);
+  assert.equal(rowByKey(nearlyView,'completed').value,`99999 of 100000 ${nearlyUnit} (99999/100000, 99.99%)`);
   assert.doesNotMatch(rowByKey(nearlyView,'completed').value,/100%/);
 
   // Inconsistent supplied percentages are overridden by counter-derived percent and incomplete work never formats as 100%
@@ -274,7 +286,7 @@ test('measured counts and separate current-step vs overall estimates render accu
   assert.equal(rowByKey(extremeIncompletePercentView,'currentStep').value,'Step 1: Verify batch (999999/1000000, 99.99%)');
   assert.doesNotMatch(extremeIncompletePercentView.text,/100%/);
 
-  // Measured non-step units accepted by describeProgress (e.g. files) render with generic unit labels instead of hardcoded steps/sub-steps
+  // Measured non-step units (e.g. files / checks) use validated contract units when emitted by describeProgress, or generic units fallback for older helpers
   const fileUnitState=describeProgress({
     status:'running',
     live:{
@@ -305,16 +317,21 @@ test('measured counts and separate current-step vs overall estimates render accu
     },
   },attempt,then+5000);
   const fileUnitView=presentProgress(fileUnitState,{formatLocalTime:fixedClock});
-  assert.equal(rowByKey(fileUnitView,'currentStep').value,'Step 1: Inspect sources (3/4, 75%; 6 units/s)');
-  assert.equal(rowByKey(fileUnitView,'completed').value,'2 of 5 units (2/5, 40%)');
-  assert.equal(rowByKey(fileUnitView,'remaining').value,'3 of 5 units remaining');
-  assert.equal(rowByKey(fileUnitView,'rate').value,'0.5 units/s (current step: 6 units/s)');
+  const fileHasUnit='unit' in fileUnitState;
+  const expectedFileUnit=fileHasUnit ? 'files' : 'units';
+  const expectedCheckUnit=fileHasUnit ? 'checks' : 'units';
+  assert.equal(fileUnitView.counts.unit,fileHasUnit ? 'files' : null);
+  assert.equal(fileUnitView.counts.unitSingular,fileHasUnit ? 'file' : null);
+  assert.equal(rowByKey(fileUnitView,'currentStep').value,`Step 1: Inspect sources (3/4, 75%; 6 ${expectedCheckUnit}/s)`);
+  assert.equal(rowByKey(fileUnitView,'completed').value,`2 of 5 ${expectedFileUnit} (2/5, 40%)`);
+  assert.equal(rowByKey(fileUnitView,'remaining').value,`3 of 5 ${expectedFileUnit} remaining`);
+  assert.equal(rowByKey(fileUnitView,'rate').value,`0.5 ${expectedFileUnit}/s (current step: 6 ${expectedCheckUnit}/s)`);
   assert.doesNotMatch(rowByKey(fileUnitView,'completed').value,/steps/i);
   assert.doesNotMatch(rowByKey(fileUnitView,'remaining').value,/steps/i);
   assert.doesNotMatch(rowByKey(fileUnitView,'rate').value,/steps\/s|sub-steps\/s/i);
 
   // Empty currentStep object with positive overall stepRate falls back to not-reported without crashing
-  const emptyStepView=presentProgress(describeProgress({
+  const emptyStepState=describeProgress({
     status:'running',
     live:{
       lastActivity:new Date(then+4000).toISOString(),
@@ -330,16 +347,18 @@ test('measured counts and separate current-step vs overall estimates render accu
         currentStep:{},
       },
     },
-  },attempt,then+5000),{formatLocalTime:fixedClock});
+  },attempt,then+5000);
+  const emptyStepView=presentProgress(emptyStepState,{formatLocalTime:fixedClock});
+  const emptyStepUnit='unit' in emptyStepState ? 'steps' : 'units';
   assert.equal(rowByKey(emptyStepView,'currentStep').value,'Unavailable (current step not reported)');
-  assert.equal(rowByKey(emptyStepView,'rate').value,'0.5 units/s');
+  assert.equal(rowByKey(emptyStepView,'rate').value,`0.5 ${emptyStepUnit}/s`);
   assert.equal(rowByKey(emptyStepView,'overallEta').value,'6.0 s');
 });
 
 test('stale data, zero rates, waiting-for-completion, and unavailable inputs behave conservatively',()=>{
   const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
 
-  // Zero measured rate shows 0 units/s without inventing an ETA
+  // Zero measured rate shows 0 unit rate without inventing an ETA
   const zeroRate=describeProgress({
     status:'running',
     live:{
@@ -357,9 +376,10 @@ test('stale data, zero rates, waiting-for-completion, and unavailable inputs beh
     },
   },attempt,then+10000);
   const zeroView=presentProgress(zeroRate,{formatLocalTime:fixedClock});
+  const zeroUnit='unit' in zeroRate ? 'steps' : 'units';
   assert.equal(zeroView.phase,'waiting');
   assert.equal(zeroView.waiting,true);
-  assert.equal(rowByKey(zeroView,'rate').value,'0 units/s');
+  assert.equal(rowByKey(zeroView,'rate').value,`0 ${zeroUnit}/s`);
   assert.equal(rowByKey(zeroView,'rate').available,true);
   assert.match(rowByKey(zeroView,'overallEta').value,/0 steps\/s/i);
   assert.match(rowByKey(zeroView,'completion').value,/0 steps\/s/i);
@@ -459,9 +479,10 @@ test('stale data, zero rates, waiting-for-completion, and unavailable inputs beh
   assert.equal(waitingSettlement.currentStepEtaMs,null);
   assert.equal(waitingSettlement.unavailableReasons.currentStepEta,'Unavailable until the workspace confirms run completion.');
   const settleView=presentProgress(waitingSettlement,{formatLocalTime:fixedClock});
+  const settleUnit='unit' in waitingSettlement ? 'steps' : 'units';
   assert.equal(settleView.phase,'waiting');
   assert.equal(settleView.complete,false);
-  assert.equal(rowByKey(settleView,'remaining').value,'0 of 5 units remaining (waiting for completion)');
+  assert.equal(rowByKey(settleView,'remaining').value,`0 of 5 ${settleUnit} remaining (waiting for completion)`);
   assert.equal(rowByKey(settleView,'currentStepEta').value,'Unavailable until the workspace confirms run completion.');
   assert.equal(rowByKey(settleView,'currentStepEta').available,false);
   assert.doesNotMatch(rowByKey(settleView,'currentStepEta').value,/current step complete|0 ms/i);
@@ -534,6 +555,7 @@ test('failures, premature completion, interruptions and cancellations distinguis
   },attempt,then+12000);
 
   const failedView=presentProgress(failed,{formatLocalTime:fixedClock});
+  const failedUnit='unit' in failed ? 'steps' : 'units';
   assert.equal(failedView.phase,'failed');
   assert.equal(failedView.stateLabel,'Failed');
   assert.equal(failedView.failed,true);
@@ -542,8 +564,8 @@ test('failures, premature completion, interruptions and cancellations distinguis
   assert.doesNotMatch(failedView.text,/Protected check exited with status 1/);
   assert.doesNotMatch(failedView.announcement,/Protected check exited with status 1/);
   assert.equal(rowByKey(failedView,'status').value,'Attempt failed');
-  assert.equal(rowByKey(failedView,'completed').value,'3 of 5 units (3/5, 60%)');
-  assert.equal(rowByKey(failedView,'remaining').value,'2 of 5 units remaining');
+  assert.equal(rowByKey(failedView,'completed').value,`3 of 5 ${failedUnit} (3/5, 60%)`);
+  assert.equal(rowByKey(failedView,'remaining').value,`2 of 5 ${failedUnit} remaining`);
   assert.equal(rowByKey(failedView,'elapsed').value,'7.0 s');
   assert.match(rowByKey(failedView,'currentStepEta').value,/failed/i);
   assert.match(rowByKey(failedView,'overallEta').value,/failed/i);
@@ -609,7 +631,7 @@ test('failures, premature completion, interruptions and cancellations distinguis
     ['cancelled','cancelled','Cancelled'],
     ['interrupted','interrupted','Interrupted'],
   ]) {
-    const terminal5View=presentProgress(describeProgress({
+    const terminal5=describeProgress({
       status:taskStatus,
       live:{
         lastActivity:new Date(then+5000).toISOString(),
@@ -621,11 +643,13 @@ test('failures, premature completion, interruptions and cancellations distinguis
       started:start,
       ended:new Date(then+6000).toISOString(),
       execution:{phase:'dispatching',dispatchedAt:start},
-    },then+7000),{formatLocalTime:fixedClock});
+    },then+7000);
+    const terminal5View=presentProgress(terminal5,{formatLocalTime:fixedClock});
+    const terminal5Unit='unit' in terminal5 ? 'steps' : 'units';
     assert.equal(terminal5View.phase,expectedPhase);
     assert.equal(terminal5View.stateLabel,expectedLabel);
     assert.equal(terminal5View.waiting,false);
-    assert.equal(rowByKey(terminal5View,'remaining').value,'0 of 5 units remaining');
+    assert.equal(rowByKey(terminal5View,'remaining').value,`0 of 5 ${terminal5Unit} remaining`);
     assert.doesNotMatch(rowByKey(terminal5View,'remaining').value,/waiting for completion/i);
   }
 });
@@ -721,13 +745,14 @@ test('completion renders 100%, zero remaining, recorded completion clock, and pr
   },then+10000);
 
   const completeView=presentProgress(complete,{formatLocalTime:fixedClock});
+  const completeUnit='unit' in complete ? 'steps' : 'units';
   assert.equal(completeView.phase,'complete');
   assert.equal(completeView.stateLabel,'Complete');
   assert.equal(completeView.complete,true);
   assert.equal(rowByKey(completeView,'status').value,'Complete');
-  assert.equal(rowByKey(completeView,'currentStep').value,'None (all measured units complete)');
-  assert.equal(rowByKey(completeView,'completed').value,'4 of 4 units (4/4, 100%)');
-  assert.equal(rowByKey(completeView,'remaining').value,'0 of 4 units remaining');
+  assert.equal(rowByKey(completeView,'currentStep').value,`None (all measured ${completeUnit} complete)`);
+  assert.equal(rowByKey(completeView,'completed').value,`4 of 4 ${completeUnit} (4/4, 100%)`);
+  assert.equal(rowByKey(completeView,'remaining').value,`0 of 4 ${completeUnit} remaining`);
   assert.equal(rowByKey(completeView,'elapsed').value,'8.0 s');
   assert.equal(rowByKey(completeView,'currentStepEta').value,'Complete. No remaining work.');
   assert.equal(rowByKey(completeView,'overallEta').value,'Complete. No remaining time.');
@@ -896,3 +921,232 @@ test('hostile inputs, accessor getters, revoked proxies, arbitrary objects and c
   assert.doesNotMatch(fallbackClockView.text,/SECRET_FORMATTER_CRASH/);
   assert.match(rowByKey(fallbackClockView,'completion').value,/^Completed at /);
 });
+
+test('validated unit contract formats allowlisted units accurately and falls back to generic units when absent or invalid',()=>{
+  // Validated overall files/file and currentStep checks/check contract
+  const activeFilesView=presentProgress({
+    phase:'active',
+    status:'Running step 2 of 5',
+    totalKnown:true,
+    unit:'files',
+    unitSingular:'file',
+    completedSteps:2,
+    totalSteps:5,
+    remainingSteps:3,
+    stepRate:0.5,
+    overallEtaMs:6000,
+    projectedCompletionMs:then+12000,
+    currentStep:{
+      index:2,
+      label:'Lint sources',
+      unit:'checks',
+      unitSingular:'check',
+      completed:3,
+      total:4,
+      remaining:1,
+      rate:2,
+      etaMs:500,
+    },
+    currentStepEtaMs:500,
+  },{formatLocalTime:fixedClock});
+  assert.equal(activeFilesView.counts.unit,'files');
+  assert.equal(activeFilesView.counts.unitSingular,'file');
+  assert.equal(rowByKey(activeFilesView,'currentStep').value,'Step 2: Lint sources (3/4, 75%; 2 checks/s)');
+  assert.equal(rowByKey(activeFilesView,'completed').value,'2 of 5 files (2/5, 40%)');
+  assert.equal(rowByKey(activeFilesView,'remaining').value,'3 of 5 files remaining');
+  assert.equal(rowByKey(activeFilesView,'rate').value,'0.5 files/s (current step: 2 checks/s)');
+
+  // Singular vs plural open-total and 1-of-1 formatting
+  const singleOpenView=presentProgress({
+    phase:'active',
+    status:'Running',
+    totalKnown:false,
+    unit:'files',
+    unitSingular:'file',
+    completedSteps:1,
+    totalSteps:null,
+    stepRate:0.25,
+    currentStep:{
+      index:1,
+      label:'Scan module',
+      unit:'checks',
+      unitSingular:'check',
+      completed:1,
+      total:null,
+      rate:1,
+    },
+  });
+  assert.equal(singleOpenView.counts.unit,'files');
+  assert.equal(singleOpenView.counts.unitSingular,'file');
+  assert.equal(rowByKey(singleOpenView,'currentStep').value,'Step 1: Scan module (1 check completed, total unknown; 1 checks/s)');
+  assert.equal(rowByKey(singleOpenView,'completed').value,'1 file completed (total unknown)');
+  assert.equal(rowByKey(singleOpenView,'remaining').value,'Unknown (total files not reported)');
+  assert.equal(rowByKey(singleOpenView,'rate').value,'0.25 files/s (current step: 1 checks/s)');
+
+  const singleTotalCompleteView=presentProgress({
+    phase:'complete',
+    complete:true,
+    status:'Complete',
+    totalKnown:true,
+    unit:'items',
+    unitSingular:'item',
+    completedSteps:1,
+    totalSteps:1,
+    remainingSteps:0,
+    overallEtaMs:0,
+    projectedCompletionMs:then+1000,
+  },{formatLocalTime:fixedClock});
+  assert.equal(singleTotalCompleteView.counts.unit,'items');
+  assert.equal(singleTotalCompleteView.counts.unitSingular,'item');
+  assert.equal(rowByKey(singleTotalCompleteView,'currentStep').value,'None (all measured items complete)');
+  assert.equal(rowByKey(singleTotalCompleteView,'completed').value,'1 of 1 item (1/1, 100%)');
+  assert.equal(rowByKey(singleTotalCompleteView,'remaining').value,'0 of 1 item remaining');
+
+  // 5/5 settlement wait vs terminal failed 5/5 with validated units
+  const waitingFilesView=presentProgress({
+    phase:'waiting',
+    waiting:true,
+    status:'Waiting for completion',
+    totalKnown:true,
+    unit:'files',
+    unitSingular:'file',
+    completedSteps:5,
+    totalSteps:5,
+    remainingSteps:0,
+    currentStepEtaMs:null,
+    unavailableReasons:{currentStepEta:'Unavailable until the workspace confirms run completion.'},
+  });
+  assert.equal(rowByKey(waitingFilesView,'remaining').value,'0 of 5 files remaining (waiting for completion)');
+
+  const failedFilesView=presentProgress({
+    phase:'failed',
+    failed:true,
+    status:'Attempt failed',
+    explanation:'The attempt failed before completion.',
+    totalKnown:true,
+    unit:'files',
+    unitSingular:'file',
+    completedSteps:5,
+    totalSteps:5,
+    remainingSteps:0,
+  });
+  assert.equal(rowByKey(failedFilesView,'remaining').value,'0 of 5 files remaining');
+
+  // Missing completed count on complete preserves validated singular/plural unit wording
+  const missingDoneFilesView=presentProgress({
+    phase:'complete',
+    complete:true,
+    status:'Complete',
+    totalKnown:true,
+    unit:'files',
+    unitSingular:'file',
+    completedSteps:null,
+    totalSteps:5,
+    remainingSteps:null,
+  });
+  assert.equal(rowByKey(missingDoneFilesView,'completed').value,'Unavailable (completed count not recorded; 5 total files)');
+  assert.equal(rowByKey(missingDoneFilesView,'remaining').value,'Unknown (completed count for 5 total files was not recorded)');
+  assert.equal(rowByKey(missingDoneFilesView,'currentStepEta').value,'Unavailable because completed file count is not recorded.');
+  assert.equal(rowByKey(missingDoneFilesView,'overallEta').value,'Unavailable because completed file count is not recorded.');
+
+  // Premature complete with validated files / checks preserves safe unit message; invalid failure units are omitted
+  const prematureFilesView=presentProgress({
+    phase:'complete',
+    complete:true,
+    status:'Complete',
+    totalKnown:true,
+    unit:'files',
+    unitSingular:'file',
+    completedSteps:3,
+    totalSteps:5,
+    remainingSteps:2,
+  });
+  assert.equal(prematureFilesView.phase,'failed');
+  assert.equal(prematureFilesView.explanation,'Completion was reported before all measured files finished.');
+  assert.equal(rowByKey(prematureFilesView,'remaining').value,'2 of 5 files remaining');
+
+  const safeReportedPrematureView=presentProgress({
+    phase:'failed',
+    failed:true,
+    status:'Incomplete termination',
+    explanation:'Completion was reported before all measured current-step checks finished.',
+    remaining:'1 of 4 current-step checks remaining.',
+    totalKnown:false,
+  });
+  assert.equal(safeReportedPrematureView.explanation,'Completion was reported before all measured current-step checks finished.');
+  assert.equal(rowByKey(safeReportedPrematureView,'remaining').value,'1 of 4 current-step checks remaining.');
+
+  const unsafeUnitFailureView=presentProgress({
+    phase:'failed',
+    failed:true,
+    status:'Incomplete termination',
+    explanation:'Completion was reported before all measured SENSITIVE_TOKENS finished.',
+    remaining:'1 of 4 SENSITIVE_TOKENS remaining.',
+    totalKnown:false,
+  });
+  assert.equal(unsafeUnitFailureView.explanation,'Attempt failed (code: E_ATTEMPT_FAILED). Detailed diagnostics are omitted; review recovery status before retrying.');
+  assert.doesNotMatch(unsafeUnitFailureView.text,/SENSITIVE_TOKENS/);
+
+  // Untrusted, disallowed, mismatched, or unmeasured unit fields fall back to generic units without leaking
+  const invalidUnitInputs=[
+    {unit:'chars',unitSingular:'char'},
+    {unit:'tokens',unitSingular:'token'},
+    {unit:'SENSITIVE_SECRET_UNIT',unitSingular:'SENSITIVE_SECRET_SINGULAR'},
+    {unit:'files',unitSingular:'step'},
+    {unit:'files',unitSingular:null},
+    {unit:null,unitSingular:null},
+    {unit:undefined,unitSingular:undefined},
+  ];
+  for (const invalidPair of invalidUnitInputs) {
+    const fallbackView=presentProgress({
+      phase:'active',
+      status:'Running',
+      totalKnown:true,
+      unit:invalidPair.unit,
+      unitSingular:invalidPair.unitSingular,
+      completedSteps:2,
+      totalSteps:5,
+      remainingSteps:3,
+      stepRate:0.5,
+      chars:120,
+      rate:24,
+      currentStep:{
+        index:1,
+        label:'Process batch',
+        unit:'tokens',
+        unitSingular:'token',
+        completed:1,
+        total:4,
+        rate:2,
+      },
+    });
+    assert.equal(fallbackView.counts.unit,null);
+    assert.equal(fallbackView.counts.unitSingular,null);
+    assert.equal(rowByKey(fallbackView,'currentStep').value,'Step 1: Process batch (1/4, 25%; 2 units/s)');
+    assert.equal(rowByKey(fallbackView,'completed').value,'2 of 5 units (2/5, 40%)');
+    assert.equal(rowByKey(fallbackView,'remaining').value,'3 of 5 units remaining');
+    assert.equal(rowByKey(fallbackView,'rate').value,'0.5 units/s (current step: 2 units/s; 24.0 UTF-16 code units/s)');
+    assert.equal(rowByKey(fallbackView,'output').value,'120 UTF-16 code units (total unknown)');
+    assert.doesNotMatch(fallbackView.text,/SENSITIVE_SECRET|tokens|characters/i);
+  }
+
+  // Unmeasured overall counters never claim a concrete unit even if unit/unitSingular are supplied
+  const unmeasuredUnitView=presentProgress({
+    phase:'waiting',
+    waiting:true,
+    status:'Waiting',
+    totalKnown:false,
+    unit:'files',
+    unitSingular:'file',
+    currentStep:{
+      index:1,
+      label:'Queued check',
+      unit:'checks',
+      unitSingular:'check',
+    },
+  });
+  assert.equal(unmeasuredUnitView.counts.unit,null);
+  assert.equal(unmeasuredUnitView.counts.unitSingular,null);
+  assert.equal(rowByKey(unmeasuredUnitView,'currentStep').value,'Step 1: Queued check (sub-progress not measured)');
+});
+

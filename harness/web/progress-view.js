@@ -26,18 +26,80 @@ const SAFE_FAILURE_STATUSES = new Set([
   'Incomplete termination',
 ]);
 
-const SAFE_FAILURE_EXPLANATIONS = new Set([
-  'Completion was reported before all measured steps finished.',
-  'Completion was reported before all measured current-step sub-steps finished.',
-  'Completion was reported before all measured units finished.',
-  'Completion was reported before all measured current-step units finished.',
-  'The attempt failed before completion.',
+const ALLOWED_MEASURED_UNITS = new Map([
+  ['steps', 'step'],
+  ['sub-steps', 'sub-step'],
+  ['files', 'file'],
+  ['checks', 'check'],
+  ['tests', 'test'],
+  ['tasks', 'task'],
+  ['items', 'item'],
+  ['stages', 'stage'],
+  ['phases', 'phase'],
+  ['cases', 'case'],
+  ['suites', 'suite'],
+  ['batches', 'batch'],
+  ['chunks', 'chunk'],
+  ['pages', 'page'],
+  ['jobs', 'job'],
+  ['calls', 'call'],
+  ['tools', 'tool'],
+  ['actions', 'action'],
+  ['operations', 'operation'],
+  ['passes', 'pass'],
+  ['iterations', 'iteration'],
+  ['epochs', 'epoch'],
+  ['milestones', 'milestone'],
+  ['commands', 'command'],
+  ['shards', 'shard'],
+  ['partitions', 'partition'],
+  ['records', 'record'],
+  ['rows', 'row'],
+  ['modules', 'module'],
+  ['packages', 'package'],
+  ['targets', 'target'],
+  ['units', 'unit'],
 ]);
 
 const CONTROLLED_FAILURE_SUMMARY =
   'Attempt failed (code: E_ATTEMPT_FAILED). Detailed diagnostics are omitted; review recovery status before retrying.';
 
-const SAFE_FAILURE_REMAINING_RE = /^\d+ of \d+ (?:steps|current-step sub-steps) remaining\.$/;
+function validateUnitPair(rawUnit, rawUnitSingular) {
+  if (typeof rawUnit !== 'string' || !rawUnit.trim()) {
+    return { plural: 'units', singular: 'unit', known: false };
+  }
+  const normalizedPlural = rawUnit.trim().toLowerCase();
+  const expectedSingular = ALLOWED_MEASURED_UNITS.get(normalizedPlural);
+  if (!expectedSingular) {
+    return { plural: 'units', singular: 'unit', known: false };
+  }
+  if (rawUnitSingular !== undefined) {
+    if (typeof rawUnitSingular !== 'string' || rawUnitSingular.trim().toLowerCase() !== expectedSingular) {
+      return { plural: 'units', singular: 'unit', known: false };
+    }
+  }
+  return { plural: normalizedPlural, singular: expectedSingular, known: true };
+}
+
+function formatUnitCount(count, unitPair) {
+  return count === 1 ? unitPair.singular : unitPair.plural;
+}
+
+function isSafeFailureExplanation(text) {
+  if (text === null) return false;
+  if (text === 'The attempt failed before completion.') return true;
+  const match = text.match(/^Completion was reported before all measured (?:current-step )?([a-z-]+) finished\.$/);
+  if (!match) return false;
+  return ALLOWED_MEASURED_UNITS.has(match[1]);
+}
+
+function isSafeFailureRemaining(text) {
+  if (text === null) return false;
+  if (text === 'Review the problem and recovery status before retrying.') return true;
+  const match = text.match(/^\d+ of \d+ (?:current-step )?([a-z-]+) remaining\.$/);
+  if (!match) return false;
+  return ALLOWED_MEASURED_UNITS.has(match[1]);
+}
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value) || ArrayBuffer.isView(value)) {
@@ -244,6 +306,8 @@ function unavailableResult() {
     clockAnomalyReason: null,
     counts: {
       totalKnown: false,
+      unit: null,
+      unitSingular: null,
       completedSteps: null,
       totalSteps: null,
       remainingSteps: null,
@@ -277,6 +341,8 @@ function snapshotInput(progress, options) {
       currentStep = {
         index: ownData(rawStep, 'index'),
         label: ownData(rawStep, 'label'),
+        unit: ownData(rawStep, 'unit'),
+        unitSingular: ownData(rawStep, 'unitSingular'),
         completed: ownData(rawStep, 'completed'),
         total: ownData(rawStep, 'total'),
         remaining: ownData(rawStep, 'remaining'),
@@ -318,6 +384,8 @@ function snapshotInput(progress, options) {
       idleMs: ownData(progress, 'idleMs'),
       remaining: ownData(progress, 'remaining'),
       totalKnown: ownData(progress, 'totalKnown'),
+      unit: ownData(progress, 'unit'),
+      unitSingular: ownData(progress, 'unitSingular'),
       completedSteps: ownData(progress, 'completedSteps'),
       totalSteps: ownData(progress, 'totalSteps'),
       remainingSteps: ownData(progress, 'remainingSteps'),
@@ -425,6 +493,13 @@ export function presentProgress(progress, options = undefined) {
     }
   }
 
+  const hasMeasuredOverallCounters = totalKnown
+    || completedSteps !== null
+    || validNonNegFinite(raw.stepRate) !== null;
+  const overallUnit = stepSamplesValid === false || stepRejectionReason !== null || !hasMeasuredOverallCounters
+    ? { plural: 'units', singular: 'unit', known: false }
+    : validateUnitPair(raw.unit, raw.unitSingular);
+
   let currentStep = null;
   if (raw.currentStep !== null) {
     const cs = raw.currentStep;
@@ -457,10 +532,17 @@ export function presentProgress(progress, options = undefined) {
     const csRate = !hasClockAnomaly && stepSamplesValid !== false && csValidCounters
       ? validNonNegFinite(cs.rate)
       : null;
+    const hasMeasuredSubCounters = csTotal !== null || csCompleted !== null || validNonNegFinite(cs.rate) !== null;
+    const csUnit = csValidCounters && stepSamplesValid !== false && hasMeasuredSubCounters
+      ? validateUnitPair(cs.unit, cs.unitSingular)
+      : { plural: 'units', singular: 'unit', known: false };
 
     currentStep = {
       index: csIndex,
       label: csLabel,
+      unit: csUnit.known ? csUnit.plural : null,
+      unitSingular: csUnit.known ? csUnit.singular : null,
+      unitPair: csUnit,
       completed: csCompleted,
       total: csTotal,
       remaining: csRemaining,
@@ -482,12 +564,12 @@ export function presentProgress(progress, options = undefined) {
       prematureComplete = true;
       phase = 'failed';
       statusText = 'Incomplete termination';
-      explanationText = 'Completion was reported before all measured units finished.';
+      explanationText = `Completion was reported before all measured ${overallUnit.plural} finished.`;
     } else if (currentStep && currentStep.total !== null && currentStep.completed !== null && currentStep.completed < currentStep.total) {
       prematureComplete = true;
       phase = 'failed';
       statusText = 'Incomplete termination';
-      explanationText = 'Completion was reported before all measured current-step units finished.';
+      explanationText = `Completion was reported before all measured current-step ${currentStep.unitPair.plural} finished.`;
     }
   }
 
@@ -498,7 +580,7 @@ export function presentProgress(progress, options = undefined) {
       : statusText,
   );
   const explanation = phase === 'failed'
-    ? (SAFE_FAILURE_EXPLANATIONS.has(explanationText) ? explanationText : CONTROLLED_FAILURE_SUMMARY)
+    ? (isSafeFailureExplanation(explanationText) ? explanationText : CONTROLLED_FAILURE_SUMMARY)
     : (explanationText ?? `${PHASE_LABELS[phase]} state reported.`);
 
   const isTerminal = phase === 'complete' || phase === 'failed' || phase === 'interrupted' || phase === 'cancelled';
@@ -542,7 +624,7 @@ export function presentProgress(progress, options = undefined) {
   const rawOverallEtaText = sanitizeText(raw.overallEta);
   const rawRemainingNote = sanitizeText(raw.remaining);
   const remainingNote = phase === 'failed'
-    ? (rawRemainingNote === 'Review the problem and recovery status before retrying.' || (rawRemainingNote !== null && SAFE_FAILURE_REMAINING_RE.test(rawRemainingNote))
+    ? (isSafeFailureRemaining(rawRemainingNote)
       ? rawRemainingNote
       : 'Review recovery status before retrying.')
     : rawRemainingNote;
@@ -627,21 +709,21 @@ export function presentProgress(progress, options = undefined) {
       const pctText = formatPercent(currentStep.percent, currentStep.completed, currentStep.total);
       details.push(pctText !== null ? `${currentStep.doneTotal}, ${pctText}` : currentStep.doneTotal);
     } else if (currentStep.completed !== null) {
-      details.push(`${currentStep.completed} units completed, total unknown`);
+      details.push(`${currentStep.completed} ${formatUnitCount(currentStep.completed, currentStep.unitPair)} completed, total unknown`);
     } else if (currentStep.total !== null) {
-      details.push(`completed count not recorded; ${currentStep.total} total`);
+      details.push(`completed count not recorded; ${currentStep.total} total ${formatUnitCount(currentStep.total, currentStep.unitPair)}`);
     } else {
       details.push('sub-progress not measured');
     }
 
     if (currentStep.rate !== null) {
-      details.push(`${formatRate(currentStep.rate)} units/s`);
+      details.push(`${formatRate(currentStep.rate)} ${currentStep.unitPair.plural}/s`);
     }
 
     rows.push(row('currentStep', 'Current step', `${parts[0]} (${details.join('; ')})`, true));
   } else if (phase === 'complete') {
     const text = totalKnown && completedSteps !== null && completedSteps === totalSteps
-      ? 'None (all measured units complete)'
+      ? `None (all measured ${overallUnit.plural} complete)`
       : 'None (attempt complete)';
     rows.push(row('currentStep', 'Current step', text, true));
   } else {
@@ -653,16 +735,18 @@ export function presentProgress(progress, options = undefined) {
   if (stepRejectionReason) {
     rows.push(row('completed', 'Completed', ensureUnavailablePrefix(stepRejectionReason, 'Unavailable'), false, stepRejectionReason));
   } else if (totalKnown && completedSteps !== null && totalSteps !== null) {
+    const unitLabel = formatUnitCount(totalSteps, overallUnit);
     const pctText = formatPercent(percent, completedSteps, totalSteps);
     const text = pctText !== null
-      ? `${completedSteps} of ${totalSteps} units (${doneTotal}, ${pctText})`
-      : `${completedSteps} of ${totalSteps} units (${doneTotal})`;
+      ? `${completedSteps} of ${totalSteps} ${unitLabel} (${doneTotal}, ${pctText})`
+      : `${completedSteps} of ${totalSteps} ${unitLabel} (${doneTotal})`;
     rows.push(row('completed', 'Completed', text, true));
   } else if (completedSteps !== null && totalSteps === null) {
-    rows.push(row('completed', 'Completed', `${completedSteps} units completed (total unknown)`, true));
+    rows.push(row('completed', 'Completed', `${completedSteps} ${formatUnitCount(completedSteps, overallUnit)} completed (total unknown)`, true));
   } else if (totalKnown && completedSteps === null && totalSteps !== null) {
-    const reason = `Completed count not recorded for ${totalSteps} total units.`;
-    rows.push(row('completed', 'Completed', `Unavailable (completed count not recorded; ${totalSteps} total units)`, false, reason));
+    const unitLabel = formatUnitCount(totalSteps, overallUnit);
+    const reason = `Completed count not recorded for ${totalSteps} total ${unitLabel}.`;
+    rows.push(row('completed', 'Completed', `Unavailable (completed count not recorded; ${totalSteps} total ${unitLabel})`, false, reason));
   } else if (chars !== null) {
     const reason = 'Measured work counts are unavailable.';
     rows.push(row('completed', 'Completed', `Unavailable (${chars} UTF-16 code units received; work counts unmeasured)`, false, reason));
@@ -678,16 +762,23 @@ export function presentProgress(progress, options = undefined) {
   if (stepRejectionReason) {
     rows.push(row('remaining', 'Remaining', `Unknown (${stepRejectionReason})`, false, stepRejectionReason));
   } else if (totalKnown && remainingSteps !== null && totalSteps !== null) {
+    const unitLabel = formatUnitCount(totalSteps, overallUnit);
     const text = remainingSteps === 0 && phase === 'waiting'
-      ? `0 of ${totalSteps} units remaining (waiting for completion)`
-      : `${remainingSteps} of ${totalSteps} units remaining`;
+      ? `0 of ${totalSteps} ${unitLabel} remaining (waiting for completion)`
+      : `${remainingSteps} of ${totalSteps} ${unitLabel} remaining`;
     rows.push(row('remaining', 'Remaining', text, true));
   } else if (totalKnown && completedSteps === null && totalSteps !== null) {
-    const reason = `Completed count for ${totalSteps} total units was not recorded.`;
-    rows.push(row('remaining', 'Remaining', `Unknown (completed count for ${totalSteps} total units was not recorded)`, false, reason));
+    const unitLabel = formatUnitCount(totalSteps, overallUnit);
+    const reason = `Completed count for ${totalSteps} total ${unitLabel} was not recorded.`;
+    rows.push(row('remaining', 'Remaining', `Unknown (completed count for ${totalSteps} total ${unitLabel} was not recorded)`, false, reason));
   } else if (completedSteps !== null && totalSteps === null) {
-    const reason = 'Total work units not reported.';
-    rows.push(row('remaining', 'Remaining', 'Unknown (total work units not reported)', false, reason));
+    const reason = overallUnit.known
+      ? `Total ${overallUnit.plural} not reported.`
+      : 'Total work units not reported.';
+    const value = overallUnit.known
+      ? `Unknown (total ${overallUnit.plural} not reported)`
+      : 'Unknown (total work units not reported)';
+    rows.push(row('remaining', 'Remaining', value, false, reason));
   } else if (phase === 'complete') {
     rows.push(row('remaining', 'Remaining', remainingNote ?? 'No remaining work.', true));
   } else if (phase === 'failed' || phase === 'interrupted' || phase === 'cancelled' || phase === 'stopping') {
@@ -707,9 +798,9 @@ export function presentProgress(progress, options = undefined) {
     const reason = `Unavailable due to clock anomaly: ${clockAnomalyReason}`;
     rows.push(row('rate', 'Rate', reason, false, reason));
   } else if (stepRate !== null) {
-    const parts = [`${formatRate(stepRate)} units/s`];
+    const parts = [`${formatRate(stepRate)} ${overallUnit.plural}/s`];
     if (currentStep !== null && currentStep.rate !== null) {
-      parts.push(`current step: ${formatRate(currentStep.rate)} units/s`);
+      parts.push(`current step: ${formatRate(currentStep.rate)} ${currentStep.unitPair.plural}/s`);
     }
     if (charRate !== null) {
       parts.push(`${formatRate(charRate)} UTF-16 code units/s`);
@@ -788,7 +879,9 @@ export function presentProgress(progress, options = undefined) {
     rows.push(row('currentStepEta', 'Current step ETA', formatDuration(currentStepEtaMs), true));
   } else {
     const fallbackReason = missingOverallDone
-      ? 'Unavailable because completed count is not recorded.'
+      ? (overallUnit.known
+        ? `Unavailable because completed ${overallUnit.singular} count is not recorded.`
+        : 'Unavailable because completed count is not recorded.')
       : 'Unavailable because current-step sub-progress is not measured.';
     const reason = reasonCurrentEta ?? rawCurrentEtaText ?? fallbackReason;
     rows.push(row('currentStepEta', 'Current step ETA', ensureUnavailablePrefix(reason, fallbackReason), false, reason));
@@ -809,7 +902,9 @@ export function presentProgress(progress, options = undefined) {
     const fallbackReason = stepRejectionReason
       ? ensureUnavailablePrefix(stepRejectionReason, 'Unavailable')
       : missingOverallDone
-        ? 'Unavailable because completed count is not recorded.'
+        ? (overallUnit.known
+          ? `Unavailable because completed ${overallUnit.singular} count is not recorded.`
+          : 'Unavailable because completed count is not recorded.')
         : 'Unavailable because total work and remaining output are unknown.';
     const reason = reasonOverallEta ?? rawOverallEtaText ?? fallbackReason;
     rows.push(row('overallEta', 'Overall ETA', ensureUnavailablePrefix(reason, fallbackReason), false, reason));
@@ -867,6 +962,8 @@ export function presentProgress(progress, options = undefined) {
     clockAnomalyReason,
     counts: {
       totalKnown,
+      unit: overallUnit.known ? overallUnit.plural : null,
+      unitSingular: overallUnit.known ? overallUnit.singular : null,
       completedSteps,
       totalSteps,
       remainingSteps,
