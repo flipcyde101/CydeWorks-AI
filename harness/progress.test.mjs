@@ -824,7 +824,8 @@ test('clock anomalies suppress all ETAs and projections, validate current-step s
     },
   },{started:nearMaxStart,execution:{phase:'dispatching',dispatchedAt:nearMaxStart}},nearMaxNow);
   assert.equal(overflowProjection.clockAnomaly,false);
-  assert.equal(overflowProjection.overallEtaMs,6000);
+  // Sample window spans (MAX_DATE_MS - 2000) - (MAX_DATE_MS - 5000) = 3000 ms for 2 steps; 3 remaining steps => 4500 ms.
+  assert.equal(overflowProjection.overallEtaMs,4500);
   assert.equal(overflowProjection.projectedCompletionMs,null);
   assert.equal(overflowProjection.projectedCompletionAt,null);
   assert.match(overflowProjection.completion,/calendar range/i);
