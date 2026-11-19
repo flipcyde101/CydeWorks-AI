@@ -86,7 +86,14 @@ function computeRemainingEtaMs(remaining, spanInfo) {
   return etaMs;
 }
 
-function evaluateStepSeries(raw, { validNow, started, minSampleTime = null, minSampleLabel = null }) {
+function evaluateStepSeries(raw, {
+  validNow,
+  started,
+  minSampleTime = null,
+  minSampleLabel = null,
+  maxSampleTime = null,
+  maxSampleLabel = null,
+}) {
   if (raw === undefined || raw === null) {
     return {
       present: false,
@@ -211,6 +218,10 @@ function evaluateStepSeries(raw, { validNow, started, minSampleTime = null, minS
         const reason = minSampleLabel ?? 'Step sample timestamp precedes step start time.';
         return invalid(reason, reason);
       }
+      if (maxSampleTime !== null && sampleAt > maxSampleTime) {
+        const reason = maxSampleLabel ?? 'Step sample timestamp occurs after completion time.';
+        return invalid(reason, reason);
+      }
 
       const sComp = sample.completed !== undefined && sample.completed !== null;
       const sDone = sample.done !== undefined && sample.done !== null;
@@ -314,7 +325,7 @@ function evaluateStepSeries(raw, { validNow, started, minSampleTime = null, minS
   };
 }
 
-function inspectCurrentStep(rawCurrent, { validNow, started }) {
+function inspectCurrentStep(rawCurrent, { validNow, started, dispatched = null, ended = null }) {
   if (rawCurrent === undefined || rawCurrent === null) {
     return {
       kind: 'none',
@@ -363,6 +374,10 @@ function inspectCurrentStep(rawCurrent, { validNow, started }) {
       stepStarted = stepStart.time;
       if (started !== null && stepStarted !== null && stepStarted < started) {
         clockAnomaly = 'Current step start timestamp precedes attempt start time.';
+      } else if (dispatched !== null && stepStarted !== null && stepStarted < dispatched) {
+        clockAnomaly = 'Current step start timestamp precedes dispatch time.';
+      } else if (ended !== null && stepStarted !== null && stepStarted > ended) {
+        clockAnomaly = 'Current step start timestamp occurs after completion time.';
       }
     }
   }
@@ -383,11 +398,18 @@ function inspectCurrentStep(rawCurrent, { validNow, started }) {
     };
   }
 
+  const minSampleTime = stepStarted !== null ? stepStarted : dispatched;
+  const minSampleLabel = stepStarted !== null
+    ? 'Current-step sample timestamp precedes current step start time.'
+    : 'Current-step sample timestamp precedes dispatch time.';
+
   const subEval = evaluateStepSeries(rawCurrent, {
     validNow,
     started,
-    minSampleTime: stepStarted,
-    minSampleLabel: 'Current-step sample timestamp precedes current step start time.',
+    minSampleTime,
+    minSampleLabel,
+    maxSampleTime: ended,
+    maxSampleLabel: 'Current-step sample timestamp occurs after completion time.',
   });
   if (subEval.clockAnomaly && !clockAnomaly) {
     clockAnomaly = subEval.clockAnomaly;
@@ -572,12 +594,26 @@ export function describeProgress(task, attempt, now = Date.now()) {
     anomalies.push('Completion timestamp precedes attempt start time.');
     ended = null;
   }
+  const recordedEnded = ended;
+  const endedBeforeDispatched = dispatched !== null && ended !== null && ended < dispatched;
+  if (endedBeforeDispatched) {
+    anomalies.push('Completion timestamp precedes dispatch time.');
+    ended = null;
+  }
 
   const lastCheck = inspectTime(live?.lastActivity, validNow, 'Last activity');
   if (lastCheck.anomaly) anomalies.push(lastCheck.anomaly);
   let last = lastCheck.time;
+  let lastAfterEnded = false;
   if (started !== null && last !== null && last < started) {
     anomalies.push('Last activity timestamp precedes attempt start time.');
+    last = null;
+  } else if (dispatched !== null && last !== null && last < dispatched) {
+    anomalies.push('Last activity timestamp precedes dispatch time.');
+    last = null;
+  } else if (recordedEnded !== null && last !== null && last > recordedEnded) {
+    anomalies.push('Last activity timestamp occurs after completion time.');
+    lastAfterEnded = true;
     last = null;
   }
 
@@ -586,7 +622,7 @@ export function describeProgress(task, attempt, now = Date.now()) {
   const heartbeat = heartbeatCheck.time;
 
   const chars = Number.isSafeInteger(live?.chars) && live.chars >= 0 ? live.chars : null;
-  const idle = validNow !== null && last !== null ? validNow - last : null;
+  const outputIdle = validNow !== null && last !== null ? validNow - last : null;
   const heartbeatAgeMs = validNow !== null && heartbeat !== null ? validNow - heartbeat : null;
 
   const rawStepInput = live?.steps !== undefined && live?.steps !== null
@@ -597,14 +633,25 @@ export function describeProgress(task, attempt, now = Date.now()) {
         ? attemptObj.progress
         : null;
 
-  const stepEval = evaluateStepSeries(rawStepInput, { validNow, started });
+  const stepEval = evaluateStepSeries(rawStepInput, {
+    validNow,
+    started,
+    minSampleTime: dispatched,
+    minSampleLabel: 'Step sample timestamp precedes dispatch time.',
+    maxSampleTime: recordedEnded,
+    maxSampleLabel: 'Step sample timestamp occurs after completion time.',
+  });
   if (stepEval.clockAnomaly) anomalies.push(stepEval.clockAnomaly);
 
   const parsedCurrentStep = inspectCurrentStep(
     isPlainObject(rawStepInput) ? rawStepInput.currentStep : null,
-    { validNow, started },
+    { validNow, started, dispatched, ended: recordedEnded },
   );
   if (parsedCurrentStep.clockAnomaly) anomalies.push(parsedCurrentStep.clockAnomaly);
+
+  const subEval = stepEval.valid && parsedCurrentStep.kind === 'measured' && parsedCurrentStep.subEval?.valid
+    ? parsedCurrentStep.subEval
+    : null;
 
   const taskStatus = taskObj.status;
   const attemptStatus = attemptObj?.status;
@@ -632,21 +679,36 @@ export function describeProgress(task, attempt, now = Date.now()) {
   const isComplete = !prematureComplete && declaredComplete;
   const waitingForSettlementAfterSteps = isRunningAuthoritative && stepsComplete && !isFailed && !live?.stopping;
 
-  const outputActive = chars !== null && chars > 0 && idle !== null && idle < STALL_THRESHOLD_MS;
-  const workProgressActive = stepEval.present && stepEval.valid && stepEval.lastProgressAt !== null
-    && validNow !== null && (validNow - stepEval.lastProgressAt) < STALL_THRESHOLD_MS;
+  const overallWorkProgressAt = stepEval.present && stepEval.valid ? stepEval.lastProgressAt : null;
+  const subWorkProgressAt = subEval !== null ? subEval.lastProgressAt : null;
+  const latestWorkProgressAt = overallWorkProgressAt !== null && subWorkProgressAt !== null
+    ? Math.max(overallWorkProgressAt, subWorkProgressAt)
+    : (overallWorkProgressAt ?? subWorkProgressAt);
+
+  const overallWorkRefAt = stepEval.present && stepEval.valid && stepEval.samplesCount > 0
+    ? (stepEval.lastProgressAt ?? stepEval.firstSampleAt)
+    : null;
+  const subWorkRefAt = subEval !== null && subEval.samplesCount > 0
+    ? (subEval.lastProgressAt ?? subEval.firstSampleAt)
+    : null;
+  const latestWorkRefAt = overallWorkRefAt !== null && subWorkRefAt !== null
+    ? Math.max(overallWorkRefAt, subWorkRefAt)
+    : (overallWorkRefAt ?? subWorkRefAt);
+
+  const outputActive = chars !== null && chars > 0 && outputIdle !== null && outputIdle < STALL_THRESHOLD_MS;
+  const workProgressActive = latestWorkProgressAt !== null
+    && validNow !== null && (validNow - latestWorkProgressAt) < STALL_THRESHOLD_MS;
 
   let isStalled = false;
   if (live && !isFailed && !isInterrupted && !isCancelled && !isDraft && !isComplete && !live.stopping && attemptObj?.execution?.phase !== 'claimed') {
     if (!outputActive && !workProgressActive) {
-      if (idle !== null && idle >= STALL_THRESHOLD_MS) {
+      if (outputIdle !== null && outputIdle >= STALL_THRESHOLD_MS) {
         isStalled = true;
-      } else if (stepEval.present && stepEval.valid && stepEval.samplesCount > 0 && validNow !== null) {
-        const refWorkAt = stepEval.lastProgressAt ?? stepEval.firstSampleAt;
-        if (refWorkAt !== null && (validNow - refWorkAt) >= STALL_THRESHOLD_MS) {
+      } else if (latestWorkRefAt !== null && validNow !== null) {
+        if ((validNow - latestWorkRefAt) >= STALL_THRESHOLD_MS) {
           isStalled = true;
         }
-      } else if (idle === null && validNow !== null) {
+      } else if (outputIdle === null && validNow !== null) {
         const refSince = dispatched ?? started;
         if ((heartbeatAgeMs !== null && heartbeatAgeMs >= STALL_THRESHOLD_MS)
           || (refSince !== null && (validNow - refSince) >= STALL_THRESHOLD_MS)) {
@@ -723,7 +785,7 @@ export function describeProgress(task, attempt, now = Date.now()) {
   } else if (isStalled) {
     phase = 'stalled';
     status = 'Possibly stalled';
-    explanation = stepEval.valid && (stepEval.totalKnown || stepEval.completed !== null)
+    explanation = stepEval.valid && (stepEval.totalKnown || stepEval.completed !== null || subEval !== null)
       ? 'No new step progress or activity for at least 60 seconds. The worker may still be working.'
       : 'No new model output for at least 60 seconds. The model may still be working.';
   } else if (waitingForSettlementAfterSteps) {
@@ -731,9 +793,10 @@ export function describeProgress(task, attempt, now = Date.now()) {
     status = 'Waiting for completion';
     explanation = `All ${stepEval.total} measured steps completed, waiting for authoritative run completion.`;
     remaining = `0 of ${stepEval.total} steps remaining; waiting for completion.`;
-  } else if (live && stepEval.present && stepEval.valid && (stepEval.completed !== null || stepEval.totalKnown)) {
-    const recentStepProgress = stepEval.lastProgressAt !== null && validNow !== null && (validNow - stepEval.lastProgressAt) < WAITING_OUTPUT_THRESHOLD_MS;
-    if (stepEval.completed === 0 || stepEval.completed === null || (idle !== null && idle >= WAITING_OUTPUT_THRESHOLD_MS && !recentStepProgress) || stepEval.rate === 0) {
+  } else if (live && stepEval.present && stepEval.valid && (stepEval.completed !== null || stepEval.totalKnown || (subEval !== null && (subEval.completed !== null || subEval.totalKnown)))) {
+    const recentStepProgress = latestWorkProgressAt !== null && validNow !== null && (validNow - latestWorkProgressAt) < WAITING_OUTPUT_THRESHOLD_MS;
+    const recentSubProgress = subWorkProgressAt !== null && validNow !== null && (validNow - subWorkProgressAt) < WAITING_OUTPUT_THRESHOLD_MS;
+    if (!recentSubProgress && (stepEval.completed === 0 || stepEval.completed === null || (outputIdle !== null && outputIdle >= WAITING_OUTPUT_THRESHOLD_MS && !recentStepProgress) || stepEval.rate === 0)) {
       phase = 'waiting';
       status = stepEval.totalKnown && stepEval.completed !== null
         ? `Waiting on step ${Math.min(stepEval.completed + 1, stepEval.total)} of ${stepEval.total}`
@@ -743,17 +806,23 @@ export function describeProgress(task, attempt, now = Date.now()) {
         : 'Waiting for the current step to complete.';
     } else {
       phase = 'active';
-      status = stepEval.totalKnown
+      status = stepEval.totalKnown && stepEval.completed !== null
         ? `Running step ${Math.min(stepEval.completed + 1, stepEval.total)} of ${stepEval.total}`
-        : `Completed ${stepEval.completed} steps`;
-      explanation = stepEval.totalKnown
+        : stepEval.completed !== null
+          ? `Completed ${stepEval.completed} steps`
+          : parsedCurrentStep.label
+            ? `Running ${parsedCurrentStep.label}`
+            : 'Running current step';
+      explanation = stepEval.totalKnown && stepEval.completed !== null
         ? `Measured progress: ${stepEval.completed} of ${stepEval.total} steps complete.`
-        : `Measured progress: ${stepEval.completed} steps complete; total steps unknown.`;
+        : stepEval.completed !== null
+          ? `Measured progress: ${stepEval.completed} steps complete; total steps unknown.`
+          : 'Current-step sub-progress is advancing.';
     }
     if (stepEval.totalKnown && stepEval.remaining !== null) {
       remaining = `${stepEval.remaining} of ${stepEval.total} steps remaining.`;
     }
-  } else if (live && (chars === 0 || (idle !== null && idle >= WAITING_OUTPUT_THRESHOLD_MS))) {
+  } else if (live && (chars === 0 || (outputIdle !== null && outputIdle >= WAITING_OUTPUT_THRESHOLD_MS))) {
     phase = 'waiting';
     status = 'Waiting for model output';
     explanation = 'The model may be loading, processing context or generating.';
@@ -896,18 +965,28 @@ export function describeProgress(task, attempt, now = Date.now()) {
     completion = 'Unavailable until a reliable remaining time can be measured.';
   }
 
+  const endedContradicted = endedBeforeDispatched
+    || lastAfterEnded
+    || (recordedEnded !== null && (Boolean(stepEval.clockAnomaly) || Boolean(parsedCurrentStep.clockAnomaly)));
+  const trustedEnded = endedContradicted ? null : ended;
+
   const isTerminalState = isComplete || isFailed || isInterrupted || isCancelled;
   const elapsedMs = validNow === null || started === null
     ? null
-    : ended !== null
-      ? ended - started
+    : trustedEnded !== null
+      ? trustedEnded - started
       : isTerminalState
         ? null
         : validNow - started;
 
-  const rate = validNow !== null && chars !== null && chars > 0 && dispatched !== null && validNow > dispatched
+  const rate = !hasClockAnomaly && !isTerminalState && validNow !== null && chars !== null && chars > 0 && dispatched !== null && validNow > dispatched
     ? (chars * 1000) / (validNow - dispatched)
     : null;
+
+  const latestActivity = last !== null && latestWorkProgressAt !== null
+    ? Math.max(last, latestWorkProgressAt)
+    : (last ?? latestWorkProgressAt);
+  const latestIdle = validNow !== null && latestActivity !== null ? validNow - latestActivity : null;
 
   return {
     status,
@@ -925,9 +1004,9 @@ export function describeProgress(task, attempt, now = Date.now()) {
     heartbeat,
     heartbeatAt: safeDateIso(heartbeat),
     heartbeatAgeMs,
-    lastActivity: last,
-    lastActivityAt: safeDateIso(last),
-    idleMs: idle,
+    lastActivity: latestActivity,
+    lastActivityAt: safeDateIso(latestActivity),
+    idleMs: latestIdle,
     remaining,
     totalKnown: stepEval.valid && stepEval.totalKnown,
     completedSteps: stepEval.valid ? stepEval.completed : null,
@@ -959,6 +1038,64 @@ export function describeProgress(task, attempt, now = Date.now()) {
 export function progressAnnouncement(task, progress, connection) {
   if (connection !== 'connected') return 'Connection interrupted. The saved task state may be stale.';
   if (!task) return '';
+
+  const hasProgress = progress && typeof progress === 'object';
+  if (hasProgress) {
+    if (progress.failed === true || progress.phase === 'failed') {
+      if (progress.status === 'Incomplete termination') {
+        return progress.remaining
+          ? `Incomplete termination. ${progress.remaining}`
+          : 'Incomplete termination. Completion was reported before all measured steps finished.';
+      }
+      return 'Attempt failed. Review the problem and recovery status.';
+    }
+    if (progress.phase === 'interrupted') {
+      if (task.status === 'interrupted' && task.attempts?.at(-1)?.recovery?.state === 'retry-safe') {
+        return 'Previous attempt interrupted. It is safe to retry after reviewing the scope.';
+      }
+      return 'Run outcome may be unknown. Review recovery status.';
+    }
+    if (progress.phase === 'cancelled') {
+      return 'Cancellation recorded. Review recovery status.';
+    }
+    if (progress.complete === false && (
+      task.status === 'complete'
+      || task.status === 'completed'
+      || task.status === 'review'
+      || task.status === 'accepted'
+      || task.status === 'rejected'
+    )) {
+      const detail = progress.remaining ?? progress.explanation ?? 'Completion could not be verified.';
+      return progress.status ? `${progress.status}. ${detail}` : detail;
+    }
+  } else if (
+    task.status === 'complete'
+    || task.status === 'completed'
+    || task.status === 'review'
+    || task.status === 'accepted'
+    || task.status === 'rejected'
+  ) {
+    const live = task.live && typeof task.live === 'object' ? task.live : null;
+    const latestAttempt = Array.isArray(task.attempts) && task.attempts.length > 0 ? task.attempts.at(-1) : null;
+    const hasLiveError = typeof live?.error === 'string'
+      ? live.error.trim().length > 0
+      : Boolean(live?.error && typeof live.error === 'object');
+    if (live?.failed === true || latestAttempt?.status === 'failed' || hasLiveError) {
+      return 'Attempt failed. Review the problem and recovery status.';
+    }
+    const rawStepInput = live?.steps !== undefined && live?.steps !== null
+      ? live.steps
+      : live?.progress !== undefined && live?.progress !== null
+        ? live.progress
+        : latestAttempt?.progress !== undefined && latestAttempt?.progress !== null
+          ? latestAttempt.progress
+          : null;
+    const stepEval = evaluateStepSeries(rawStepInput, { validNow: MAX_DATE_MS, started: null });
+    if (stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed < stepEval.total) {
+      return `Incomplete termination. ${stepEval.remaining} of ${stepEval.total} steps remaining.`;
+    }
+  }
+
   if (task.status === 'running') return progress?.status ?? 'Waiting for run state';
   if (task.status === 'complete' || task.status === 'completed') return 'Attempt complete.';
   if (task.status === 'review') return 'Proposal ready for review.';

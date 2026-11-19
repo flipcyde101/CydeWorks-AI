@@ -929,3 +929,209 @@ test('stall detection considers valid work samples without treating heartbeat as
   assert.match(activeOutputStaleSamples.completion,/stale/i);
 });
 
+test('current-step work activity prevents false stalls, updates latest activity and preserves current-step ETA while keeping heartbeat distinct',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  const activeCurrentStepWork=describeProgress({
+    status:'running',
+    live:{
+      chars:20,
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+64000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Verify checks',
+          startedAt:new Date(then+4000).toISOString(),
+          measured:true,
+          completed:3,
+          total:4,
+          samples:[
+            {at:new Date(then+4000).toISOString(),done:0},
+            {at:new Date(then+64000).toISOString(),done:3},
+          ],
+        },
+      },
+    },
+  },attempt,then+65000);
+  assert.equal(activeCurrentStepWork.stalled,false);
+  assert.equal(activeCurrentStepWork.phase,'active');
+  assert.equal(activeCurrentStepWork.status,'Running step 3 of 5');
+  assert.equal(activeCurrentStepWork.lastActivity,then+64000);
+  assert.equal(activeCurrentStepWork.lastActivityAt,new Date(then+64000).toISOString());
+  assert.equal(activeCurrentStepWork.idleMs,1000);
+  assert.equal(activeCurrentStepWork.currentStepEtaMs,20000);
+  assert.equal(activeCurrentStepWork.eta,activeCurrentStepWork.currentStepEta);
+  assert.equal(activeCurrentStepWork.overallEtaMs,null);
+  assert.match(activeCurrentStepWork.overallEta,/stale/i);
+
+  // Without recent current-step work, a fresh heartbeat alone still does not mask a stall or advance lastActivity.
+  const heartbeatOnly=describeProgress({
+    status:'running',
+    live:{
+      chars:20,
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+64000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Verify checks',
+          startedAt:new Date(then+4000).toISOString(),
+          measured:true,
+          completed:0,
+          total:4,
+          samples:[
+            {at:new Date(then+4000).toISOString(),done:0},
+          ],
+        },
+      },
+    },
+  },attempt,then+65000);
+  assert.equal(heartbeatOnly.stalled,true);
+  assert.equal(heartbeatOnly.phase,'stalled');
+  assert.equal(heartbeatOnly.lastActivity,then+4000);
+  assert.equal(heartbeatOnly.idleMs,61000);
+  assert.equal(heartbeatOnly.heartbeatAgeMs,1000);
+  assert.equal(heartbeatOnly.currentStepEtaMs,null);
+  assert.equal(heartbeatOnly.overallEtaMs,null);
+});
+
+test('inconsistent chronology rejects ended before dispatched and samples after ended without displaying impossible completion',()=>{
+  const endedBeforeDispatch=describeProgress({
+    status:'review',
+    live:{
+      chars:120,
+      lastActivity:new Date(then+3000).toISOString(),
+      heartbeat:new Date(then+3000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:2,
+        samples:[
+          {at:new Date(then+2000).toISOString(),done:0},
+          {at:new Date(then+3000).toISOString(),done:2},
+        ],
+      },
+    },
+  },{
+    status:'completed',
+    started:start,
+    ended:new Date(then+1000).toISOString(),
+    execution:{phase:'settled',dispatchedAt:new Date(then+2000).toISOString()},
+  },then+5000);
+  assert.equal(endedBeforeDispatch.clockAnomaly,true);
+  assert.equal(endedBeforeDispatch.elapsedMs,null);
+  assert.equal(endedBeforeDispatch.rate,null);
+  assert.equal(endedBeforeDispatch.stepRate,null);
+  assert.equal(endedBeforeDispatch.stepSamplesValid,false);
+  assert.equal(endedBeforeDispatch.overallEtaMs,null);
+  assert.equal(endedBeforeDispatch.currentStepEtaMs,null);
+  assert.equal(endedBeforeDispatch.projectedCompletionMs,null);
+  assert.equal(endedBeforeDispatch.projectedCompletionAt,null);
+  assert.match(endedBeforeDispatch.completion,/clock anomaly/i);
+
+  const samplesAfterEnded=describeProgress({
+    status:'review',
+    live:{
+      lastActivity:new Date(then+2000).toISOString(),
+      heartbeat:new Date(then+2000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:2,
+        samples:[
+          {at:new Date(then+1000).toISOString(),done:0},
+          {at:new Date(then+3000).toISOString(),done:2},
+        ],
+      },
+    },
+  },{
+    status:'completed',
+    started:start,
+    ended:new Date(then+2000).toISOString(),
+    execution:{phase:'settled',dispatchedAt:new Date(then+1000).toISOString()},
+  },then+5000);
+  assert.equal(samplesAfterEnded.clockAnomaly,true);
+  assert.match(samplesAfterEnded.clockAnomalyReason,/after completion/i);
+  assert.equal(samplesAfterEnded.stepSamplesValid,false);
+  assert.equal(samplesAfterEnded.stepRate,null);
+  assert.equal(samplesAfterEnded.elapsedMs,null);
+  assert.equal(samplesAfterEnded.projectedCompletionMs,null);
+  assert.equal(samplesAfterEnded.projectedCompletionAt,null);
+  assert.match(samplesAfterEnded.completion,/clock anomaly/i);
+});
+
+test('progressAnnouncement agrees with conservative incomplete termination for complete and review snapshots',()=>{
+  const attempt={started:start,execution:{phase:'settled',dispatchedAt:start}};
+
+  const partialCompleteTask={
+    status:'complete',
+    live:{
+      complete:true,
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+      },
+    },
+  };
+  const partialCompleteState=describeProgress(partialCompleteTask,attempt,then+5000);
+  assert.equal(partialCompleteState.status,'Incomplete termination');
+  assert.equal(partialCompleteState.failed,true);
+  const announcedWithState=progressAnnouncement(partialCompleteTask,partialCompleteState,'connected');
+  assert.match(announcedWithState,/incomplete termination/i);
+  assert.match(announcedWithState,/3 of 5 steps remaining/i);
+  assert.doesNotMatch(announcedWithState,/attempt complete|ready for review/i);
+
+  const announcedWithoutState=progressAnnouncement(partialCompleteTask,null,'connected');
+  assert.match(announcedWithoutState,/incomplete termination/i);
+  assert.match(announcedWithoutState,/3 of 5 steps remaining/i);
+  assert.doesNotMatch(announcedWithoutState,/attempt complete|ready for review/i);
+
+  const partialReviewTask={
+    status:'review',
+    live:{
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+      },
+    },
+  };
+  const partialReviewState=describeProgress(partialReviewTask,attempt,then+5000);
+  assert.equal(partialReviewState.status,'Incomplete termination');
+  assert.equal(partialReviewState.failed,true);
+  const reviewWithState=progressAnnouncement(partialReviewTask,partialReviewState,'connected');
+  assert.match(reviewWithState,/incomplete termination/i);
+  assert.match(reviewWithState,/3 of 5 steps remaining/i);
+  assert.doesNotMatch(reviewWithState,/ready for review/i);
+
+  const reviewWithoutState=progressAnnouncement(partialReviewTask,null,'connected');
+  assert.match(reviewWithoutState,/incomplete termination/i);
+  assert.match(reviewWithoutState,/3 of 5 steps remaining/i);
+  assert.doesNotMatch(reviewWithoutState,/ready for review/i);
+});
