@@ -7,7 +7,7 @@ import {classifyError} from './adapters/contract.js';
 import {swap, stableKey} from './core/dom.js';
 import {mode, readAdapterMode} from './core/mode.js';
 import {shortHash} from './core/format.js';
-import {progressUiState} from './vendor/harness-web/progress-ui.js';
+import {progressAfterRead} from './vendor/harness-web/progress-ui.js';
 import {announce, revalidateDialogs, closeAllDialogs} from './ui/primitives.js';
 import {readSourceFile, rememberedTask, rememberTask} from './logic/parity.js';
 import {captureApproval, approvalProblems, submissionBody, terminalTargetHolds, evidenceProblem} from './logic/approval.js';
@@ -208,7 +208,7 @@ async function loop() {
 
 function statusAnnouncement(task) {
   const progressConnection = state.needsReconcile && state.connection === 'connected' ? 'checking' : state.connection;
-  return progressUiState(task, state.now, progressConnection).announcement;
+  return progressAfterRead(task, progressConnection);
 }
 
 // ---- Pending run submissions -----------------------------------------------------------------

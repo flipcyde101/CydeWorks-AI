@@ -1336,6 +1336,10 @@ export function progressAnnouncement(task, progress, connection) {
     if (progress.phase === 'cancelled') {
       return 'Cancellation recorded. Review recovery status.';
     }
+    if ((task.status === 'review' || task.status === 'complete' || task.status === 'completed') &&
+        (progress.clockAnomaly === true || progress.stepSamplesValid === false)) {
+      return 'Progress could not be verified. Review the recorded status.';
+    }
     if (progress.complete === false && (
       task.status === 'complete'
       || task.status === 'completed'

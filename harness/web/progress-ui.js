@@ -16,3 +16,8 @@ export function progressUiState(task, now, connection) {
   }
   return {view, announcement};
 }
+
+// Read the observation clock after the asynchronous task response has arrived.
+export function progressAfterRead(task, connection, clock = Date.now) {
+  return progressUiState(task, clock(), connection).announcement;
+}

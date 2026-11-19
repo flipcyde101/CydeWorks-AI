@@ -1,7 +1,7 @@
 [
   {
     "file": "app.js",
-    "sha256": "af32e5f364774c71212ad01fadd8897c0ba7d899fdbc5db6b4315bd27d4abfd1"
+    "sha256": "458d9a5a21990c84406ed372e2c2626022529e8b7b64a3b83056f4b80427f757"
   },
   {
     "file": "favicon.svg",
@@ -109,7 +109,7 @@
   },
   {
     "file": "vendor/harness-web/progress-ui.js",
-    "sha256": "63bad16fc397866417252f62da7d5072ec085f7139448849c77c645d976fe83d"
+    "sha256": "6b084a18cb72477daf9e4f19de5b78f8f29245c9d65e97fea36144fd237e680d"
   },
   {
     "file": "vendor/harness-web/progress-view.js",
@@ -117,7 +117,7 @@
   },
   {
     "file": "vendor/harness-web/progress.js",
-    "sha256": "293dd98687552f97a8462e1dbb03e02189cdf4ed97032b2afe730ef12dea393e"
+    "sha256": "84bb6a1b614f2a39d6ff90e77cc8458413ad24003fc4b62687ead84b02428e66"
   },
   {
     "file": "vendor/harness-web/usage.js",

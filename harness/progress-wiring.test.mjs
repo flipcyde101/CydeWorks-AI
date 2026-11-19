@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {loadBrowserAssets} from './browser-assets.mjs';
 import {renderTask} from './web-experience/views/task.js';
 import {describeProgress, progressAnnouncement} from './web/progress.js';
-import {progressUiState} from './web/progress-ui.js';
+import {progressUiState, progressAfterRead} from './web/progress-ui.js';
 import {progressUiState as experienceProgressUiState} from './web-experience/vendor/harness-web/progress-ui.js';
 import {announce} from './web-experience/ui/primitives.js';
 
@@ -47,6 +47,7 @@ test('a review sample recorded during a poll never announces ready from a stale 
   const fresh = progressUiState(task, then + 5000, 'connected').announcement;
   assert.doesNotMatch(stale, /ready for review/i);
   assert.match(fresh, /incomplete termination/i);
+  assert.equal(progressAfterRead(task, 'connected', () => then + 5000), fresh);
 });
 
 class TestNode {
