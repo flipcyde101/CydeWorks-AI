@@ -1,7 +1,7 @@
 [
   {
     "file": "app.js",
-    "sha256": "6d621750e96614c9679181299aaadcfe638bc84899648266d57eed72e12664e2"
+    "sha256": "db9209db69b8bd81f20a5540d598cdc35ef5431cb7d4a42ccc4c73c60de8d8ee"
   },
   {
     "file": "favicon.svg",
@@ -13,7 +13,7 @@
   },
   {
     "file": "adapters/contract.js",
-    "sha256": "a4ef6dfbbf14bdebac75cbb8d8ee7e401bf252e9d12b58a0986f788ed4ca114e"
+    "sha256": "808fca7d084c4ce67ca7951fbf990f92bf3a09b24c9b15e45047b164c93fcf23"
   },
   {
     "file": "adapters/http.js",

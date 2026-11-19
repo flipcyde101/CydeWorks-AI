@@ -78,6 +78,16 @@ export const viewStorageKeys = Object.freeze({
 });
 const viewToken = /^[a-f0-9]{32}$/;
 const storedOutcomes = new Set(['unconfirmed', 'confirmed', 'already']);
+function isSharedLock(value) {
+  return value === 'locked' || /^lock\.[a-f0-9]{32}$/.test(value ?? '');
+}
+function nextLockRevision() {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  let hex = '';
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
+  return 'lock.' + hex;
+}
 
 // One browser tab. The session store survives reload of this tab. The shared store
 // is visible to other tabs on this origin. The view id is never written there.
@@ -106,7 +116,7 @@ export function createTabAdmission({session, shared} = {}) {
     },
     promiseLock() {
       write(session, viewStorageKeys.localLock, 'unconfirmed');
-      write(shared, viewStorageKeys.sharedGeneration, 'locked');
+      write(shared, viewStorageKeys.sharedGeneration, nextLockRevision());
     },
     markSharedLocked() {
       const existing = read(session, viewStorageKeys.localLock);
@@ -115,7 +125,8 @@ export function createTabAdmission({session, shared} = {}) {
       const own = read(session, viewStorageKeys.viewGeneration);
       // A newer unlock has already published its generation. Do not replace it.
       if (viewToken.test(sharedValue ?? '') && sharedValue !== own) return;
-      write(shared, viewStorageKeys.sharedGeneration, 'locked');
+      if (isSharedLock(sharedValue)) return;
+      write(shared, viewStorageKeys.sharedGeneration, nextLockRevision());
     },
     noteLockOutcome(outcome) {
       if (!storedOutcomes.has(outcome)) return false;
@@ -133,12 +144,19 @@ export function createTabAdmission({session, shared} = {}) {
       write(session, viewStorageKeys.viewId, null);
       write(session, viewStorageKeys.viewGeneration, null);
     },
+    // A same-origin window with an opener can start from a copy of this store.
+    // That copy is not this document's admission. A reload has no opener.
+    bindDocument({opener = false} = {}) {
+      if (!opener) return false;
+      this.dropAdmission();
+      return true;
+    },
     mustConceal() {
       if (storageFailed || !session || !shared) return true;
       const local = read(session, viewStorageKeys.localLock);
       if (storageFailed || local) return true;
       const sharedValue = read(shared, viewStorageKeys.sharedGeneration);
-      if (storageFailed || sharedValue === 'locked') return true;
+      if (storageFailed || isSharedLock(sharedValue)) return true;
       const own = read(session, viewStorageKeys.viewGeneration);
       if (storageFailed) return true;
       return !!(sharedValue && sharedValue !== own);
@@ -161,7 +179,7 @@ export function createSharedLockWatch(admission) {
       if (next === seen) return false;
       seen = next;
       const own = admission.generation();
-      return next === 'locked' || (viewToken.test(next ?? '') && next !== own);
+      return isSharedLock(next) || (viewToken.test(next ?? '') && next !== own);
     },
   };
 }

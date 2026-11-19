@@ -40,19 +40,28 @@ function storedLockNotice(outcome) {
   return null;
 }
 const profile = (() => { try { return storage?.getItem(PROFILE_KEY) === 'first-use' ? 'first-use' : 'returning'; } catch { return 'returning'; } })();
-function takeDesktopTicket() {
-  const node = document.getElementById('bfe-desktop-view');
-  if (!node) return;
-  let ticket = null;
-  try { ticket = JSON.parse(node.textContent || ''); } catch { ticket = null; }
-  node.remove();
+function documentHasOpener() {
+  try { return !!globalThis.opener; } catch { return true; }
+}
+async function takeDesktopTicket() {
   if (mode.synthetic) return;
   const admission = experienceAdmission();
   if (admission.localLock() || admission.mayOpenWorkspace() || admission.mustConceal()) return;
-  admission.admit(ticket?.viewId, ticket?.viewGeneration);
+  let ticket = null;
+  try {
+    const response = await fetch('/api/desktop-view', {
+      method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'application/json'},
+      body: '{}', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+    });
+    if (!response.ok) return;
+    ticket = await response.json();
+  } catch { return; }
+  const again = experienceAdmission();
+  if (again.localLock() || again.mayOpenWorkspace() || again.mustConceal()) return;
+  again.admit(ticket?.viewId, ticket?.viewGeneration);
 }
 mode.adapter = readAdapterMode();
-takeDesktopTicket();
+if (!mode.synthetic) experienceAdmission().bindDocument({opener: documentHasOpener()});
 sharedWatch.observe();
 // The HTTP adapter talks to the workspace service that served this page. The demo adapter runs the
 // synthetic in-page workspace. Views behave the same on both; only labels differ.
@@ -344,17 +353,19 @@ const actions = {
   // workspace and dropped. It is never stored, logged or kept in state.
   unlock: file => act(async epoch => {
     state.unlockError = null;
+    const revision = mode.synthetic ? null : experienceAdmission().sharedGeneration();
     let key;
     if (!mode.synthetic) {
       if (!file) { state.unlockError = 'Choose the workspace access file first.'; return; }
       if (file.size > 1024) { state.unlockError = 'That file is too large to be a workspace access key. Nothing was sent.'; return; }
       try { key = (await file.text()).trim(); } catch { state.unlockError = 'The access file could not be read. Nothing was sent.'; return; }
     }
-    if (epoch !== state.sessionEpoch) return;
+    if (epoch !== state.sessionEpoch || (!mode.synthetic && experienceAdmission().sharedGeneration() !== revision)) return;
     let opened;
     try {
       opened = await adapter.unlock(key);
       fresh(epoch, opened);
+      if (!mode.synthetic && experienceAdmission().sharedGeneration() !== revision) return;
       if (!mode.synthetic) {
         if (!experienceAdmission().admit(opened?.viewId, opened?.viewGeneration)) {
           state.unlockError = 'Choose the workspace access file again.';
@@ -680,6 +691,8 @@ function concealForeignGeneration() {
 window.addEventListener('storage', event => { if (event.key === viewStorageKeys.sharedGeneration) concealForeignGeneration(); });
 window.addEventListener('pageshow', concealForeignGeneration);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') concealForeignGeneration(); });
+await takeDesktopTicket();
+sharedWatch.observe();
 state.session = await adapter.session().catch(() => state.session);
 {
   const stored = experienceAdmission().localLock();

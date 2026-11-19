@@ -16,7 +16,7 @@ let connection='connected', needsReconcile=false, explicitLock=null;
 let actionRevision=0;
 const sessionUi=createLegacySessionController();
 const sessionGate=sessionUi.gate;
-const accessAttempts=createAccessAttempt(sessionGate);
+const accessAttempts=createAccessAttempt(sessionGate,()=>admission.sharedGeneration());
 function browserStores() {
   let session=null, shared=null;
   try { session=sessionStorage; } catch { session=null; }
@@ -793,27 +793,31 @@ function concealForeignGeneration() {
   $('lock-workspace').hidden=true;
   setConnection({phase:'locked'});
 }
-function takeDesktopTicket() {
-  const node=document.getElementById('bfe-desktop-view');
-  if(!node) return;
+function documentHasOpener() {
+  try { return !!globalThis.opener; }
+  catch { return true; }
+}
+async function takeDesktopTicket() {
+  if(admission.localLock()||admission.mayOpenWorkspace()||admission.mustConceal()) return;
   let ticket=null;
-  try { ticket=JSON.parse(node.textContent||''); }
-  catch { ticket=null; }
-  node.remove();
+  try { ticket=await api('/api/desktop-view',{}); }
+  catch { return; }
   if(admission.localLock()||admission.mayOpenWorkspace()||admission.mustConceal()) return;
   admission.admit(ticket?.viewId, ticket?.viewGeneration);
 }
 function bootWorkspace() {
-  takeDesktopTicket();
-  sharedWatch.observe();
-  if(admission.mustConceal()||!admission.mayOpenWorkspace()) {
-    const stored=admission.localLock();
-    if(stored) holdConcealed(stored);
-    else if(admission.mustConceal()) holdConcealed('unconfirmed');
-    else { concealLocalSession(); $('lock-workspace').hidden=true; }
-    return;
-  }
-  void enter().catch(()=>{});
+  admission.bindDocument({opener:documentHasOpener()});
+  void takeDesktopTicket().then(()=>{
+    sharedWatch.observe();
+    if(admission.mustConceal()||!admission.mayOpenWorkspace()) {
+      const stored=admission.localLock();
+      if(stored) holdConcealed(stored);
+      else if(admission.mustConceal()) holdConcealed('unconfirmed');
+      else { concealLocalSession(); $('lock-workspace').hidden=true; }
+      return;
+    }
+    void enter().catch(()=>{});
+  });
 }
 bootWorkspace();
 window.addEventListener('pageshow',()=>{

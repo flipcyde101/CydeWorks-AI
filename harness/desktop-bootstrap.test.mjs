@@ -58,38 +58,49 @@ const documentHeaders={
   'Sec-Fetch-Site':'none',
   Accept:'text/html',
 };
-function ticketFrom(body) {
-  const marker='id="bfe-desktop-view">';
-  const start=body.indexOf(marker);
-  assert.ok(start>=0);
-  const jsonStart=start+marker.length;
-  const jsonEnd=body.indexOf('</script>', jsonStart);
-  return JSON.parse(body.slice(jsonStart, jsonEnd));
+function claimDesktop(origin, cookie) {
+  return rawHttp(origin,'/api/desktop-view',{method:'POST',body:{},headers:{
+    Origin:origin, Accept:'application/json', ...(cookie?{Cookie:cookie}:{}),
+  }});
 }
 
-test('desktop bootstrap admits only the first document view',{timeout:10000},async t=>{
+test('desktop bootstrap claims one launcher view after an unrelated navigation',{timeout:10000},async t=>{
   const {child, stdout}=desktopChild(t);
   const [ready]=await Promise.race([once(child,'message'),once(child,'exit').then(([code])=>{throw Error('Service exited '+code);})]);
   assert.equal(ready.type,'bfe-desktop-ready');
   assert.deepEqual(Object.keys(ready).sort(),['port','session','type']);
   assert.equal(Object.hasOwn(ready,'viewId'), false);
   const origin='http://127.0.0.1:'+ready.port;
+  const cookie='bfe_session='+ready.session;
   const probe=await rawHttp(origin,'/',{headers:{Accept:'text/html'}});
   assert.equal(probe.status, 200);
   assert.equal(probe.path, '/');
   assert.equal(probe.body.includes('bfe-desktop-view'), false);
-  const first=await rawHttp(origin,'/',{headers:documentHeaders});
-  assert.equal(first.path, '/');
-  assert.equal(first.body.includes('bfe-desktop-view'), true);
-  const ticket=ticketFrom(first.body);
+  const unrelated=await rawHttp(origin,'/',{headers:documentHeaders});
+  assert.equal(unrelated.path, '/');
+  assert.equal(unrelated.status, 200);
+  assert.equal(unrelated.body.includes('bfe-desktop-view'), false);
+  const withCookie=await rawHttp(origin,'/',{headers:{...documentHeaders, Cookie:cookie}});
+  assert.equal(withCookie.status, 200);
+  assert.equal(withCookie.body.includes('bfe-desktop-view'), false);
+  const stranger=await claimDesktop(origin);
+  assert.equal(stranger.status, 401);
+  assert.equal(stranger.headers['set-cookie'], undefined);
+  const claimed=await claimDesktop(origin, cookie);
+  assert.equal(claimed.path, '/api/desktop-view');
+  assert.equal(claimed.status, 200);
+  assert.equal(claimed.headers['set-cookie'], undefined);
+  const ticket=JSON.parse(claimed.body);
   assert.match(ticket.viewId,/^[a-f0-9]{32}$/);
   assert.match(ticket.viewGeneration,/^[a-f0-9]{32}$/);
-  assert.equal(first.path.includes(ticket.viewId), false);
-  assert.equal(first.body.split(ticket.viewId).length, 2);
-  const second=await rawHttp(origin,'/',{headers:documentHeaders});
-  assert.equal(second.body.includes('bfe-desktop-view'), false);
+  assert.equal(claimed.headers['x-view-generation'], ticket.viewGeneration);
+  assert.equal(unrelated.body.includes(ticket.viewId), false);
+  assert.equal(withCookie.body.includes(ticket.viewId), false);
+  assert.equal(probe.body.includes(ticket.viewId), false);
+  assert.equal(claimed.body.includes(ticket.viewId), true);
+  const second=await claimDesktop(origin, cookie);
+  assert.notEqual(second.status, 200);
   assert.equal(second.body.includes(ticket.viewId), false);
-  const cookie='bfe_session='+ready.session;
   const browser={'Sec-Fetch-Site':'same-origin','Sec-Fetch-Mode':'cors','Sec-Fetch-Dest':'empty',Cookie:cookie,Origin:origin,Accept:'application/json'};
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:browser})).status, 401);
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...browser,'X-Workspace-View':ticket.viewId}})).status, 200);
@@ -108,11 +119,16 @@ test('desktop bootstrap admits only the first document view',{timeout:10000},asy
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:{Cookie:cookie,Accept:'application/json'}})).status, 200);
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...navigation,'X-Workspace-View':ticket.viewId}})).status, 200);
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...browser,'X-Workspace-View':ticket.viewId}})).status, 200);
-  const stillSpent=await rawHttp(origin,'/',{headers:documentHeaders});
-  assert.equal(stillSpent.body.includes('bfe-desktop-view'), false);
+  const stillUnissued=await rawHttp(origin,'/',{headers:documentHeaders});
+  assert.equal(stillUnissued.body.includes('bfe-desktop-view'), false);
+  assert.equal(stillUnissued.body.includes(ticket.viewId), false);
   const locked=await rawHttp(origin,'/api/session/lock',{method:'POST',body:{},headers:{...browser,'X-Workspace-View':ticket.viewId}});
   assert.equal(locked.status, 200);
   assert.equal((await rawHttp(origin,'/api/tasks',{headers:{...browser,'X-Workspace-View':ticket.viewId}})).status, 401);
+  const afterLock=await claimDesktop(origin, cookie);
+  assert.notEqual(afterLock.status, 200);
+  assert.equal(afterLock.body.includes(ticket.viewId), false);
+  assert.equal(afterLock.headers['set-cookie'], undefined);
   const after=await rawHttp(origin,'/',{headers:documentHeaders});
   assert.equal(after.body.includes('bfe-desktop-view'), false);
   assert.equal(after.body.includes(ticket.viewId), false);
@@ -124,13 +140,17 @@ test('desktop bootstrap does not mint a view after lock',{timeout:10000},async t
   const {child, stdout}=desktopChild(t);
   const [ready]=await Promise.race([once(child,'message'),once(child,'exit').then(([code])=>{throw Error('Service exited '+code);})]);
   const origin='http://127.0.0.1:'+ready.port;
+  const cookie='bfe_session='+ready.session;
   const locked=await rawHttp(origin,'/api/session/lock',{method:'POST',body:{},headers:{
-    Origin:origin, Cookie:'bfe_session='+ready.session, Accept:'application/json',
+    Origin:origin, Cookie:cookie, Accept:'application/json',
   }});
   assert.equal(locked.status, 200);
   const page=await rawHttp(origin,'/',{headers:documentHeaders});
   assert.equal(page.path, '/');
   assert.equal(page.body.includes('bfe-desktop-view'), false);
+  const claim=await claimDesktop(origin, cookie);
+  assert.notEqual(claim.status, 200);
+  assert.equal(claim.headers['set-cookie'], undefined);
   const again=await rawHttp(origin,'/',{headers:documentHeaders});
   assert.equal(again.body.includes('bfe-desktop-view'), false);
   assert.doesNotMatch(stdout(), /bfe-desktop-view/);

@@ -50,40 +50,33 @@ if (database !== ':memory:') {
 if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
 let session=randomBytes(32).toString('hex');
 // Changes when the session ends. A view id is admitted by the unlock that
-// presented the access file, or once into the first desktop document. It is
-// not a cookie and not a URL, so another tab cannot inherit it.
+// presented the access file, or once by POST /api/desktop-view with the
+// launcher cookie. It is not a cookie and not a URL.
 let viewGeneration=randomBytes(16).toString('hex');
 const admittedViews=new Set();
 function rotateViewGeneration() {
   viewGeneration=randomBytes(16).toString('hex');
   admittedViews.clear();
 }
-// One desktop document can receive this view. A non-document GET does not take
-// it. Lock or idle before that document spends it and does not mint another.
+// One launcher claim can receive this view. A document navigation does not take
+// it. Lock or idle rotates the generation first, so a later claim is not
+// admitted and does not mint another view.
 let desktopViewTicket=null;
 if(process.env.BFE_DESKTOP_BOOTSTRAP==='1') {
   desktopViewTicket={viewId:randomBytes(16).toString('hex'),viewGeneration,delivered:false};
 }
-function desktopDocumentNavigation(req) {
-  const site=req.headers['sec-fetch-site'];
-  return req.headers['sec-fetch-dest']==='document'&&req.headers['sec-fetch-mode']==='navigate'&&(site==='none'||site==='same-origin');
-}
-function desktopDocumentBody(req, data) {
-  if(!desktopViewTicket||desktopViewTicket.delivered||!desktopDocumentNavigation(req)) return data;
+function claimDesktopView(res) {
   const ticket=desktopViewTicket;
-  const html=data.toString('utf8');
-  const marker='<body>';
-  const at=html.indexOf(marker);
+  if(!ticket||ticket.delivered) return null;
   const valid=/^[a-f0-9]{32}$/.test(ticket.viewId)&&/^[a-f0-9]{32}$/.test(ticket.viewGeneration);
   if(ticket.viewGeneration!==viewGeneration||!valid) {
     ticket.delivered=true;
-    return data;
+    return null;
   }
-  if(at<0) return data;
   ticket.delivered=true;
   admittedViews.add(ticket.viewId);
-  const payload=JSON.stringify({viewId:ticket.viewId,viewGeneration:ticket.viewGeneration});
-  return html.slice(0,at+marker.length)+'<script type="application/json" id="bfe-desktop-view">'+payload+'</script>'+html.slice(at+marker.length);
+  res.setHeader('X-View-Generation',viewGeneration);
+  return {viewId:ticket.viewId,viewGeneration:ticket.viewGeneration};
 }
 // Workspace inactivity deadline. This is not the 15-second terminal control lease.
 // Either clock moving backward ends the session. It does not extend the deadline.
@@ -336,11 +329,25 @@ const server=http.createServer(async (req,res) => {
     }
     if (req.method==='GET' && assets.has(path)) {
       const asset=assets.get(path);
-      const body=path==='/'?desktopDocumentBody(req, asset.data):asset.data;
       res.writeHead(200,{'Content-Type':asset.type+'; charset=utf-8'});
-      return res.end(body);
+      return res.end(asset.data);
     }
     if (req.method==='POST' && req.headers.origin !== origin) fail(403,'A same-origin approval is required.');
+    if (req.method==='POST' && path==='/api/desktop-view') {
+      await jsonBody(req);
+      const presented=presentedSessionValues(req.headers.cookie);
+      if(sessionIdle()) {
+        const matched=presented.some(value=>equal(value,session));
+        endWorkspaceSession();
+        if(desktopViewTicket) desktopViewTicket.delivered=true;
+        if(matched) res.setHeader('Set-Cookie','bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api');
+        fail(401,'Unlock this workspace with its local access.key file.');
+      }
+      if(!presented.some(value=>equal(value,session))) fail(401,'Unlock this workspace with its local access.key file.');
+      const claimed=claimDesktopView(res);
+      if(!claimed) fail(404,'The desktop view is not available.');
+      return send(200,claimed);
+    }
     if (req.method==='POST' && path==='/api/session') {
       const data=await jsonBody(req);
       if (!equal(data.key,key)) fail(401,'Choose this workspace’s access.key file.');

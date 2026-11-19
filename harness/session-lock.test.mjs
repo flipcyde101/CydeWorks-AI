@@ -537,8 +537,11 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(foreign,/if\(wasLocked\)return/);
   assert.match(foreign,/advance:false/);
   const boot=app.slice(app.indexOf('function bootWorkspace'), app.indexOf('\nbootWorkspace();'));
+  assert.ok(boot.indexOf('bindDocument(')>=0&&boot.indexOf('bindDocument(')<boot.indexOf('takeDesktopTicket()'));
   assert.ok(boot.indexOf('takeDesktopTicket()')>=0&&boot.indexOf('takeDesktopTicket()')<boot.indexOf('mayOpenWorkspace'));
-  assert.match(app,/bfe-desktop-view/);
+  assert.match(app,/\/api\/desktop-view/);
+  assert.match(app,/bindDocument\(\{opener:documentHasOpener\(\)\}\)/);
+  assert.match(app,/createAccessAttempt\(sessionGate,\(\)=>admission\.sharedGeneration\(\)\)/);
   assert.match(app,/createSharedLockWatch\(admission\)/);
   const localLock=app.slice(app.indexOf('onLocalLock()'), app.indexOf('onOutcome'));
   assert.ok(localLock.indexOf('admission.promiseLock()')<localLock.indexOf('sharedWatch.observe()'));
@@ -552,7 +555,13 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(experience,/state\.sessionEpoch !== epoch \|\| state\.session\.unlocked/);
   const unlock=experience.slice(experience.indexOf('unlock: file'),experience.indexOf('lock() {'));
   assert.ok(unlock.indexOf('epoch !== state.sessionEpoch')>=0);
+  assert.ok(unlock.indexOf('const revision')>=0&&unlock.indexOf('const revision')<unlock.indexOf('await file.text()'));
   assert.ok(unlock.indexOf('epoch !== state.sessionEpoch')<unlock.indexOf('adapter.unlock'));
+  const beforeUnlock=unlock.indexOf('sharedGeneration() !== revision');
+  const unlockAt=unlock.indexOf('adapter.unlock');
+  assert.ok(beforeUnlock>=0&&beforeUnlock<unlockAt);
+  const afterUnlock=unlock.indexOf('sharedGeneration() !== revision', unlockAt);
+  assert.ok(afterUnlock>unlockAt&&afterUnlock<unlock.indexOf('.admit('));
   assert.match(experience,/addEventListener\('storage'/);
   assert.match(experience,/pageshow/);
   assert.match(experience,/viewStorageKeys\.sharedGeneration/);
@@ -561,9 +570,12 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   assert.match(foreignExperience,/state\.sessionEpoch = \(state\.sessionEpoch \?\? 0\) \+ 1/);
   assert.doesNotMatch(foreignExperience,/if \(!state\.session\.unlocked \|\|/);
   const ticketCall=experience.indexOf('takeDesktopTicket();');
-  assert.ok(experience.indexOf('mode.adapter = readAdapterMode();')<ticketCall);
+  const bindCall=experience.indexOf('bindDocument({opener: documentHasOpener()})');
+  assert.ok(experience.indexOf('mode.adapter = readAdapterMode();')<bindCall);
+  assert.ok(bindCall<ticketCall);
   assert.ok(ticketCall<experience.indexOf('state.session = await adapter.session()'));
-  assert.match(experience,/bfe-desktop-view/);
+  assert.match(experience,/\/api\/desktop-view/);
+  assert.match(experience,/bindDocument\(\{opener: documentHasOpener\(\)\}\)/);
   assert.match(experience,/experienceAdmission\(\)\.sharedGeneration\(\)/);
   const conceal=experience.slice(experience.indexOf('function concealSession'), experience.indexOf('function observedAdapter'));
   assert.ok(conceal.indexOf('admission.promiseLock()')<conceal.indexOf('sharedWatch.observe()'));
@@ -574,16 +586,21 @@ test('legacy lock stays hidden until the workspace opens and continuations check
   const server=await readFile(new URL('./server.mjs',import.meta.url),'utf8');
   assert.match(server,/admittedViews/);
   assert.match(server,/fetchSite!==undefined\|\|presentedView!==undefined/);
-  assert.match(server,/site==='none'\|\|site==='same-origin'/);
   assert.doesNotMatch(server,/sec-fetch-site'\]==='same-origin'/);
   assert.match(server,/must not\s+rotate the session or expire the cookie/);
-  assert.match(server,/sec-fetch-dest'\]==='document'/);
-  assert.match(server,/sec-fetch-mode'\]==='navigate'/);
-  assert.match(server,/id="bfe-desktop-view"/);
-  const deliver=server.slice(server.indexOf('function desktopDocumentBody'), server.indexOf('const sessionIdleMs'));
+  assert.match(server,/path==='\/api\/desktop-view'/);
+  assert.doesNotMatch(server,/id="bfe-desktop-view"/);
+  const deliver=server.slice(server.indexOf('function claimDesktopView'), server.indexOf('const sessionIdleMs'));
   assert.ok(deliver.indexOf('ticket.delivered=true')<deliver.indexOf('admittedViews.add(ticket.viewId)'));
   assert.match(server,/type:'bfe-desktop-ready',port:server\.address\(\)\.port,session\}/);
   assert.doesNotMatch(server,/desktopSend\(\{type:'bfe-desktop-ready'[^}]*viewId/);
+  const admissionSource=await readFile(new URL('./web/workspace-lock.js',import.meta.url),'utf8');
+  const experienceAdmissionSource=await readFile(new URL('./web-experience/adapters/contract.js',import.meta.url),'utf8');
+  for(const source of [admissionSource, experienceAdmissionSource]) {
+    assert.match(source,/nextLockRevision\(\)/);
+    assert.match(source,/bindDocument/);
+  }
+  assert.match(admissionSource,/readShared\(\)===revision/);
 });
 
 test('a backward session clock ends the workspace session',{timeout:15000},async t=>{
@@ -931,7 +948,7 @@ test('an unconfirmed lock survives reload and the other view does not inherit th
     assert.equal(second.mayOpenWorkspace(), true);
     first.promiseLock();
     assert.equal(first.localLock(), 'unconfirmed');
-    assert.equal(shared.getItem('bfe-shared-generation'), 'locked');
+    assert.match(shared.getItem('bfe-shared-generation'), /^lock\.[a-f0-9]{32}$/);
     assert.equal(first.mustConceal(), true);
     assert.equal(second.mustConceal(), true);
     const reloaded=create({session:sessionA, shared});
@@ -1109,6 +1126,124 @@ test('a concealed view drops an in-flight unlock when another view locks',async(
     assert.equal(admitted, false);
     assert.equal(entered, 0);
     assert.equal(reader.viewId(), 'b'.repeat(32));
+  }
+});
+
+test('a copied session store does not keep the opener document view',()=>{
+  function cloneStore(source) {
+    const copy=memoryStore();
+    for(const key of ['bfe-view-id','bfe-view-generation','bfe-local-lock']) {
+      const value=source.getItem(key);
+      if(value!=null) copy.setItem(key, value);
+    }
+    return copy;
+  }
+  for(const create of [createTabAdmission, createExperienceAdmission]) {
+    const shared=memoryStore(), session=memoryStore();
+    const original=create({session, shared});
+    assert.equal(original.admit('a'.repeat(32), '1'.repeat(32)), true);
+    assert.equal(original.mayOpenWorkspace(), true);
+    assert.equal(original.header(), 'a'.repeat(32));
+    const copy=create({session:cloneStore(session), shared});
+    assert.equal(copy.bindDocument({opener:true}), true);
+    assert.equal(copy.viewId(), null);
+    assert.equal(copy.generation(), null);
+    assert.equal(copy.mayOpenWorkspace(), false);
+    assert.equal(copy.mustConceal(), true);
+    assert.equal(copy.header(), '');
+    assert.equal(original.mayOpenWorkspace(), true);
+    assert.equal(original.viewId(), 'a'.repeat(32));
+    assert.equal(original.header(), 'a'.repeat(32));
+    const reloaded=create({session, shared});
+    assert.equal(reloaded.bindDocument({opener:false}), false);
+    assert.equal(reloaded.mayOpenWorkspace(), true);
+    assert.equal(reloaded.viewId(), 'a'.repeat(32));
+    const lockedCopy=create({session:cloneStore(session), shared});
+    lockedCopy.noteLockOutcome('unconfirmed');
+    assert.equal(lockedCopy.bindDocument({opener:true}), true);
+    assert.equal(lockedCopy.localLock(), 'unconfirmed');
+    assert.equal(lockedCopy.viewId(), null);
+    assert.equal(lockedCopy.mayOpenWorkspace(), false);
+    assert.equal(original.viewId(), 'a'.repeat(32));
+    assert.equal(original.localLock(), null);
+  }
+});
+
+test('a foreign lock revision drops a continuation before the storage callback',async()=>{
+  const interfaces=[
+    {create:createTabAdmission, watch:createSharedLockWatch, respond:respondToSharedGeneration},
+    {create:createExperienceAdmission, watch:createExperienceLockWatch, respond:respondToExperienceGeneration},
+  ];
+  for(const face of interfaces) {
+    const generation='1'.repeat(32);
+    const shared=memoryStore();
+    const writer=face.create({session:memoryStore(), shared});
+    const reader=face.create({session:memoryStore(), shared});
+    assert.equal(writer.admit('a'.repeat(32), generation), true);
+    assert.equal(reader.admit('b'.repeat(32), generation), true);
+    const readerWatch=face.watch(reader);
+    const writerWatch=face.watch(writer);
+    readerWatch.observe();
+    writerWatch.observe();
+    const gate=createSessionEpoch();
+    gate.conceal();
+    const before=gate.epoch();
+    const attempts=createAccessAttempt(gate, ()=>reader.sharedGeneration());
+    const attempt=attempts.begin();
+    assert.equal(attempt.current(), true);
+    let posts=0;
+    const text=deferred();
+    const pending=(async()=>{
+      const key=await text.promise;
+      if(!attempt.current()) return 'dropped';
+      posts+=1;
+      return key;
+    })();
+    const previous=shared.getItem('bfe-shared-generation');
+    writer.promiseLock();
+    writerWatch.observe();
+    const revision=shared.getItem('bfe-shared-generation');
+    assert.match(revision, /^lock\.[a-f0-9]{32}$/);
+    assert.notEqual(revision, previous);
+    assert.equal(gate.epoch(), before);
+    text.release('access-key');
+    assert.equal(await pending, 'dropped');
+    assert.equal(posts, 0);
+    assert.equal(attempt.current(), false);
+    assert.equal(gate.epoch(), before);
+    assert.equal(face.respond(readerWatch, gate), true);
+    const moved=gate.epoch();
+    assert.notEqual(moved, before);
+    assert.equal(face.respond(readerWatch, gate), false);
+    assert.equal(gate.epoch(), moved);
+    const again=attempts.begin();
+    assert.equal(again.current(), true);
+    const response=deferred();
+    let admitted=false;
+    const inflight=(async()=>{
+      if(!again.current()) return 'dropped-before';
+      posts+=1;
+      const opened=await response.promise;
+      if(!again.current()) return 'dropped-after';
+      admitted=reader.admit(opened.viewId, opened.viewGeneration)===true;
+      return 'opened';
+    })();
+    assert.equal(posts, 1);
+    const firstRevision=shared.getItem('bfe-shared-generation');
+    writer.promiseLock();
+    const secondRevision=shared.getItem('bfe-shared-generation');
+    assert.match(secondRevision, /^lock\.[a-f0-9]{32}$/);
+    assert.notEqual(secondRevision, firstRevision);
+    assert.equal(gate.epoch(), moved);
+    response.release({viewId:'d'.repeat(32), viewGeneration:'3'.repeat(32)});
+    assert.equal(await inflight, 'dropped-after');
+    assert.equal(admitted, false);
+    assert.equal(posts, 1);
+    assert.equal(reader.viewId(), 'b'.repeat(32));
+    assert.equal(shared.getItem('bfe-shared-generation'), secondRevision);
+    assert.equal(gate.epoch(), moved);
+    assert.equal(face.respond(readerWatch, gate), true);
+    assert.notEqual(gate.epoch(), moved);
   }
 });
 
