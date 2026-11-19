@@ -11,6 +11,8 @@ import {createInferenceBroker} from '../../harness/inference-broker.mjs';
 import {createLlamaCpp} from '../../harness/llamacpp.mjs';
 import {createStepReceipt} from '../../harness/opencode-usage.mjs';
 
+export {claimRun, reconcileClaim, runOwned, bindCheckedPatch} from './runner-lifecycle.mjs';
+
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
 const REPO = join(ROOT, 'fixture-repo');
 const FILES = ['limits.py', 'measurement.py'];
@@ -172,6 +174,8 @@ async function generate(broker, original, fileDigests, signal, report) {
 }
 
 async function run() {
+  throw Error('Pilot execution disabled: Windows-to-WSL ownership and protected verifier qualification required.');
+
   const clock = performance.now();
   let completed = 0;
   const report = text => console.log(`[${completed}/5 complete, ${Math.round((performance.now() - clock) / 1000)}s elapsed] ${text}`);
@@ -251,3 +255,4 @@ async function run() {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   await run().catch(error => { console.error(error.message); process.exitCode = 1; });
 }
+
