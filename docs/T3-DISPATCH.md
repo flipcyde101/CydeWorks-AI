@@ -19,3 +19,13 @@ The coordinator handles recovery. The worker reports the exact error and preserv
 4. Independent reviews use Codex GPT-6.2 Sol High only. Hold the review when that route is unavailable. Build authorization does not permit a reviewer substitution. Preserve any scope, safety, approval and integration gates on the task.
 
 This workflow controls the coordinator's dispatches. T3's manual model picker and other users' queues are outside its scope. The coordinator must apply the checks before every supervised submission.
+
+## During a workwave
+
+Keep a bounded supervision pass open until every assigned writer is terminal, its stated time limit is reached, or an actual blocker requires the owner. A single completed writer is a handoff to inspect, not a reason to stop monitoring the other writers. Record the outcome and preserve each worktree's owner while work remains active.
+
+When an actual provider error establishes a quota or billing hold, inspect already submitted and queued work for that route. Use T3's supported queue cancellation only for messages that have not started; do not interrupt an active writer merely to change models. Once the failed writer is terminal, preserve its worktree and assign at most one successor on a verified included route. If the reported reset has passed, that is a reason for one supervised real-work attempt, not proof that quota has returned.
+
+Cursor documents its included weekly pool as shared with Grok for the applicable plans. Treat matching Cursor and Grok balances as a possible shared reserve, not independent capacity, and check actual route outcomes. Cursor's third-party models can require prepaid usage even when the model appears in T3's catalog. Do not select such a route as included without account-specific evidence. See [Cursor models and pricing](https://cursor.com/docs/models-and-pricing).
+
+These are coordinator operating rules, not a verified automatic quota watcher or a guarantee that T3 exposes real-time allowance for every model. Record actual provider outcomes and use supported queue controls; do not report instruction-based monitoring as automatic failover.
