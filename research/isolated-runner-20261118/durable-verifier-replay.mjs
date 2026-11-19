@@ -50,13 +50,40 @@ import {
  *   arguments and unknown options are rejected.
  *
  * What is stored
- *   Per record: sha256 digest of the nonce (domain separated), claim id,
- *   scope hash, state, and a sha256 row checksum. No HMAC keys, raw nonces,
- *   evidence, file digests, paths or diagnostics are stored. The checksum
- *   detects accidental corruption and naive edits only. It is not a MAC: a
- *   writer with file access can forge rows, so file protection is the host's
- *   job. Use high-entropy nonces; an unsalted digest of a guessable nonce can
- *   be brute forced.
+ *   Per record: an insertion sequence number, a sha256 digest of the nonce
+ *   (domain separated), claim id, scope hash, state, and a sha256 row
+ *   checksum over all of those fields. The meta table holds the record count
+ *   and the head of a sha256 chain over every record's immutable fields
+ *   (sequence, nonce digest, claim id, scope hash) in sequence order. No HMAC
+ *   keys, raw nonces, evidence, file digests, paths or diagnostics are
+ *   stored. Use high-entropy nonces; an unsalted digest of a guessable nonce
+ *   can be brute forced.
+ *
+ * Integrity check (unkeyed; consistency only, not tamper protection)
+ *   Every admission, state transition and inspection first validates the
+ *   WHOLE store inside the same SQLite transaction that then reads or writes
+ *   (BEGIN IMMEDIATE for writes, a read transaction for inspection; open also
+ *   validates). Any failure makes the store unusable (STORE_CORRUPT); no
+ *   reservation is made against a store that fails validation. Checked:
+ *   exact schema, format, scope, count, every row's field shapes and row
+ *   checksum, sequence numbers exactly 1..count with no gaps or duplicates,
+ *   unique nonce digests, and the recomputed chain head equal to the stored
+ *   head.
+ *   This detects, for edits that do not also recompute the checksums:
+ *   a changed nonce digest or other field in any row (including rows other
+ *   than the one being admitted), a changed state, a deleted row anywhere
+ *   (count, sequence gap or chain mismatch), an inserted or reordered row,
+ *   and a changed count or chain head. It also detects partial or torn
+ *   damage that SQLite's own quick_check reports.
+ *   It CANNOT detect: anyone who recomputes the checksums (the algorithm is
+ *   public and unkeyed, so a writer with file access can rewrite rows, count
+ *   and head consistently, including deleting the newest rows); a state change
+ *   that is consistently re-checksummed (the chain covers only immutable
+ *   fields); rollback to an older consistent copy of the whole file;
+ *   power-loss or disk-cache loss of an acknowledged commit; or deletion of
+ *   the whole store (which fails closed as unavailable only if the host
+ *   opens with create:false). Protection against all of these is the trusted
+ *   host's job (file ownership, ACLs, storage durability, backup discipline).
  *
  * What the trusted host must provide and protect
  *   - An absolute path on a local, non-network volume, in a directory that
@@ -68,6 +95,8 @@ import {
  *   - Backup and restore discipline: restoring an older copy of the store
  *     re-opens nonces settled after that copy. Hosts must never restore or
  *     replace the store while nonces issued after the copy could be replayed.
+ *   - A corrupt store must be investigated, not repaired or recreated
+ *     automatically; recreating it forgets every settled nonce.
  *   - Process isolation: the store handle and controllers stay in host
  *     memory. Nothing here is safe to expose to untrusted code.
  *
@@ -78,29 +107,37 @@ import {
  *   apply step). A crash between commit here and a later host side effect
  *   must be reconciled by the host. Tests use throwaway databases only.
  *
+ * Bounds
+ *   At most MAX_RECORDS records and MAX_STORE_BYTES bytes. Full validation is
+ *   linear in the record count and runs on every operation; that cost is the
+ *   price of checking every row in the admitting transaction.
+ *
  * Errors are ReplayGuardError with a fixed code and fixed message. They never
  * include nonces, keys, paths, claim ids, evidence, or SQLite text.
  */
 
-export const REPLAY_STORE_FORMAT = 'durable-verifier-replay-v1';
+export const REPLAY_STORE_FORMAT = 'durable-verifier-replay-v2';
 export const REPLAY_STORE_SCOPE = `${VERIFIER_SCOPE}|${VERIFIER_VERSION}`;
 
 const APPLICATION_ID = 0x44565250; // "DVRP"
-const USER_VERSION = 1;
-const MAX_STORE_BYTES = 64 * 1024 * 1024;
-const MAX_RECORDS = 65536;
+const USER_VERSION = 2;
+const MAX_STORE_BYTES = 16 * 1024 * 1024;
+const MAX_RECORDS = 16384;
 const DEFAULT_BUSY_TIMEOUT_MS = 2000;
 const MAX_BUSY_TIMEOUT_MS = 10000;
 
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
 const CLAIM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const NONCE_RE = /^[A-Za-z0-9._-]{16,128}$/;
+const COUNT_RE = /^(?:0|[1-9][0-9]{0,5})$/;
 const STATES = new Set(['pending', 'committed', 'rejected']);
 const OPEN_OPTION_KEYS = new Set(['path', 'create', 'busyTimeoutMs']);
+const META_KEYS = Object.freeze(['count', 'format', 'head', 'scope']);
 
 const SQL_META = "CREATE TABLE replay_meta (k TEXT PRIMARY KEY NOT NULL, v TEXT NOT NULL) STRICT, WITHOUT ROWID";
 const SQL_RECORDS = "CREATE TABLE replay_records (" +
   "nonce_digest TEXT PRIMARY KEY NOT NULL CHECK (length(nonce_digest) = 64), " +
+  "seq INTEGER NOT NULL UNIQUE CHECK (seq >= 1), " +
   "claim_id TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 128), " +
   "scope_hash TEXT NOT NULL CHECK (length(scope_hash) = 64), " +
   "state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rejected')), " +
@@ -156,8 +193,14 @@ function nonceDigest(nonce) {
   return sha256Hex(`${REPLAY_STORE_FORMAT}\0nonce\0${nonce}`);
 }
 
-function rowDigest(digest, claimId, scopeHash, state) {
-  return sha256Hex(`${REPLAY_STORE_FORMAT}\0row\0${digest}\0${claimId}\0${scopeHash}\0${state}`);
+function rowDigest(seq, digest, claimId, scopeHash, state) {
+  return sha256Hex(`${REPLAY_STORE_FORMAT}\0row\0${seq}\0${digest}\0${claimId}\0${scopeHash}\0${state}`);
+}
+
+const GENESIS_HEAD = sha256Hex(`${REPLAY_STORE_FORMAT}\0genesis\0${REPLAY_STORE_SCOPE}`);
+
+function chainLink(head, seq, digest, claimId, scopeHash) {
+  return sha256Hex(`${REPLAY_STORE_FORMAT}\0link\0${head}\0${seq}\0${digest}\0${claimId}\0${scopeHash}`);
 }
 
 function sqliteCode(error) {
@@ -189,10 +232,10 @@ function safeRollback(db) {
   }
 }
 
-// Runs fn inside BEGIN IMMEDIATE. A failed COMMIT is uncertain, never success.
-function immediate(db, fn) {
+// Runs fn inside one transaction. A failed COMMIT is uncertain, never success.
+function transaction(db, begin, fn) {
   try {
-    db.exec('BEGIN IMMEDIATE');
+    db.exec(begin);
   } catch (error) {
     throw mapError(error);
   }
@@ -211,6 +254,9 @@ function immediate(db, fn) {
   }
   return result;
 }
+
+const immediate = (db, fn) => transaction(db, 'BEGIN IMMEDIATE', fn);
+const snapshot = (db, fn) => transaction(db, 'BEGIN DEFERRED', fn);
 
 function pragmaValue(db, name) {
   const row = db.prepare(`PRAGMA ${name}`).get();
@@ -235,14 +281,16 @@ function initializeStore(db) {
     db.exec(SQL_META);
     db.exec(SQL_RECORDS);
     const insert = db.prepare('INSERT INTO replay_meta (k, v) VALUES (?, ?)');
+    insert.run('count', '0');
     insert.run('format', REPLAY_STORE_FORMAT);
+    insert.run('head', GENESIS_HEAD);
     insert.run('scope', REPLAY_STORE_SCOPE);
     db.exec(`PRAGMA application_id = ${APPLICATION_ID}`);
     db.exec(`PRAGMA user_version = ${USER_VERSION}`);
   });
 }
 
-function verifyStore(db) {
+function verifyStructure(db) {
   if (pragmaValue(db, 'journal_mode') !== 'delete') throw fail('STORE_CORRUPT');
   if (pragmaValue(db, 'application_id') !== APPLICATION_ID || pragmaValue(db, 'user_version') !== USER_VERSION) {
     throw fail('STORE_CORRUPT');
@@ -258,18 +306,63 @@ function verifyStore(db) {
       seen.add(row.name);
     } else if (row.type === 'index' && row.sql === null && EXPECTED_TABLES.has(row.tbl_name) &&
                typeof row.name === 'string' && row.name.startsWith(`sqlite_autoindex_${row.tbl_name}_`)) {
-      // Implicit primary key index; created by SQLite, not by a caller.
+      // Implicit primary key or UNIQUE index; created by SQLite, not by a caller.
     } else {
       throw fail('STORE_CORRUPT');
     }
   }
   if (seen.size !== EXPECTED_TABLES.size) throw fail('STORE_CORRUPT');
-  const meta = db.prepare('SELECT k, v FROM replay_meta ORDER BY k').all();
-  if (meta.length !== 2 || meta[0].k !== 'format' || meta[1].k !== 'scope' ||
-      meta[0].v !== REPLAY_STORE_FORMAT) {
+}
+
+function readMeta(db) {
+  const rows = db.prepare('SELECT k, v FROM replay_meta ORDER BY k').all();
+  if (rows.length !== META_KEYS.length) throw fail('STORE_CORRUPT');
+  const meta = {};
+  rows.forEach((row, index) => {
+    if (!isPlainObj(row) || row.k !== META_KEYS[index] || typeof row.v !== 'string') throw fail('STORE_CORRUPT');
+    meta[row.k] = row.v;
+  });
+  if (meta.format !== REPLAY_STORE_FORMAT || !COUNT_RE.test(meta.count) || !HEX_SHA256_RE.test(meta.head)) {
     throw fail('STORE_CORRUPT');
   }
-  if (meta[1].v !== REPLAY_STORE_SCOPE) throw fail('STORE_SCOPE_MISMATCH');
+  if (meta.scope !== REPLAY_STORE_SCOPE) throw fail('STORE_SCOPE_MISMATCH');
+  const count = Number(meta.count);
+  if (count > MAX_RECORDS) throw fail('STORE_CORRUPT');
+  return {count, head: meta.head};
+}
+
+// Validates every record, the count and the chain head. Must run inside the
+// same transaction as any decision based on its result.
+function loadLedger(db) {
+  checkSize(db);
+  const meta = readMeta(db);
+  const rows = db.prepare(
+    'SELECT seq, nonce_digest, claim_id, scope_hash, state, row_digest FROM replay_records ORDER BY seq LIMIT ?',
+  ).all(MAX_RECORDS + 1);
+  if (rows.length !== meta.count) throw fail('STORE_CORRUPT');
+  const records = new Map();
+  let head = GENESIS_HEAD;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const seq = index + 1;
+    if (!isPlainObj(row) || row.seq !== seq || typeof row.nonce_digest !== 'string' ||
+        !HEX_SHA256_RE.test(row.nonce_digest) || records.has(row.nonce_digest) ||
+        typeof row.claim_id !== 'string' || !CLAIM_ID_RE.test(row.claim_id) ||
+        typeof row.scope_hash !== 'string' || !HEX_SHA256_RE.test(row.scope_hash) ||
+        !STATES.has(row.state) || typeof row.row_digest !== 'string' ||
+        row.row_digest !== rowDigest(seq, row.nonce_digest, row.claim_id, row.scope_hash, row.state)) {
+      throw fail('STORE_CORRUPT');
+    }
+    head = chainLink(head, seq, row.nonce_digest, row.claim_id, row.scope_hash);
+    records.set(row.nonce_digest, {seq, claimId: row.claim_id, scopeHash: row.scope_hash, state: row.state});
+  }
+  if (head !== meta.head) throw fail('STORE_CORRUPT');
+  return {count: meta.count, head, records};
+}
+
+function setMeta(db, key, value) {
+  const change = db.prepare('UPDATE replay_meta SET v = ? WHERE k = ?').run(value, key);
+  if (Number(change.changes) !== 1) throw fail('STORE_CORRUPT');
 }
 
 /**
@@ -321,7 +414,10 @@ export function openReplayStore(options) {
     db.exec('PRAGMA trusted_schema = OFF');
     db.exec('PRAGMA cell_size_check = ON');
     if (create) initializeStore(db);
-    verifyStore(db);
+    snapshot(db, () => {
+      verifyStructure(db);
+      loadLedger(db);
+    });
   } catch (error) {
     try {
       db.close();
@@ -352,22 +448,6 @@ function requireStore(store) {
   return state.db;
 }
 
-function readRecord(db, digest) {
-  const rows = db.prepare(
-    'SELECT nonce_digest, claim_id, scope_hash, state, row_digest FROM replay_records WHERE nonce_digest = ?',
-  ).all(digest);
-  if (rows.length === 0) return null;
-  if (rows.length !== 1) throw fail('STORE_CORRUPT');
-  const row = rows[0];
-  if (!isPlainObj(row) || row.nonce_digest !== digest || typeof row.claim_id !== 'string' ||
-      !CLAIM_ID_RE.test(row.claim_id) || typeof row.scope_hash !== 'string' || !HEX_SHA256_RE.test(row.scope_hash) ||
-      !STATES.has(row.state) || typeof row.row_digest !== 'string' ||
-      row.row_digest !== rowDigest(digest, row.claim_id, row.scope_hash, row.state)) {
-    throw fail('STORE_CORRUPT');
-  }
-  return {claimId: row.claim_id, scopeHash: row.scope_hash, state: row.state};
-}
-
 // Reads only the host-held binding fields. Genuineness is checked separately.
 function controllerBinding(controller) {
   const nonce = controller?.expectedInvocationNonce;
@@ -387,33 +467,30 @@ function refuseExisting(record, binding) {
 
 function transition(db, binding, target) {
   immediate(db, () => {
-    const record = readRecord(db, binding.digest);
+    const {records} = loadLedger(db);
+    const record = records.get(binding.digest);
     if (!record) throw fail('STORE_CORRUPT');
     if (record.claimId !== binding.claimId || record.scopeHash !== binding.scopeHash) throw fail('CLAIM_MISMATCH');
     if (record.state !== 'pending') throw fail('STORE_CORRUPT');
-    const before = rowDigest(binding.digest, binding.claimId, binding.scopeHash, 'pending');
-    const after = rowDigest(binding.digest, binding.claimId, binding.scopeHash, target);
+    const before = rowDigest(record.seq, binding.digest, binding.claimId, binding.scopeHash, 'pending');
+    const after = rowDigest(record.seq, binding.digest, binding.claimId, binding.scopeHash, target);
     const change = db.prepare(
-      "UPDATE replay_records SET state = ?, row_digest = ? WHERE nonce_digest = ? AND state = 'pending' AND row_digest = ?",
-    ).run(target, after, binding.digest, before);
+      "UPDATE replay_records SET state = ?, row_digest = ? " +
+      "WHERE nonce_digest = ? AND seq = ? AND state = 'pending' AND row_digest = ?",
+    ).run(target, after, binding.digest, record.seq, before);
     if (Number(change.changes) !== 1) throw fail('STORE_CORRUPT');
   });
 }
 
 /**
  * Returns 'absent', 'pending', 'committed' or 'rejected' for the controller's
- * nonce. Read-only and grants no authority.
+ * nonce. Read-only, validates the whole store, and grants no authority.
  */
 export function inspectReplayRecord(store, controller) {
   if (arguments.length !== 2) throw fail('STORE_CONFIG');
   const db = requireStore(store);
   const binding = controllerBinding(controller);
-  let record;
-  try {
-    record = readRecord(db, binding.digest);
-  } catch (error) {
-    throw mapError(error);
-  }
+  const record = snapshot(db, () => loadLedger(db).records.get(binding.digest));
   if (!record) return 'absent';
   if (record.claimId !== binding.claimId || record.scopeHash !== binding.scopeHash) throw fail('CLAIM_MISMATCH');
   return record.state;
@@ -435,15 +512,18 @@ export function beginDurableAcceptance(store, controller) {
   // From here on the in-memory controller stays pending unless commit succeeds.
   const binding = controllerBinding(controller);
   immediate(db, () => {
-    checkSize(db);
-    const record = readRecord(db, binding.digest);
+    const ledger = loadLedger(db);
+    const record = ledger.records.get(binding.digest);
     if (record) refuseExisting(record, binding);
-    const count = db.prepare('SELECT count(*) AS n FROM replay_records').get();
-    if (!isPlainObj(count) || typeof count.n !== 'number' || count.n >= MAX_RECORDS) throw fail('STORE_FULL');
+    if (ledger.count >= MAX_RECORDS) throw fail('STORE_FULL');
+    const seq = ledger.count + 1;
     db.prepare(
-      "INSERT INTO replay_records (nonce_digest, claim_id, scope_hash, state, row_digest) VALUES (?, ?, ?, 'pending', ?)",
-    ).run(binding.digest, binding.claimId, binding.scopeHash,
-      rowDigest(binding.digest, binding.claimId, binding.scopeHash, 'pending'));
+      "INSERT INTO replay_records (nonce_digest, seq, claim_id, scope_hash, state, row_digest) " +
+      "VALUES (?, ?, ?, ?, 'pending', ?)",
+    ).run(binding.digest, seq, binding.claimId, binding.scopeHash,
+      rowDigest(seq, binding.digest, binding.claimId, binding.scopeHash, 'pending'));
+    setMeta(db, 'count', String(seq));
+    setMeta(db, 'head', chainLink(ledger.head, seq, binding.digest, binding.claimId, binding.scopeHash));
   });
 
   let state = 'reserved';

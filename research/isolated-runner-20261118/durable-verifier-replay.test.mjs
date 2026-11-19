@@ -23,6 +23,8 @@ import {
   inspectReplayRecord,
   openReplayStore,
   REPLAY_ERROR_MESSAGES,
+  REPLAY_STORE_FORMAT,
+  REPLAY_STORE_SCOPE,
   ReplayGuardError,
 } from './durable-verifier-replay.mjs';
 
@@ -99,6 +101,64 @@ function rawDb(dbPath) {
   return new DatabaseSync(dbPath);
 }
 
+function rawExec(dbPath, sql, ...params) {
+  const db = rawDb(dbPath);
+  try {
+    if (params.length === 0) db.exec(sql);
+    else db.prepare(sql).run(...params);
+  } finally {
+    db.close();
+  }
+}
+
+// Mirrors the published, unkeyed checksum formulas so tests can model a
+// writer that recomputes row checksums. Recomputing is possible by design.
+const sha = text => createHash('sha256').update(text, 'utf8').digest('hex');
+const testRowDigest = (seq, digest, claimId, scopeHash, state) =>
+  sha(`${REPLAY_STORE_FORMAT}\0row\0${seq}\0${digest}\0${claimId}\0${scopeHash}\0${state}`);
+const testGenesis = () => sha(`${REPLAY_STORE_FORMAT}\0genesis\0${REPLAY_STORE_SCOPE}`);
+const testLink = (head, seq, digest, claimId, scopeHash) =>
+  sha(`${REPLAY_STORE_FORMAT}\0link\0${head}\0${seq}\0${digest}\0${claimId}\0${scopeHash}`);
+
+const NONCE_A = 'nonce-integrity-a-0001';
+const NONCE_B = 'nonce-integrity-b-0002';
+const NONCE_C = 'nonce-integrity-c-0003';
+const NONCE_D = 'nonce-integrity-d-0004';
+
+// Builds a store with two settled synthetic records (A and B, rejected) and
+// one pending record (C). D is never reserved.
+function seedStore(path) {
+  const store = openReplayStore({path, create: true});
+  try {
+    const claim = syntheticClaim();
+    beginDurableAcceptance(store, hostController({nonce: NONCE_A, claim})).reject();
+    beginDurableAcceptance(store, hostController({nonce: NONCE_B, claim})).reject();
+    beginDurableAcceptance(store, hostController({nonce: NONCE_C, claim}));
+  } finally {
+    closeReplayStore(store);
+  }
+}
+
+function readRows(path) {
+  const db = rawDb(path);
+  try {
+    return db.prepare('SELECT seq, nonce_digest, claim_id, scope_hash, state, row_digest FROM replay_records ORDER BY seq')
+      .all();
+  } finally {
+    db.close();
+  }
+}
+
+// After tampering, neither open nor an already-open handle may admit any nonce.
+function assertStoreRefusesEverything(path, openHandle) {
+  const claim = syntheticClaim();
+  for (const nonce of [NONCE_A, NONCE_B, NONCE_C, NONCE_D]) {
+    rejectsWith(() => beginDurableAcceptance(openHandle, hostController({nonce, claim})), 'STORE_CORRUPT');
+    rejectsWith(() => inspectReplayRecord(openHandle, hostController({nonce, claim})), 'STORE_CORRUPT');
+  }
+  rejectsWith(() => openReplayStore({path}), 'STORE_CORRUPT');
+}
+
 // Never accepts: either open, begin, or commit must fail with one of the codes.
 function assertNeverAccepts(dbPath, codes) {
   let store;
@@ -130,8 +190,8 @@ const CHILD_SOURCE = [
   "  const {DatabaseSync} = await import('node:sqlite');",
   '  const db = new DatabaseSync(arg.dbPath);',
   "  db.exec('BEGIN IMMEDIATE');",
-  "  db.prepare(\"INSERT INTO replay_records VALUES (?, ?, ?, 'pending', ?)\")",
-  "    .run('d'.repeat(64), 'claim-holder', 'e'.repeat(64), 'f'.repeat(64));",
+  "  db.prepare(\"INSERT INTO replay_records (nonce_digest, seq, claim_id, scope_hash, state, row_digest) \" +",
+  "    \"VALUES (?, 999, ?, ?, 'pending', ?)\").run('d'.repeat(64), 'claim-holder', 'e'.repeat(64), 'f'.repeat(64));",
   '  out({ready: true});',
   '  setTimeout(() => process.exit(3), 30000);',
   '} else {',
@@ -461,18 +521,16 @@ test('corrupt, foreign, tampered or truncated storage never accepts', t => {
 
   const tamperedRow = join(dir, 'tampered.sqlite');
   const tamperStore = openReplayStore({path: tamperedRow, create: true});
-  beginDurableAcceptance(tamperStore, hostController()).reject();
-  closeReplayStore(tamperStore);
-  const tamperDb = rawDb(tamperedRow);
-  tamperDb.exec("UPDATE replay_records SET state = 'pending'");
-  tamperDb.close();
-  const reopened = openReplayStore({path: tamperedRow});
   try {
-    rejectsWith(() => beginDurableAcceptance(reopened, hostController()), 'STORE_CORRUPT');
-    rejectsWith(() => inspectReplayRecord(reopened, hostController()), 'STORE_CORRUPT');
+    beginDurableAcceptance(tamperStore, hostController()).reject();
+    // Tamper while a handle is open: the next operation must notice.
+    rawExec(tamperedRow, "UPDATE replay_records SET state = 'pending'");
+    rejectsWith(() => beginDurableAcceptance(tamperStore, hostController()), 'STORE_CORRUPT');
+    rejectsWith(() => inspectReplayRecord(tamperStore, hostController()), 'STORE_CORRUPT');
   } finally {
-    closeReplayStore(reopened);
+    closeReplayStore(tamperStore);
   }
+  rejectsWith(() => openReplayStore({path: tamperedRow}), 'STORE_CORRUPT');
 
   const truncated = join(dir, 'truncated.sqlite');
   const truncStore = openReplayStore({path: truncated, create: true});
@@ -514,4 +572,116 @@ test('errors are fixed strings without nonces, keys, paths, claims or SQLite tex
     for (const value of forbidden) assert.equal(text.includes(value), false, `${error.code} leaks a value`);
     for (const value of forbidden) assert.equal(String(error.stack).split('\n')[0].includes(value), false);
   }
+});
+
+// Opens a seeded store, applies a raw edit while the handle is open, then
+// checks that no nonce can be admitted or inspected and that reopen fails.
+function tamperAndAssert(t, edit) {
+  const {dbPath} = scratch(t);
+  seedStore(dbPath);
+  const handle = openStore(t, dbPath);
+  assert.equal(inspectReplayRecord(handle, hostController({nonce: NONCE_A, claim: syntheticClaim()})), 'rejected');
+  edit(dbPath, readRows(dbPath));
+  assertStoreRefusesEverything(dbPath, handle);
+  return dbPath;
+}
+
+test('integrity: a structurally valid altered nonce_digest cannot reopen a settled nonce', t => {
+  tamperAndAssert(t, path => {
+    rawExec(path, 'UPDATE replay_records SET nonce_digest = ? WHERE seq = 1', 'a'.repeat(64));
+  });
+});
+
+test('integrity: an altered nonce_digest with a recomputed row checksum is caught by the chain', t => {
+  tamperAndAssert(t, (path, rows) => {
+    const row = rows[0];
+    const forged = 'a'.repeat(64);
+    rawExec(path, 'UPDATE replay_records SET nonce_digest = ?, row_digest = ? WHERE seq = 1', forged,
+      testRowDigest(1, forged, row.claim_id, row.scope_hash, row.state));
+  });
+});
+
+test('integrity: corruption of a different row blocks admission of an unrelated new nonce', t => {
+  tamperAndAssert(t, path => {
+    rawExec(path, "UPDATE replay_records SET claim_id = 'claim-other-row' WHERE seq = 2");
+  });
+});
+
+test('integrity: a changed state on another row blocks every admission', t => {
+  tamperAndAssert(t, path => {
+    rawExec(path, "UPDATE replay_records SET state = 'committed' WHERE seq = 3");
+  });
+});
+
+test('integrity: a deleted middle row is detected', t => {
+  tamperAndAssert(t, path => {
+    rawExec(path, 'DELETE FROM replay_records WHERE seq = 2');
+  });
+});
+
+test('integrity: a deleted newest row with an adjusted count is caught by the chain head', t => {
+  tamperAndAssert(t, path => {
+    rawExec(path, 'DELETE FROM replay_records WHERE seq = 3');
+    rawExec(path, "UPDATE replay_meta SET v = '2' WHERE k = 'count'");
+  });
+});
+
+test('integrity: an inserted row with a valid row checksum but no ledger update is detected', t => {
+  tamperAndAssert(t, (path, rows) => {
+    const row = rows[0];
+    const extra = 'c'.repeat(64);
+    rawExec(path,
+      "INSERT INTO replay_records (nonce_digest, seq, claim_id, scope_hash, state, row_digest) VALUES (?, 4, ?, ?, 'pending', ?)",
+      extra, row.claim_id, row.scope_hash, testRowDigest(4, extra, row.claim_id, row.scope_hash, 'pending'));
+  });
+});
+
+test('integrity: reordered sequence numbers with recomputed row checksums are caught by the chain', t => {
+  tamperAndAssert(t, (path, rows) => {
+    const [first, second] = rows;
+    rawExec(path, 'UPDATE replay_records SET seq = 100 WHERE seq = 1');
+    rawExec(path, 'UPDATE replay_records SET seq = 1, row_digest = ? WHERE seq = 2',
+      testRowDigest(1, second.nonce_digest, second.claim_id, second.scope_hash, second.state));
+    rawExec(path, 'UPDATE replay_records SET seq = 2, row_digest = ? WHERE seq = 100',
+      testRowDigest(2, first.nonce_digest, first.claim_id, first.scope_hash, first.state));
+  });
+});
+
+test('integrity: altered count or chain head metadata is detected', t => {
+  tamperAndAssert(t, path => {
+    rawExec(path, "UPDATE replay_meta SET v = '4' WHERE k = 'count'");
+  });
+  tamperAndAssert(t, path => {
+    rawExec(path, "UPDATE replay_meta SET v = ? WHERE k = 'head'", 'b'.repeat(64));
+  });
+  tamperAndAssert(t, path => {
+    rawExec(path, "DELETE FROM replay_meta WHERE k = 'head'");
+  });
+});
+
+test('integrity: a pending record survives validation and stays unresolved after an untampered reopen', t => {
+  const {dbPath} = scratch(t);
+  seedStore(dbPath);
+  const store = openStore(t, dbPath);
+  const claim = syntheticClaim();
+  rejectsWith(() => beginDurableAcceptance(store, hostController({nonce: NONCE_C, claim})), 'REPLAY_UNRESOLVED');
+  rejectsWith(() => beginDurableAcceptance(store, hostController({nonce: NONCE_A, claim})), 'REPLAY_REJECTED');
+  beginDurableAcceptance(store, hostController({nonce: NONCE_D, claim})).reject();
+  assert.equal(readRows(dbPath).length, 4);
+});
+
+// Documents the stated limit: the checksum is unkeyed, so a writer that
+// recomputes every row, the count and the head can erase a record. This is
+// why the host must protect the file; the helper does not claim otherwise.
+test('documented limit: a fully recomputed consistent rewrite is not detectable', t => {
+  const {dbPath} = scratch(t);
+  seedStore(dbPath);
+  const rows = readRows(dbPath).filter(row => row.seq !== 3);
+  let head = testGenesis();
+  for (const row of rows) head = testLink(head, row.seq, row.nonce_digest, row.claim_id, row.scope_hash);
+  rawExec(dbPath, 'DELETE FROM replay_records WHERE seq = 3');
+  rawExec(dbPath, "UPDATE replay_meta SET v = '2' WHERE k = 'count'");
+  rawExec(dbPath, "UPDATE replay_meta SET v = ? WHERE k = 'head'", head);
+  const store = openStore(t, dbPath);
+  assert.equal(inspectReplayRecord(store, hostController({nonce: NONCE_C, claim: syntheticClaim()})), 'absent');
 });
