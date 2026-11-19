@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {lstatSync,realpathSync,statSync} from 'node:fs';
-import {isAbsolute,parse,resolve} from 'node:path';
+import {isAbsolute,join,parse,relative,resolve} from 'node:path';
 
 export const DEFAULT_PROJECT_ID='default-workspace';
 export const DEFAULT_PROJECT_LABEL='Default local workspace';
@@ -8,6 +8,9 @@ export const DEFAULT_PROJECT_LABEL='Default local workspace';
 const ID_PATTERN=/^[A-Za-z0-9._:-]{1,80}$/;
 const REVISION_PATTERN=/^[a-f0-9]{40,64}$/;
 const ALLOWED_CREATE_FIELDS=new Set(['label','root','revision']);
+const CONTROL_CHARS_PATTERN=/[\u0000-\u001f\u007f]/;
+const RESERVED_CHARS_PATTERN=/[<>:"|?*]/;
+const DOS_DEVICE_PATTERN=/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 
 function fail(status,code,message) {
   throw Object.assign(Error(message),{status,code});
@@ -17,8 +20,12 @@ function isPlainObject(value) {
   return value!==null&&typeof value==='object'&&!Array.isArray(value);
 }
 
+function pathsEqual(a,b) {
+  return process.platform==='win32'?a.toLowerCase()===b.toLowerCase():a===b;
+}
+
 function normalizeLabel(rawLabel) {
-  if(typeof rawLabel!=='string'||/[\u0000-\u001f\u007f]/.test(rawLabel)) {
+  if(typeof rawLabel!=='string'||CONTROL_CHARS_PATTERN.test(rawLabel)) {
     fail(400,'INVALID_PROJECT_LABEL','Enter a valid project label.');
   }
   const trimmed=rawLabel.trim();
@@ -43,35 +50,138 @@ function normalizeProjectId(id) {
   return id;
 }
 
-export function resolveLocalRoot(rawRoot) {
-  if(typeof rawRoot!=='string'||/[\u0000-\u001f\u007f]/.test(rawRoot)) {
-    fail(400,'INVALID_PROJECT_ROOT','Enter a valid local project root path.');
+export function validateLocalPathSyntax(rawPath,code='INVALID_PROJECT_ROOT',label='local project root path') {
+  if(typeof rawPath!=='string'||CONTROL_CHARS_PATTERN.test(rawPath)) {
+    fail(400,code,'Enter a valid '+label+'.');
   }
-  const trimmed=rawRoot.trim();
-  if(!trimmed||trimmed.length>512||!isAbsolute(trimmed)) {
-    fail(400,'INVALID_PROJECT_ROOT','Project root must be an absolute local path.');
+  if(rawPath!==rawPath.trim()||!rawPath||rawPath.length>512) {
+    fail(400,code,'Enter a valid '+label+'.');
   }
+  if(/^[\\/]{2}/.test(rawPath)) {
+    fail(400,code,'Network, UNC, and device paths are not permitted for '+label+'.');
+  }
+  const drivePrefix=/^([A-Za-z]):(.*)$/.exec(rawPath);
+  let remainder;
+  if(drivePrefix) {
+    if(!/^[\\/]/.test(drivePrefix[2])) {
+      fail(400,code,'Drive-relative paths are not permitted for '+label+'.');
+    }
+    if(process.platform!=='win32') {
+      fail(400,code,'Enter a valid '+label+' for this host.');
+    }
+    remainder=drivePrefix[2];
+  } else {
+    if(process.platform==='win32') {
+      fail(400,code,'Enter an absolute local drive path for '+label+'.');
+    }
+    if(!rawPath.startsWith('/')) {
+      fail(400,code,'Enter an absolute local path for '+label+'.');
+    }
+    remainder=rawPath;
+  }
+  if(!isAbsolute(rawPath)) {
+    fail(400,code,'Enter an absolute local path for '+label+'.');
+  }
+  if(RESERVED_CHARS_PATTERN.test(remainder)) {
+    fail(400,code,'Reserved or wildcard characters are not permitted in '+label+'.');
+  }
+  const segments=remainder.split(/[\\/]+/);
+  for(const seg of segments) {
+    if(seg==='')continue;
+    if(seg==='.'||seg==='..') {
+      fail(400,code,'Relative traversal segments are not permitted in '+label+'.');
+    }
+    if(/[ .]$/.test(seg)) {
+      fail(400,code,'Path segments in '+label+' cannot end with a space or dot.');
+    }
+    const baseName=seg.split('.')[0];
+    if(DOS_DEVICE_PATTERN.test(baseName)) {
+      fail(400,code,'Reserved DOS device names are not permitted in '+label+'.');
+    }
+  }
+  return rawPath;
+}
+
+export function resolveLocalRoot(rawRoot,{useTime=false}={}) {
+  const errStatus=useTime?409:400;
+  const trimmed=validateLocalPathSyntax(rawRoot,'INVALID_PROJECT_ROOT','local project root path');
   const resolved=resolve(trimmed);
+  if(parse(resolved).root===resolved) {
+    fail(errStatus,'PROJECT_ROOT_FILESYSTEM_ROOT','Choose a project directory rather than a filesystem root.');
+  }
   let linkStat;
   try {
     linkStat=lstatSync(resolved);
   } catch {
-    fail(400,'PROJECT_ROOT_MISSING','The selected project root does not exist.');
+    fail(errStatus,'PROJECT_ROOT_MISSING','The selected project root does not exist.');
   }
   if(linkStat.isSymbolicLink()) {
-    fail(400,'PROJECT_ROOT_SYMLINK','Project root must be a real directory, not a symbolic link.');
+    fail(errStatus,'PROJECT_ROOT_SYMLINK','Project root must be a real directory, not a symbolic link.');
   }
   if(!linkStat.isDirectory()) {
-    fail(400,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
+    fail(errStatus,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
   }
-  const canonical=realpathSync(resolved);
+  let canonical;
+  try {
+    canonical=realpathSync(resolved);
+  } catch {
+    fail(errStatus,'PROJECT_ROOT_MISSING','The selected project root could not be resolved.');
+  }
+  validateLocalPathSyntax(canonical,'INVALID_PROJECT_ROOT','local project root path');
+  if(process.platform==='win32'&&!pathsEqual(canonical,resolved)) {
+    fail(errStatus,'PROJECT_ROOT_SYMLINK','Project root cannot traverse symbolic links or junctions.');
+  }
   if(!statSync(canonical).isDirectory()) {
-    fail(400,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
+    fail(errStatus,'PROJECT_ROOT_NOT_DIRECTORY','The selected project root must be a directory.');
   }
   if(parse(canonical).root===canonical) {
-    fail(400,'PROJECT_ROOT_FILESYSTEM_ROOT','Choose a project directory rather than a filesystem root.');
+    fail(errStatus,'PROJECT_ROOT_FILESYSTEM_ROOT','Choose a project directory rather than a filesystem root.');
   }
   return canonical;
+}
+
+export function verifyContainedRoot(projectRoot,candidateRoot,{useTime=false}={}) {
+  const errStatus=useTime?409:400;
+  validateLocalPathSyntax(candidateRoot,'INVALID_APPROVED_ROOTS','approved root path');
+  if(typeof projectRoot!=='string'||!projectRoot) {
+    fail(errStatus,'APPROVED_ROOT_OUTSIDE_PROJECT','Project has no registered local root for approved filesystem paths.');
+  }
+  const canonicalProject=resolveLocalRoot(projectRoot,{useTime});
+  const candidateResolved=resolve(candidateRoot);
+  const synRel=relative(canonicalProject,candidateResolved);
+  if(synRel.startsWith('..')||isAbsolute(synRel)) {
+    fail(errStatus,'APPROVED_ROOT_OUTSIDE_PROJECT','Approved root must be inside the registered project root.');
+  }
+  if(synRel!=='') {
+    let cursor=canonicalProject;
+    for(const seg of synRel.split(/[\\/]+/)) {
+      if(!seg)continue;
+      cursor=join(cursor,seg);
+      let segStat;
+      try {
+        segStat=lstatSync(cursor);
+      } catch {
+        fail(errStatus,'APPROVED_ROOT_MISSING','Approved root does not exist on disk.');
+      }
+      if(segStat.isSymbolicLink()) {
+        fail(errStatus,'APPROVED_ROOT_SYMLINK','Approved root cannot be or traverse a symbolic link or junction.');
+      }
+      if(!segStat.isDirectory()) {
+        fail(errStatus,'APPROVED_ROOT_NOT_DIRECTORY','Approved root must be a directory.');
+      }
+    }
+  }
+  let canonicalCandidate;
+  try {
+    canonicalCandidate=realpathSync(candidateResolved);
+  } catch {
+    fail(errStatus,'APPROVED_ROOT_MISSING','Approved root could not be resolved.');
+  }
+  const canonRel=relative(canonicalProject,canonicalCandidate);
+  if(canonRel.startsWith('..')||isAbsolute(canonRel)||!pathsEqual(canonRel,synRel)) {
+    fail(errStatus,'APPROVED_ROOT_OUTSIDE_PROJECT','Approved root resolves outside the registered project root.');
+  }
+  return canonicalCandidate;
 }
 
 function rowToProject(row) {
