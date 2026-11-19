@@ -6,6 +6,11 @@ guest.py, sandbox.py, or harness/ until integration review.
 
 Trust model and limits:
 - Consumes immutable controller-owned byte snapshots (no mutable directory reads).
+- At each claim and verification boundary, copies snapshot bytes independently
+  and derives every signed base and candidate digest and tree field from that
+  same copy. Rejects digest maps, trees, and nested values that do not match it.
+- Checks the interpreter step budget before incrementing, so a limit failure
+  never records a case row above MAX_STEPS_PER_CASE.
 - Never imports, compiles to bytecode, evals, or executes candidate Python.
 - Rejects UTF-8 BOMs and PEP 263 coding declarations so raw-byte decoding
   matches Python's source decoder.
@@ -197,11 +202,16 @@ _ALLOWED_VALUE_CMPOPS = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 _ALLOWED_IDENTITY_CMPOPS = (ast.Is, ast.IsNot)
 
 
+def _independent_bytes(raw: bytes) -> bytes:
+    """Copy bytes so a caller-held buffer cannot alias the stored snapshot."""
+    return bytes(bytearray(raw))
+
+
 def freeze_file_snapshot(files: Mapping[str, bytes], *, label: str = "snapshot") -> FileSnapshot:
     """Validate raw two-file bytes and freeze them into an immutable snapshot."""
     if not isinstance(files, Mapping):
         raise InvalidInputError(f"{label} must be a mapping object.")
-    if tuple(sorted(files.keys())) != APPROVED_FILES:
+    if tuple(sorted(files.keys())) != APPROVED_FILES or tuple(sorted(files.keys())) != APPROVED_FILES:
         raise InvalidInputError(f"{label} must match exact allowlist {APPROVED_FILES}.")
 
     copied: dict[str, bytes] = {}
@@ -220,7 +230,10 @@ def freeze_file_snapshot(files: Mapping[str, bytes], *, label: str = "snapshot")
             raise InvalidInputError(f"{label}[{name}] is not valid UTF-8.") from error
         if not text.strip():
             raise InvalidInputError(f"{label}[{name}] cannot be whitespace-only.")
-        raw_copy = bytes(raw)
+        again = files[name]
+        if type(again) is not bytes or again != raw:
+            raise InvalidInputError(f"{label}[{name}] bytes changed during snapshot.")
+        raw_copy = _independent_bytes(raw)
         copied[name] = raw_copy
         digests[name] = hashlib.sha256(raw_copy).hexdigest()
 
@@ -230,6 +243,88 @@ def freeze_file_snapshot(files: Mapping[str, bytes], *, label: str = "snapshot")
         file_digests=MappingProxyType(digests),
         tree_sha256=tree_sha256,
     )
+
+
+def _adopt_snapshot(snapshot: object, *, label: str, type_error: str) -> FileSnapshot:
+    """Rebuild a private snapshot from one independent copy of its raw bytes.
+
+    Directly constructed digest maps and tree fields are not trusted. Nested
+    values that change between reads, or that disagree with the copied bytes,
+    are rejected. The accepted file set stays exactly APPROVED_FILES.
+    """
+    if type(snapshot) is not FileSnapshot:
+        raise InvalidInputError(type_error)
+    raw_map = snapshot.raw_bytes
+    digest_map = snapshot.file_digests
+    if not isinstance(raw_map, Mapping) or not isinstance(digest_map, Mapping):
+        raise InvalidInputError(f"{label} nested snapshot maps are missing or substituted.")
+    try:
+        raw_keys_1 = tuple(sorted(raw_map.keys()))
+        raw_keys_2 = tuple(sorted(raw_map.keys()))
+        digest_keys_1 = tuple(sorted(digest_map.keys()))
+        digest_keys_2 = tuple(sorted(digest_map.keys()))
+    except InvalidInputError:
+        raise
+    except Exception as error:
+        raise InvalidInputError(f"{label} nested snapshot keys could not be read.") from error
+    if (
+        raw_keys_1 != raw_keys_2
+        or digest_keys_1 != digest_keys_2
+        or raw_keys_1 != APPROVED_FILES
+        or digest_keys_1 != APPROVED_FILES
+    ):
+        raise InvalidInputError(f"{label} must match exact allowlist {APPROVED_FILES}.")
+
+    copied: dict[str, bytes] = {}
+    recomputed: dict[str, str] = {}
+    for name in APPROVED_FILES:
+        try:
+            first_raw = raw_map[name]
+            second_raw = raw_map[name]
+            first_digest = digest_map[name]
+            second_digest = digest_map[name]
+        except InvalidInputError:
+            raise
+        except Exception as error:
+            raise InvalidInputError(f"{label}[{name}] nested snapshot value could not be read.") from error
+        if type(first_raw) is not bytes or type(second_raw) is not bytes or len(first_raw) != len(second_raw):
+            raise InvalidInputError(f"{label}[{name}] bytes were substituted or are not raw bytes.")
+        if len(first_raw) == 0 or len(first_raw) > MAX_FILE_BYTES:
+            raise InvalidInputError(
+                f"{label}[{name}] byte length out of bounds (1..{MAX_FILE_BYTES})."
+            )
+        if first_raw != second_raw:
+            raise InvalidInputError(f"{label}[{name}] bytes were substituted or are not raw bytes.")
+        independent = _independent_bytes(first_raw)
+        copied[name] = independent
+        digest = hashlib.sha256(independent).hexdigest()
+        recomputed[name] = digest
+        if (
+            type(first_digest) is not str
+            or not HEX_SHA256_RE.fullmatch(first_digest)
+            or type(second_digest) is not str
+            or second_digest != first_digest
+            or first_digest != digest
+        ):
+            raise InvalidInputError(f"{label}[{name}] digest does not match independently copied bytes.")
+
+    try:
+        tree_1 = snapshot.tree_sha256
+        tree_2 = snapshot.tree_sha256
+    except InvalidInputError:
+        raise
+    except Exception as error:
+        raise InvalidInputError(f"{label} tree digest could not be read.") from error
+    expected_tree = _json_sha256([[name, recomputed[name]] for name in APPROVED_FILES])
+    if (
+        type(tree_1) is not str
+        or not HEX_SHA256_RE.fullmatch(tree_1)
+        or type(tree_2) is not str
+        or tree_2 != tree_1
+        or tree_1 != expected_tree
+    ):
+        raise InvalidInputError(f"{label} tree digest does not match independently copied bytes.")
+    return freeze_file_snapshot(copied, label=label)
 
 
 def _check_source_encoding(raw: bytes, filename: str) -> str:
@@ -605,9 +700,10 @@ class _BoundedInterpreter:
         self.steps = 0
 
     def _tick(self) -> None:
-        self.steps += 1
-        if self.steps > MAX_STEPS_PER_CASE:
+        # Check before increment so a limit failure never records MAX_STEPS_PER_CASE + 1.
+        if self.steps >= MAX_STEPS_PER_CASE:
             raise ExecutionLimitError(f"Case exceeded step budget ({MAX_STEPS_PER_CASE}).")
+        self.steps += 1
 
     @staticmethod
     def _check_int_bound(value: int) -> int:
@@ -850,8 +946,11 @@ def build_scope(base_revision: str, base_snapshot: FileSnapshot) -> tuple[dict[s
     """Build canonical scope matching verified-patch.mjs buildScope()."""
     if type(base_revision) is not str or not HEX_REV_RE.fullmatch(base_revision):
         raise InvalidInputError("Invalid baseRevision commit SHA.")
-    if not isinstance(base_snapshot, FileSnapshot):
-        raise InvalidInputError("base_snapshot must be a FileSnapshot.")
+    base_snapshot = _adopt_snapshot(
+        base_snapshot,
+        label="base_snapshot",
+        type_error="base_snapshot must be a FileSnapshot.",
+    )
     scope: dict[str, object] = {
         "files": list(APPROVED_FILES),
         "baseRevision": base_revision,
@@ -891,6 +990,11 @@ def validate_controller_claim(
     base_digests = scope.get("baseFileDigests")
     if not isinstance(base_digests, Mapping) or tuple(sorted(base_digests.keys())) != APPROVED_FILES:
         raise InvalidInputError("Controller claim scope.baseFileDigests invalid.")
+    base_snapshot = _adopt_snapshot(
+        base_snapshot,
+        label="base_snapshot",
+        type_error="base_snapshot must be a FileSnapshot.",
+    )
     for name in APPROVED_FILES:
         if base_digests[name] != base_snapshot.file_digests[name]:
             raise InvalidInputError(f"Controller claim base digest mismatch for {name}.")
@@ -918,6 +1022,11 @@ def load_controller_claim_from_journal(
     if not isinstance(row0, dict) or row0.get("state") != "claimed" or row0.get("id") != claim_id:
         raise InvalidInputError("Claim journal initial row does not match claimId.")
     claim = {"claimId": row0["id"], "scope": row0.get("scope"), "scopeHash": row0.get("scopeHash")}
+    base_snapshot = _adopt_snapshot(
+        base_snapshot,
+        label="base_snapshot",
+        type_error="base_snapshot must be a FileSnapshot.",
+    )
     validate_controller_claim(claim, base_snapshot=base_snapshot)
     return claim
 
@@ -954,11 +1063,21 @@ def verify_fixture_snapshot(
     require_all_files_changed: bool = True,
 ) -> dict[str, object]:
     """Verify an immutable candidate byte snapshot against fixed CASES and bind provenance."""
-    if not isinstance(candidate_snapshot, FileSnapshot):
+    if type(candidate_snapshot) is not FileSnapshot:
         raise InvalidInputError("candidate_snapshot must be an immutable FileSnapshot.")
-    if not isinstance(base_snapshot, FileSnapshot):
+    if type(base_snapshot) is not FileSnapshot:
         raise InvalidInputError("base_snapshot must be an immutable FileSnapshot.")
     _validate_invocation_inputs(invocation_nonce, attestation_key)
+    candidate_snapshot = _adopt_snapshot(
+        candidate_snapshot,
+        label="candidate_snapshot",
+        type_error="candidate_snapshot must be an immutable FileSnapshot.",
+    )
+    base_snapshot = _adopt_snapshot(
+        base_snapshot,
+        label="base_snapshot",
+        type_error="base_snapshot must be an immutable FileSnapshot.",
+    )
     claim_id, canonical_scope, scope_hash = validate_controller_claim(
         claim, base_snapshot=base_snapshot
     )
@@ -994,6 +1113,10 @@ def verify_fixture_snapshot(
         except ExecutionLimitError:
             error_label = "execution_limit_exceeded"
 
+        if interpreter.steps > MAX_STEPS_PER_CASE:
+            raise InvalidInputError(
+                f"Case step counter exceeded the accepted maximum ({MAX_STEPS_PER_CASE})."
+            )
         if interpreter.steps > max_case_steps:
             max_case_steps = interpreter.steps
         if not case_passed:

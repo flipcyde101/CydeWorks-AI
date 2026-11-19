@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import MappingProxyType
 from unittest import mock
 
 
@@ -511,6 +512,221 @@ class ProtectedFixtureVerifierTests(unittest.TestCase):
         )
         self.assertFalse(att_ovf["passed"])
         self.assertEqual(att_ovf["caseResults"][0]["error"], "execution_limit_exceeded")
+
+    def test_forged_snapshot_metadata_is_rejected(self):
+        real_digests = {
+            name: hashlib.sha256(ORDINARY_CORRECTED_FILES[name]).hexdigest()
+            for name in verifier.APPROVED_FILES
+        }
+        real_tree = hashlib.sha256(
+            json.dumps(
+                [[name, real_digests[name]] for name in verifier.APPROVED_FILES],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        base_digests = dict(self.base_snap.file_digests)
+        forged_digests = {name: "0" * 64 for name in verifier.APPROVED_FILES}
+        forged_tree = hashlib.sha256(
+            json.dumps(
+                [[name, forged_digests[name]] for name in verifier.APPROVED_FILES],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        digest_forgery = verifier.FileSnapshot(
+            raw_bytes=MappingProxyType(dict(ORDINARY_CORRECTED_FILES)),
+            file_digests=MappingProxyType(forged_digests),
+            tree_sha256=forged_tree,
+        )
+        tree_forgery = verifier.FileSnapshot(
+            raw_bytes=MappingProxyType(dict(ORDINARY_CORRECTED_FILES)),
+            file_digests=MappingProxyType(dict(real_digests)),
+            tree_sha256="ab" * 32,
+        )
+        # Bytes differ from the claim, but the declared digests copy the claim.
+        claim_digest_forgery = verifier.FileSnapshot(
+            raw_bytes=MappingProxyType(dict(ORDINARY_CORRECTED_FILES)),
+            file_digests=MappingProxyType(base_digests),
+            tree_sha256=self.base_snap.tree_sha256,
+        )
+        for bad_snap in (digest_forgery, tree_forgery, claim_digest_forgery):
+            with self.subTest(kind=bad_snap.tree_sha256[:8]):
+                with self.assertRaises(verifier.InvalidInputError):
+                    verifier.build_scope(BASE_REVISION, bad_snap)
+                with self.assertRaises(verifier.InvalidInputError):
+                    verifier.validate_controller_claim(self.claim, base_snapshot=bad_snap)
+                with self.assertRaises(verifier.InvalidInputError):
+                    verifier.verify_fixture_snapshot(
+                        bad_snap,
+                        base_snapshot=self.base_snap,
+                        claim=self.claim,
+                        invocation_nonce=TEST_NONCE,
+                        attestation_key=TEST_HMAC_KEY,
+                    )
+                with self.assertRaises(verifier.InvalidInputError):
+                    verifier.verify_fixture_snapshot(
+                        self.cand_snap,
+                        base_snapshot=bad_snap,
+                        claim=self.claim,
+                        invocation_nonce=TEST_NONCE,
+                        attestation_key=TEST_HMAC_KEY,
+                    )
+
+        mutable_raw = dict(ORDINARY_CORRECTED_FILES)
+        mutable_snap = verifier.FileSnapshot(
+            raw_bytes=MappingProxyType(mutable_raw),
+            file_digests=MappingProxyType(dict(real_digests)),
+            tree_sha256=real_tree,
+        )
+        mutable_raw["limits.py"] = b"def clamp(value):\n    return 1\n"
+        with self.assertRaises(verifier.InvalidInputError):
+            verifier.verify_fixture_snapshot(
+                mutable_snap,
+                base_snapshot=self.base_snap,
+                claim=self.claim,
+                invocation_nonce=TEST_NONCE,
+                attestation_key=TEST_HMAC_KEY,
+            )
+
+        class _SecondReadFlip(dict):
+            def __init__(self) -> None:
+                super().__init__(ORDINARY_CORRECTED_FILES)
+                self.limit_reads = 0
+
+            def __getitem__(self, key: str) -> bytes:
+                value = super().__getitem__(key)
+                if key == "limits.py":
+                    self.limit_reads += 1
+                    if self.limit_reads >= 2:
+                        return b"import os\ndef clamp(value):\n    return value\n"
+                return value
+
+        flipped = _SecondReadFlip()
+        substituted = verifier.FileSnapshot(
+            raw_bytes=flipped,
+            file_digests=MappingProxyType(dict(real_digests)),
+            tree_sha256=real_tree,
+        )
+        with self.assertRaises(verifier.InvalidInputError):
+            verifier.verify_fixture_snapshot(
+                substituted,
+                base_snapshot=self.base_snap,
+                claim=self.claim,
+                invocation_nonce=TEST_NONCE,
+                attestation_key=TEST_HMAC_KEY,
+            )
+
+        class _LaterReadFlip(dict):
+            def __init__(self) -> None:
+                super().__init__(ORDINARY_CORRECTED_FILES)
+                self.limit_reads = 0
+
+            def __getitem__(self, key: str) -> bytes:
+                value = super().__getitem__(key)
+                if key == "limits.py":
+                    self.limit_reads += 1
+                    if self.limit_reads > 2:
+                        return b"import os\ndef clamp(value):\n    return value\n"
+                return value
+
+        delayed = _LaterReadFlip()
+        consistent_direct = verifier.FileSnapshot(
+            raw_bytes=delayed,
+            file_digests=MappingProxyType(dict(real_digests)),
+            tree_sha256=real_tree,
+        )
+        att = verifier.verify_fixture_snapshot(
+            consistent_direct,
+            base_snapshot=self.base_snap,
+            claim=self.claim,
+            invocation_nonce=TEST_NONCE,
+            attestation_key=TEST_HMAC_KEY,
+        )
+        self.assertEqual(delayed.limit_reads, 2)
+        self.assertTrue(att["passed"])
+        self.assertEqual(att["fileDigests"], real_digests)
+        self.assertEqual(att["treeSha256"], real_tree)
+        self.assertEqual(att["baseFileDigests"], base_digests)
+        self.assertEqual(att["baseTreeSha256"], self.base_snap.tree_sha256)
+        verifier.verify_attestation(
+            att,
+            expected_claim=self.claim,
+            expected_invocation_nonce=TEST_NONCE,
+            attestation_key=TEST_HMAC_KEY,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="pfv-forged-journal-") as tmp:
+            jpath = Path(tmp) / "run.jsonl"
+            row0 = {
+                "id": CLAIM_ID,
+                "state": "claimed",
+                "scope": self.claim["scope"],
+                "scopeHash": self.claim["scopeHash"],
+            }
+            jpath.write_bytes((json.dumps(row0) + "\n").encode("utf-8"))
+            with self.assertRaises(verifier.InvalidInputError):
+                verifier.load_controller_claim_from_journal(
+                    jpath, CLAIM_ID, base_snapshot=claim_digest_forgery
+                )
+
+    def test_step_limit_failure_is_authenticated_and_saved(self):
+        step_snap = verifier.freeze_file_snapshot(
+            {
+                "limits.py": (
+                    b"def clamp(value):\n"
+                    + b"    value = value + 1 - 1\n" * 10
+                    + b"    return value\n"
+                ),
+                "measurement.py": (
+                    b"from limits import clamp\n\n"
+                    b"def normalize(raw):\n"
+                    b"    x = int(raw)\n"
+                    b"    return clamp(x) + clamp(0) + clamp(0) + clamp(0) + clamp(0)\n"
+                ),
+            },
+            label="steps-budget-authenticated",
+        )
+        att = verifier.verify_fixture_snapshot(
+            step_snap,
+            base_snapshot=self.base_snap,
+            claim=self.claim,
+            invocation_nonce=TEST_NONCE,
+            attestation_key=TEST_HMAC_KEY,
+        )
+        self.assertFalse(att["passed"])
+        self.assertEqual(att["caseResults"][5]["error"], "execution_limit_exceeded")
+        self.assertEqual(att["caseResults"][5]["steps"], verifier.MAX_STEPS_PER_CASE)
+        self.assertLessEqual(att["workObserved"]["maxCaseSteps"], verifier.MAX_STEPS_PER_CASE)
+        for row in att["caseResults"]:
+            self.assertIsInstance(row["steps"], int)
+            self.assertGreaterEqual(row["steps"], 0)
+            self.assertLessEqual(row["steps"], verifier.MAX_STEPS_PER_CASE)
+        verifier.verify_attestation(
+            att,
+            expected_claim=self.claim,
+            expected_invocation_nonce=TEST_NONCE,
+            attestation_key=TEST_HMAC_KEY,
+        )
+        with tempfile.TemporaryDirectory(prefix="pfv-steps-") as tmp:
+            att_path = Path(tmp) / "step-limit.json"
+            verifier.write_attestation_file(
+                att_path,
+                att,
+                expected_claim=self.claim,
+                expected_invocation_nonce=TEST_NONCE,
+                attestation_key=TEST_HMAC_KEY,
+            )
+            saved = json.loads(att_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["caseResults"][5]["steps"], verifier.MAX_STEPS_PER_CASE)
+            self.assertEqual(saved["caseResults"][5]["error"], "execution_limit_exceeded")
+            verifier.verify_attestation(
+                saved,
+                expected_claim=self.claim,
+                expected_invocation_nonce=TEST_NONCE,
+                attestation_key=TEST_HMAC_KEY,
+            )
 
     def test_finding2_rejects_unauthenticated_and_substituted_attestations(self):
         att = verifier.verify_fixture_snapshot(
