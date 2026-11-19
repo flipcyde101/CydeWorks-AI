@@ -23,6 +23,14 @@ The next design must state its trusted processes and endpoints, the adversary it
 - An abort signal alone is not proof that a save wrote nothing. [Node's file-system documentation](https://nodejs.org/api/fs.html) describes `writeFile` cancellation as best effort. Design and test a bounded save protocol with explicit commit and recovery semantics.
 - Keep credentials and sensitive material out of URLs, logs, repositories and test fixtures. Any HTTPS certificate or credential provisioning must be a separate concrete owner-approved action.
 
+## Reference session patterns
+
+The installed `t3` CLI reported `v0.1.10` on November 19, 2026. Its [versioned remote-access documentation](https://github.com/pingdotgg/t3code/blob/v0.1.10/docs/user/remote-access.md) describes one-time device pairing followed by reuse for later connections. Its [versioned authentication design](https://github.com/pingdotgg/t3code/blob/v0.1.10/docs/internals/environment-auth.md) describes scoped browser-cookie, bearer and proof-bound sessions, with revocation and server-side permission checks. The proof-bound mechanism applies to those clients that use it; it must not be assumed to protect every browser cookie or media request.
+
+This is a useful usability reference for persistent sessions without a prompt on every refresh. The cited T3 documentation does not establish the stricter exclusive-document and copied-storage guarantees required above. T3 also describes projects as organizational boundaries rather than filesystem sandboxes. Do not substitute its session model for CydeWorks' unresolved Lock and runner safety gates without a separate design decision and review.
+
+[Code-server's usage guide](https://coder.com/docs/code-server/guide) documents password authentication and recommends protected transports for remote access. [Open WebUI's hardening guide](https://docs.openwebui.com/getting-started/advanced-topics/hardening/) describes HTTPS, cookie settings, session lifetime and revocation. These are comparison inputs, not proof that either product meets the CydeWorks per-document boundary.
+
 ## Evidence required before use
 
 1. A reviewed state machine for admission, reload, duplicate, Lock, idle expiry, service restart and save cancellation, including browser restart and a replaced local service.
