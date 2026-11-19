@@ -34,7 +34,7 @@ These are coordinator operating rules, not a verified automatic quota watcher or
 
 On November 19 at 10:41 a.m. America/Denver, `claudeAgent / claude-opus-5-5` run 2 in thread `mcp:606c30e3-a6b5-44c9-a742-fe03ed17ebac` reported its five-hour limit and a 12:30 p.m. America/Denver reset. Hold that route and any possibly shared Claude pool whose allowance is uncertain. Do not retry before the reported reset. Afterward, a single supervised real-work attempt may establish whether the route is usable; elapsed time alone does not clear the hold. Do not use paid fallback.
 
-The read-only design task was reassigned once to the included Cursor Composer 2.5 route in thread `mcp:launch:4761c4aec246ce3df16d8732f931902d87f244030f414f59755c10e9f805352d`, run 9. The T3 startup receipt was not treated as evidence of completion.
+The read-only design task was reassigned once to the included Cursor Composer 2.5 route in thread `mcp:launch:4761c4aec246ce3df16d8732f931902d87f244030f414f59755c10e9f805352d`, run 9. That run completed without a reported provider error. Its output is design input, not proof that the execution hold has been resolved.
 
 ## Target-code execution hold
 
