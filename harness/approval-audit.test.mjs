@@ -1915,6 +1915,7 @@ test('migrated project rows without a recorded root identity fail closed until a
     assert.equal(legacy.rootIdentityState,'unverified');
     assert.equal(legacy.rootDev,null);
     assert.throws(()=>projects.verifyProjectRootIdentity(legacy),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
+    assert.throws(()=>projects.approvedRoots(legacyId),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
 
     const attemptInput=validAttemptInput({projectId:legacyId,approvedRoots:[join(projectDir,'src')]});
     registerScopeFromInput(host,projects,attemptInput);
@@ -1967,6 +1968,7 @@ test('migrated project rows without a recorded root identity fail closed until a
     assert.ok(revalidated.project.rootDev&&revalidated.project.rootIno);
     assert.equal(revalidated.project.updatedAt,new Date(now).toISOString());
     assert.equal(projects.revalidateProjectRoot(legacyId,{root:projectDir,revision:GIT_REV}).revalidated,false);
+    assert.deepEqual(projects.approvedRoots(legacyId),[resolveLocalRoot(projectDir)]);
     assert.equal(projects.registerProject({label:'Legacy Repo',root:projectDir,revision:GIT_REV}).project.id,legacyId);
 
     const issued=audit.issueAttemptGrant(attemptInput);
@@ -1980,6 +1982,166 @@ test('migrated project rows without a recorded root identity fail closed until a
       approvedRoots:[join(projectDir,'src')],
     })),{status:409,code:'PROJECT_ROOT_REPLACED'});
     assert.throws(()=>projects.revalidateProjectRoot(legacyId,{root:projectDir,revision:GIT_REV}),{status:409,code:'PROJECT_ROOT_REPLACED'});
+    assert.throws(()=>projects.approvedRoots(legacyId),{status:409,code:'PROJECT_ROOT_REPLACED'});
+  } finally {
+    db.close();
+  }
+});
+
+test('POSIX paths with a literal backslash are rejected before filesystem access in containment, grant issuance, and server scopes',{
+  skip:process.platform==='win32'?'backslash is a path separator on Windows':false,
+},t=>{
+  const scratch=makeScratchDir(t);
+  const projectDir=join(scratch,'proj');
+  const insideDir=join(projectDir,'sub');
+  // A stable real sibling whose single name contains a backslash. Splitting it on "\" would
+  // misread it as proj/sub, which is inside the project.
+  const outsideTwin=join(scratch,'proj\\sub');
+  mkdirSync(insideDir,{recursive:true});
+  mkdirSync(outsideTwin);
+  writeFileSync(join(outsideTwin,'outside.txt'),'outside the registered root\n');
+  assert.ok(existsSync(outsideTwin));
+  assert.notEqual(outsideTwin,insideDir);
+
+  const now=1_795_000_000_000;
+  const {db,projects,audit,host}=makeStores({clock:()=>now});
+  try {
+    const {project}=projects.registerProject({label:'BackslashRepo',root:projectDir,revision:GIT_REV});
+    assert.equal(verifyContainedRoot(project.root,insideDir),resolveLocalRoot(insideDir));
+
+    // Containment and registration reject the sibling by syntax, before any lstat or realpath.
+    assert.throws(()=>verifyContainedRoot(project.root,outsideTwin),{status:400,code:'INVALID_APPROVED_ROOTS'});
+    assert.throws(()=>verifyContainedRoot(project.root,outsideTwin,{useTime:true}),{status:400,code:'INVALID_APPROVED_ROOTS'});
+    assert.throws(()=>resolveLocalRoot(outsideTwin),{status:400,code:'INVALID_PROJECT_ROOT'});
+    assert.throws(()=>projects.registerProject({label:'Twin',root:outsideTwin}),{status:400,code:'INVALID_PROJECT_ROOT'});
+
+    // Grant issuance rejects it for attempt and action grants.
+    assert.throws(()=>audit.issueAttemptGrant(validAttemptInput({
+      projectId:project.id,
+      approvedRoots:[outsideTwin],
+    })),{status:400,code:'INVALID_APPROVED_ROOTS'});
+    assert.throws(()=>audit.issueActionGrant(validActionInput({
+      projectId:project.id,
+      approvedRoots:[outsideTwin],
+    })),{status:400,code:'INVALID_APPROVED_ROOTS'});
+
+    // A server scope that later names the sibling cannot authorize dispatch or consumption.
+    const lease=audit.acquireControllerLease({controllerId:'ctrl-backslash',leaseToken:'backslash-lease-token-01'});
+    const attemptInput=validAttemptInput({projectId:project.id,approvedRoots:[insideDir]});
+    registerScopeFromInput(host,projects,attemptInput);
+    const issued=audit.issueAttemptGrant(attemptInput);
+    assert.deepEqual(issued.grant.approvedRoots,[resolveLocalRoot(insideDir)]);
+    host.updateTaskScope(attemptInput.taskId,{approvedRoots:[outsideTwin]});
+    assert.throws(()=>audit.beginDispatch({
+      grantId:issued.grant.grantId,
+      claimId:issued.claim.claimId,
+      ownership:lease,
+    }),{status:400,code:'INVALID_APPROVED_ROOTS'});
+    assert.equal(audit.readGrant(issued.grant.grantId).claim.phase,'claimed');
+
+    const actionInput=validActionInput({projectId:project.id,approvedRoots:[insideDir]});
+    const actionGrant=audit.issueActionGrant(actionInput);
+    registerActionScopeFromInput(host,projects,actionInput);
+    host.updateActionScope(actionInput.taskId,actionInput.action,{approvedRoots:[outsideTwin]});
+    assert.throws(()=>audit.consumeActionGrant(consumeArgsFromGrant(actionGrant)),{status:409,code:'UNVERIFIED_ACTION_SCOPE'});
+    assert.equal(audit.readGrant(actionGrant.grantId).consumedAt,null);
+  } finally {
+    db.close();
+  }
+});
+
+test('approvedRoots re-verifies registered root identity and never offers an unverified or replaced root',t=>{
+  const scratch=makeScratchDir(t);
+  const projectDir=join(scratch,'roots-repo');
+  mkdirSync(projectDir);
+  const {db,projects}=makeStores();
+  try {
+    assert.deepEqual(projects.approvedRoots(DEFAULT_PROJECT_ID),[]);
+    const {project}=projects.registerProject({label:'RootsRepo',root:projectDir,revision:GIT_REV});
+    assert.deepEqual(projects.approvedRoots(project.id),[project.root]);
+
+    // Missing identity: a row written without root_dev/root_ino, as a migration would leave it.
+    const unboundDir=join(scratch,'unbound-repo');
+    mkdirSync(unboundDir);
+    const stamp=new Date(1_795_000_000_000).toISOString();
+    db.prepare(
+      'INSERT INTO workspace_projects (id,label,root,revision,is_default,created_at,updated_at) VALUES (?,?,?,?,0,?,?)'
+    ).run('unbound-project','Unbound',resolveLocalRoot(unboundDir),null,stamp,stamp);
+    assert.throws(()=>projects.approvedRoots('unbound-project'),{status:409,code:'PROJECT_ROOT_IDENTITY_UNVERIFIED'});
+
+    // Replaced root: same path, new directory.
+    rmSync(projectDir,{recursive:true,force:true});
+    mkdirSync(projectDir);
+    assert.throws(()=>projects.approvedRoots(project.id),{status:409,code:'PROJECT_ROOT_REPLACED'});
+    assert.throws(()=>projects.approvedRoots(project.id,{useTime:true}),{status:409,code:'PROJECT_ROOT_REPLACED'});
+
+    // Removed root.
+    rmSync(projectDir,{recursive:true,force:true});
+    assert.throws(()=>projects.approvedRoots(project.id,{useTime:true}),{status:409,code:'PROJECT_ROOT_MISSING'});
+    assert.throws(()=>projects.approvedRoots('missing-project'),{status:404,code:'PROJECT_NOT_FOUND'});
+  } finally {
+    db.close();
+  }
+});
+
+test('async scope resolvers that reject are consumed safely and still fail closed without consuming or dispatching',async t=>{
+  const unhandled=[];
+  const onUnhandled=reason=>{unhandled.push(reason);};
+  process.on('unhandledRejection',onUnhandled);
+  t.after(()=>{process.off('unhandledRejection',onUnhandled);});
+
+  const scratch=makeScratchDir(t);
+  const projectDir=join(scratch,'async-repo');
+  const srcDir=join(projectDir,'src');
+  mkdirSync(srcDir,{recursive:true});
+  const now=1_795_000_000_000;
+  const {db,projects,audit,host}=makeStores({clock:()=>now});
+  try {
+    const {project}=projects.registerProject({label:'AsyncRepo',root:projectDir,revision:GIT_REV});
+    const actionInput=validActionInput({projectId:project.id,approvedRoots:[srcDir]});
+    const actionGrant=audit.issueActionGrant(actionInput);
+    registerActionScopeFromInput(host,projects,actionInput);
+    const lease=audit.acquireControllerLease({controllerId:'ctrl-async',leaseToken:'async-lease-token-0001'});
+    const attemptInput=validAttemptInput({projectId:project.id,approvedRoots:[srcDir]});
+    registerScopeFromInput(host,projects,attemptInput);
+    const attempt=audit.issueAttemptGrant(attemptInput);
+
+    const rejectingResolvers=[
+      ()=>Promise.reject(Error('async scope rejected immediately')),
+      ()=>new Promise((_resolve,reject)=>setTimeout(()=>reject(Error('async scope rejected later')),5)),
+      ()=>({then(_resolve,reject) {reject(Error('thenable scope rejected'));}}),
+      ()=>{
+        const rejected=Promise.reject(Error('promise with a throwing then getter'));
+        Object.defineProperty(rejected,'then',{get() {throw Error('then getter failed');}});
+        return rejected;
+      },
+    ];
+    for(const resolver of rejectingResolvers) {
+      const alt=new ApprovalAuditStore(db,{clock:()=>now,projects,scopeResolver:resolver,hostVerifiers:host.hostVerifiers});
+      assert.throws(()=>alt.consumeActionGrant(consumeArgsFromGrant(actionGrant)),{status:409,code:'UNVERIFIED_ACTION_SCOPE'});
+      assert.equal(audit.readGrant(actionGrant.grantId).consumedAt,null);
+      assert.throws(()=>alt.beginDispatch({
+        grantId:attempt.grant.grantId,
+        claimId:attempt.claim.claimId,
+        ownership:lease,
+      }),{status:409,code:'UNVERIFIED_DISPATCH_SCOPE'});
+      assert.equal(audit.readGrant(attempt.grant.grantId).claim.phase,'claimed');
+      assert.equal(audit.readGrant(attempt.grant.grantId).dispatch,null);
+    }
+
+    // Let every pending rejection settle; none may escape as unhandled.
+    await new Promise(resolveWait=>setTimeout(resolveWait,50));
+    assert.deepEqual(unhandled,[]);
+
+    // The synchronous trusted resolver still authorizes both paths afterwards.
+    assert.equal(audit.consumeActionGrant(consumeArgsFromGrant(actionGrant)).consumed,true);
+    const dispatched=audit.beginDispatch({
+      grantId:attempt.grant.grantId,
+      claimId:attempt.claim.claimId,
+      ownership:lease,
+    });
+    assert.equal(dispatched.dispatched,true);
+    assert.equal(dispatched.sealedHandoff,false);
   } finally {
     db.close();
   }

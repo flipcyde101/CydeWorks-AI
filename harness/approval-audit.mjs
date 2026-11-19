@@ -273,9 +273,36 @@ const ALLOWED_ACTION_SCOPE_TARGET_FIELDS=new Set(['kind','id','digest']);
  * malformed, or asynchronous value is reported as an unverified scope (409), because it
  * comes from host state rather than from the caller.
  */
+/**
+ * Detects a Promise or other thenable returned by a mistaken asynchronous resolver and attaches
+ * a no-op rejection handler, so a later rejection is consumed instead of surfacing as an
+ * unhandled rejection. Callers still fail closed synchronously; the settled value is never used.
+ */
+function absorbThenable(value) {
+  if(value===null||(typeof value!=='object'&&typeof value!=='function'))return false;
+  if(value instanceof Promise) {
+    try {
+      Promise.prototype.then.call(value,undefined,()=>{});
+    } catch {}
+    return true;
+  }
+  let then;
+  try {
+    then=value.then;
+  } catch {
+    return true;
+  }
+  if(typeof then!=='function')return false;
+  try {
+    Promise.resolve(value).catch(()=>{});
+  } catch {}
+  return true;
+}
+
 function normalizeActionScope(rawScope) {
   const unverified=detail=>fail(409,'UNVERIFIED_ACTION_SCOPE','Current action scope from server state is '+detail+'.');
-  if(!isPlainObject(rawScope)||typeof rawScope.then==='function')unverified('unavailable');
+  if(absorbThenable(rawScope))unverified('asynchronous; a synchronous resolver is required');
+  if(!isPlainObject(rawScope))unverified('unavailable');
   for(const field of REQUIRED_ACTION_SCOPE_FIELDS) {
     if(!Object.hasOwn(rawScope,field)||rawScope[field]===undefined)unverified('missing '+field);
   }
@@ -1295,6 +1322,9 @@ export class ApprovalAuditStore {
         projectId:grant.projectId,
         grantKind:'attempt',
       });
+      if(absorbThenable(rawServerScope)) {
+        fail(409,'UNVERIFIED_DISPATCH_SCOPE','Dispatch scopeResolver must return current scope synchronously.');
+      }
       const serverScope=normalizeDispatchScope(rawServerScope,{
         missingStatus:409,
         missingCode:'UNVERIFIED_DISPATCH_SCOPE',

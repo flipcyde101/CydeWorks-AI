@@ -56,9 +56,13 @@ const APPROVED_ROOT_CODES=Object.freeze({
   filesystemRoot:'APPROVED_ROOT_OUTSIDE_PROJECT',
 });
 
+// Windows accepts both separators. POSIX has only "/" and allows a literal backslash inside a
+// name, so splitting on backslash there would inspect a different path than the one opened.
+const PATH_SEPARATOR_PATTERN=process.platform==='win32'?/[\\/]+/:/\/+/;
+
 function splitPath(absolutePath) {
   const root=parse(absolutePath).root;
-  return {root,segments:absolutePath.slice(root.length).split(/[\\/]+/).filter(Boolean)};
+  return {root,segments:absolutePath.slice(root.length).split(PATH_SEPARATOR_PATTERN).filter(Boolean)};
 }
 
 // lstat every component from the filesystem root down. Symbolic links, junctions and
@@ -165,6 +169,11 @@ export function validateLocalPathSyntax(rawPath,code='INVALID_PROJECT_ROOT',labe
     if(!rawPath.startsWith('/')) {
       fail(400,code,'Enter an absolute local path for '+label+'.');
     }
+    // A POSIX name may legally contain "\", but Windows-style tooling and reviewers read it as a
+    // separator. Reject it before any filesystem access so no two readings of a path exist.
+    if(rawPath.includes('\\')) {
+      fail(400,code,'Backslash characters are not permitted in '+label+' on this host.');
+    }
     remainder=rawPath;
   }
   if(!isAbsolute(rawPath)) {
@@ -173,7 +182,7 @@ export function validateLocalPathSyntax(rawPath,code='INVALID_PROJECT_ROOT',labe
   if(RESERVED_CHARS_PATTERN.test(remainder)) {
     fail(400,code,'Reserved or wildcard characters are not permitted in '+label+'.');
   }
-  const segments=remainder.split(/[\\/]+/);
+  const segments=remainder.split(PATH_SEPARATOR_PATTERN);
   for(const seg of segments) {
     if(seg==='')continue;
     if(seg==='.'||seg==='..') {
@@ -676,8 +685,14 @@ export class WorkspaceProjects {
     return {...task,projectId};
   }
 
-  approvedRoots(projectId=DEFAULT_PROJECT_ID) {
+  /**
+   * Returns the registered root only after its recorded directory identity is re-verified, so
+   * an unverified migrated row or a replaced directory fails closed instead of being offered as
+   * approved. The result is still a pathname, not a sealed handle: callers must re-verify at use.
+   */
+  approvedRoots(projectId=DEFAULT_PROJECT_ID,{useTime=false}={}) {
     const project=this.requireProject(projectId);
-    return Object.freeze(project.root?[project.root]:[]);
+    const verified=this.verifyProjectRootIdentity(project,{useTime});
+    return Object.freeze(verified?[verified.path]:[]);
   }
 }
