@@ -97,6 +97,13 @@ function pushUniqueReason(reasons, reason) {
   }
 }
 
+function isCanonicalAttemptId(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && !CONTROL_CHARS_RE.test(value)
+    && value.trim() === value;
+}
+
 function hasGenuineActiveStall(task, options) {
   try {
     if (!isPlainObject(options)) return false;
@@ -132,10 +139,9 @@ function hasGenuineActiveStall(task, options) {
     if (!isPlainObject(attempt)) return false;
 
     const attemptId = ownData(attempt, 'id');
-    if (typeof attemptId !== 'string' || CONTROL_CHARS_RE.test(attemptId) || !attemptId.trim()) {
+    if (!isCanonicalAttemptId(attemptId)) {
       return false;
     }
-    const cleanAttemptId = attemptId.trim();
 
     const attemptStatus = ownData(attempt, 'status');
     if (attemptStatus !== undefined && attemptStatus !== 'running') return false;
@@ -162,25 +168,17 @@ function hasGenuineActiveStall(task, options) {
 
     const optAttemptId = ownData(options, 'attemptId');
     const progAttemptId = ownData(rawProgress, 'attemptId');
-    if (
-      optAttemptId !== undefined
-      && (typeof optAttemptId !== 'string' || CONTROL_CHARS_RE.test(optAttemptId) || !optAttemptId.trim())
-    ) {
+    if (optAttemptId !== undefined && !isCanonicalAttemptId(optAttemptId)) {
       return false;
     }
-    if (
-      progAttemptId !== undefined
-      && (typeof progAttemptId !== 'string' || CONTROL_CHARS_RE.test(progAttemptId) || !progAttemptId.trim())
-    ) {
+    if (progAttemptId !== undefined && !isCanonicalAttemptId(progAttemptId)) {
       return false;
     }
-    const cleanOptId = typeof optAttemptId === 'string' ? optAttemptId.trim() : null;
-    const cleanProgId = typeof progAttemptId === 'string' ? progAttemptId.trim() : null;
-    if (cleanOptId !== null && cleanProgId !== null && cleanOptId !== cleanProgId) {
+    if (optAttemptId !== undefined && progAttemptId !== undefined && optAttemptId !== progAttemptId) {
       return false;
     }
-    const boundAttemptId = cleanOptId ?? cleanProgId;
-    if (!boundAttemptId || boundAttemptId !== cleanAttemptId) {
+    const boundAttemptId = optAttemptId ?? progAttemptId;
+    if (boundAttemptId === undefined || boundAttemptId !== attemptId) {
       return false;
     }
 
@@ -273,19 +271,29 @@ function hasGenuineActiveStall(task, options) {
       }
     }
 
-    const dispatchedAt = ownData(rawExecution, 'dispatchedAt');
-    if (dispatchedAt !== undefined && dispatchedAt !== null) {
-      const dispatchedAtMs = parseTimestampMs(dispatchedAt);
-      if (dispatchedAtMs === null || dispatchedAtMs < attemptStartedMs || lastActivity < dispatchedAtMs) {
-        return false;
-      }
+    const dispatchedAtMs = parseTimestampMs(ownData(rawExecution, 'dispatchedAt'));
+    if (dispatchedAtMs === null || dispatchedAtMs < attemptStartedMs || lastActivity < dispatchedAtMs) {
+      return false;
     }
 
     const stepSamplesValid = ownData(rawProgress, 'stepSamplesValid');
+    const completedSteps = ownData(rawProgress, 'completedSteps');
+    const stepRate = ownData(rawProgress, 'stepRate');
+    const currentStep = ownData(rawProgress, 'currentStep');
+    const hasMeasuredOverallSteps = stepSamplesValid === true
+      && typeof completedSteps === 'number' && Number.isSafeInteger(completedSteps) && completedSteps > 0
+      && typeof stepRate === 'number' && Number.isFinite(stepRate) && stepRate > 0;
+    const hasMeasuredCurrentStep = stepSamplesValid === true
+      && isPlainObject(currentStep)
+      && typeof ownData(currentStep, 'completed') === 'number'
+      && Number.isSafeInteger(ownData(currentStep, 'completed'))
+      && ownData(currentStep, 'completed') > 0
+      && typeof ownData(currentStep, 'rate') === 'number'
+      && Number.isFinite(ownData(currentStep, 'rate'))
+      && ownData(currentStep, 'rate') > 0;
     const chars = ownData(rawProgress, 'chars');
-    const hasMeasuredSteps = stepSamplesValid === true;
     const hasObservedOutput = typeof chars === 'number' && Number.isSafeInteger(chars) && chars > 0;
-    if (!hasMeasuredSteps && !hasObservedOutput) {
+    if (!hasMeasuredOverallSteps && !hasMeasuredCurrentStep && !hasObservedOutput) {
       return false;
     }
 
@@ -309,6 +317,16 @@ function hasGenuineActiveStall(task, options) {
  *   trusted host boundary. Arbitrary caller strings or booleans (such as
  *   `trusted: true`, `provenance: 'host'`, or `source: 'worker'`) do not prove
  *   trusted host provenance.
+ * - `attemptId` requires exact canonical equality (non-empty, no control
+ *   characters, no leading/trailing whitespace) against the current attempt's `id`,
+ *   and `attempt.execution.dispatchedAt` must be a valid timestamp with
+ *   `lastActivity >= dispatchedAt >= started`.
+ * - Because `describeProgress(...)` sets `stepSamplesValid: true` even for empty
+ *   `steps: {}` (and does not expose `samplesCount` or `lastProgressAt` on its
+ *   return object), positive step-only stall proof requires `stepSamplesValid === true`
+ *   with `completed > 0` and `rate > 0` (either overall `completedSteps`/`stepRate`
+ *   or `currentStep.completed`/`currentStep.rate`) or observed output (`chars > 0`).
+ *   Single-sample step runs without output fail closed under the current progress contract.
  * - Future server and telemetry wiring (for example in `server.mjs`) must
  *   compute `progress` server-side from authoritative host-observed run state
  *   via `describeProgress(...)`, bind `attemptId` to the server-owned current

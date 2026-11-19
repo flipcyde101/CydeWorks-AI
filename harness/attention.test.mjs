@@ -249,6 +249,64 @@ test('active progress with a fresh heartbeat, elapsed time alone, and heartbeat-
   const zeroWorkProgress = describeProgress(zeroWorkTask, zeroWorkTask.attempts[0], then + 65_000);
   assert.equal(attentionFor(zeroWorkTask, {attemptId: 'att-zero', progress: zeroWorkProgress}), null);
 
+  // Empty steps: {} sets stepSamplesValid: true in describeProgress; initialized lastActivity + fresh heartbeat + zero output must NOT infer a stall.
+  const emptyStepsTask = makeRunningTask({
+    id: 'task-empty-steps',
+    attemptId: 'att-empty-steps',
+    live: {
+      chars: 0,
+      lastActivity: start,
+      heartbeat: new Date(then + 64_000).toISOString(),
+      steps: {},
+    },
+  });
+  const emptyStepsProgress = describeProgress(emptyStepsTask, emptyStepsTask.attempts[0], then + 65_000);
+  assert.equal(emptyStepsProgress.phase, 'stalled');
+  assert.equal(emptyStepsProgress.stepSamplesValid, true);
+  assert.equal(emptyStepsProgress.completedSteps, null);
+  assert.equal(emptyStepsProgress.stepRate, null);
+  assert.equal(attentionFor(emptyStepsTask, {attemptId: 'att-empty-steps', progress: emptyStepsProgress}), null);
+
+  // Untimestamped completed count without samples also sets stepSamplesValid: true and stepRate: null -> fail closed.
+  const untimestampedStepsTask = makeRunningTask({
+    id: 'task-nosamples',
+    attemptId: 'att-nosamples',
+    live: {
+      chars: 0,
+      lastActivity: start,
+      heartbeat: new Date(then + 64_000).toISOString(),
+      steps: {measured: true, source: 'worker', completed: 2, total: 5},
+    },
+  });
+  const untimestampedProgress = describeProgress(untimestampedStepsTask, untimestampedStepsTask.attempts[0], then + 65_000);
+  assert.equal(untimestampedProgress.stepSamplesValid, true);
+  assert.equal(untimestampedProgress.completedSteps, 2);
+  assert.equal(untimestampedProgress.stepRate, null);
+  assert.equal(attentionFor(untimestampedStepsTask, {attemptId: 'att-nosamples', progress: untimestampedProgress}), null);
+
+  // Single-sample step series exposes stepRate: null under describeProgress and fails closed without observed output.
+  const singleSampleTask = makeRunningTask({
+    id: 'task-onesample',
+    attemptId: 'att-onesample',
+    live: {
+      chars: 0,
+      lastActivity: null,
+      heartbeat: new Date(then + 64_000).toISOString(),
+      steps: {
+        measured: true,
+        source: 'worker',
+        completed: 1,
+        total: 5,
+        samples: [{at: new Date(then + 4_000).toISOString(), done: 1}],
+      },
+    },
+  });
+  const singleSampleProgress = describeProgress(singleSampleTask, singleSampleTask.attempts[0], then + 65_000);
+  assert.equal(singleSampleProgress.stepSamplesValid, true);
+  assert.equal(singleSampleProgress.completedSteps, 1);
+  assert.equal(singleSampleProgress.stepRate, null);
+  assert.equal(attentionFor(singleSampleTask, {attemptId: 'att-onesample', progress: singleSampleProgress}), null);
+
   // Heartbeat-only stall (missing lastActivity timestamp) must not trigger a stall.
   const heartbeatOnlyTask = makeRunningTask({
     id: 'task-hb',
@@ -273,10 +331,12 @@ test('active progress with a fresh heartbeat, elapsed time alone, and heartbeat-
       lastActivity: null,
       idleMs: null,
       stepSamplesValid: true,
+      completedSteps: 2,
+      stepRate: 0.5,
     },
   }), null);
 
-  // Missing attempt.started timestamp or inverted dispatch timestamp never infers a stall.
+  // Missing attempt.started timestamp, missing dispatchedAt, or inverted/pre-dispatch timing never infers a stall.
   const missingStartTask = makeRunningTask({id: 'task-nostart', attemptId: 'att-ns', started: undefined});
   assert.equal(attentionFor(missingStartTask, {
     attemptId: 'att-ns',
@@ -287,6 +347,43 @@ test('active progress with a fresh heartbeat, elapsed time alone, and heartbeat-
       lastActivity: then + 4_000,
       idleMs: 61_000,
       stepSamplesValid: true,
+      completedSteps: 2,
+      stepRate: 0.5,
+    },
+  }), null);
+
+  const missingDispatchedAtTask = makeRunningTask({
+    id: 'task-nodisp',
+    attemptId: 'att-nodisp',
+    dispatchedAt: undefined,
+    live: {
+      chars: 120,
+      lastActivity: new Date(then + 4_000).toISOString(),
+      heartbeat: new Date(then + 64_000).toISOString(),
+    },
+  });
+  const missingDispProgress = describeProgress(missingDispatchedAtTask, missingDispatchedAtTask.attempts[0], then + 65_000);
+  assert.equal(missingDispProgress.phase, 'stalled');
+  assert.equal(attentionFor(missingDispatchedAtTask, {attemptId: 'att-nodisp', progress: missingDispProgress}), null);
+
+  const preDispatchActivityTask = makeRunningTask({
+    id: 'task-predisp',
+    attemptId: 'att-predisp',
+    started: start,
+    dispatchedAt: new Date(then + 10_000).toISOString(),
+  });
+  assert.equal(attentionFor(preDispatchActivityTask, {
+    attemptId: 'att-predisp',
+    progress: {
+      phase: 'stalled',
+      stalled: true,
+      clockAnomaly: false,
+      lastActivity: then + 4_000,
+      idleMs: 61_000,
+      elapsedMs: 65_000,
+      stepSamplesValid: true,
+      completedSteps: 2,
+      stepRate: 0.5,
     },
   }), null);
 
@@ -306,6 +403,8 @@ test('active progress with a fresh heartbeat, elapsed time alone, and heartbeat-
       idleMs: 61_000,
       elapsedMs: 62_000,
       stepSamplesValid: true,
+      completedSteps: 2,
+      stepRate: 0.5,
     },
   }), null);
 });
@@ -319,6 +418,8 @@ test('claimed/preflight, missing execution, and settled attempt states never rep
     idleMs: 61_000,
     elapsedMs: 65_000,
     stepSamplesValid: true,
+    completedSteps: 2,
+    stepRate: 0.5,
     chars: 50,
   };
 
@@ -348,6 +449,8 @@ test('missing and mismatched attempt IDs never trigger a stall', () => {
     idleMs: 61_000,
     elapsedMs: 65_000,
     stepSamplesValid: true,
+    completedSteps: 2,
+    stepRate: 0.5,
   };
   const task = makeRunningTask({
     attemptId: 'att-current',
@@ -360,6 +463,18 @@ test('missing and mismatched attempt IDs never trigger a stall', () => {
   assert.equal(attentionFor(task, {attemptId: '   ', progress: stalledSnapshot}), null);
   assert.equal(attentionFor(task, {attemptId: 'att-current\n', progress: stalledSnapshot}), null);
   assert.equal(attentionFor(task, {attemptId: 123, progress: stalledSnapshot}), null);
+
+  // Noncanonical whitespace around attemptId must be rejected instead of trimmed to match.
+  assert.equal(attentionFor(task, {attemptId: ' att-current ', progress: stalledSnapshot}), null);
+  assert.equal(attentionFor(task, {attemptId: 'att-current ', progress: stalledSnapshot}), null);
+  assert.equal(attentionFor(task, {attemptId: ' att-current', progress: stalledSnapshot}), null);
+  assert.equal(attentionFor(task, {
+    attemptId: 'att-current',
+    progress: {...stalledSnapshot, attemptId: ' att-current '},
+  }), null);
+  const paddedAttemptTask = makeRunningTask({attemptId: ' att-current '});
+  assert.equal(attentionFor(paddedAttemptTask, {attemptId: 'att-current', progress: stalledSnapshot}), null);
+  assert.equal(attentionFor(paddedAttemptTask, {attemptId: ' att-current ', progress: stalledSnapshot}), null);
 
   // Previous attempt or unrelated attemptId
   assert.equal(attentionFor(task, {attemptId: 'att-previous', progress: stalledSnapshot}), null);
@@ -390,6 +505,8 @@ test('terminal task and attempt states never emit a stall reason', () => {
     idleMs: 61_000,
     elapsedMs: 65_000,
     stepSamplesValid: true,
+    completedSteps: 2,
+    stepRate: 0.5,
   };
 
   for (const [status, expectedReasons] of [
@@ -438,6 +555,8 @@ test('recovery plus stall keeps one task-level entry without duplicating or leak
     idleMs: 61_000,
     elapsedMs: 65_000,
     stepSamplesValid: true,
+    completedSteps: 2,
+    stepRate: 0.5,
   };
 
   const interruptedHeld = makeRunningTask({
@@ -598,6 +717,8 @@ test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fa
     idleMs: 61_000,
     elapsedMs: 65_000,
     stepSamplesValid: true,
+    completedSteps: 2,
+    stepRate: 0.5,
     trusted: true,
     provenance: 'host',
     hostVerified: true,
@@ -615,6 +736,9 @@ test('invalid inputs, throwing getters, untrusted labels, and clock anomalies fa
     {...baseStall, measured: false},
     {...baseStall, trustworthy: false},
     {...baseStall, stepSamplesValid: false, chars: 50},
+    {...baseStall, completedSteps: null, stepRate: null},
+    {...baseStall, stepRate: null, chars: 0},
+    {...baseStall, completedSteps: 0, stepRate: 0, chars: 0},
     {...baseStall, clockAnomaly: true},
     {...baseStall, clockAnomalyReason: 'Clock timestamps are inconsistent or out of range.'},
     {...baseStall, lastActivity: Number.NaN},
@@ -668,6 +792,8 @@ test('error-data minimization omits raw progress diagnostics, recovery messages,
       idleMs: 61_000,
       elapsedMs: 65_000,
       stepSamplesValid: true,
+      completedSteps: 2,
+      stepRate: 0.5,
       status: `Provider error ${secret}`,
       explanation: `Detailed trace ${winPath}`,
       stepRejectionReason: `Rejected ${bearer}`,
@@ -702,6 +828,8 @@ test('error-data minimization omits raw progress diagnostics, recovery messages,
       idleMs: 61_000,
       elapsedMs: 65_000,
       stepSamplesValid: true,
+      completedSteps: 2,
+      stepRate: 0.5,
       status: `Progress status ${secret}`,
       explanation: `Detailed trace ${winPath}`,
       stepRejectionReason: `Rejected ${bearer}`,
