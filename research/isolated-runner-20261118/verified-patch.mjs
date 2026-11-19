@@ -436,7 +436,8 @@ export function verifyAndBindPatch({
 
   // Note: `verification.trusted === true` is only a caller-supplied attestation gate;
   // provenance must be enforced by the host caller via a sealed verifier channel.
-  if (!isPlainObj(verification) || verification.trusted !== true || verification.passed !== true ||
+  if (!isPlainObj(verification) || verification.trusted !== true || verification.untrusted === true ||
+      verification.passed !== true ||
       verification.claimId !== resolvedClaim.claimId || verification.baseRevision !== baseRevision ||
       verification.casesDigest !== boundScope.casesDigest || verification.totalCases !== boundScope.totalCases ||
       verification.passedCases !== boundScope.totalCases ||
@@ -504,7 +505,6 @@ export function verifyAndBindPatch({
     patchedFiles: derivedChanged,
     verification: Object.freeze({
       callerAssertedTrusted: true,
-      provenanceEnforcedByCaller: true,
       passed: true,
       claimId: resolvedClaim.claimId,
       baseRevision,
