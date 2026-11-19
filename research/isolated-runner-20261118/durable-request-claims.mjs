@@ -28,8 +28,8 @@ export const TRUST_LIMITS = Object.freeze([
   'SQLite integrity_check runs before every transaction body. It verifies b-tree structure and that index entries agree with table rows. It cannot detect a structurally valid, semantically consistent rewrite.',
   'Process identity: worker birth identity is the exact triple {pid, creationTime, bootId}, stored as a hash. A matching hash is not proof that the OS process is alive, dead or the same process. Partial identities are rejected and worker death is never inferred.',
   'Dispatch uncertainty: after a dispatch intent is committed, a crash leaves it unknown whether dispatch happened. The claim stays unresolved; actual worker-tree discovery and termination are outside this helper.',
-  'Durability relies on SQLite synchronous=FULL with a rollback journal and on the OS and disk honoring flushes. Windows write caching, removable drives and power-loss behavior are not verified here.',
-  'Capacity: the default bound is 1024 claims within 2048 pages. Every transaction validates the whole store, so cost grows linearly with rows. A larger maxRows needs a matching maxPages; reaching either bound fails closed.',
+  'Journal mode: only the SQLite rollback journal (journal_mode=delete) is accepted. It is checked at open and inside every transaction after the store is read; a WAL or other mode fails closed with STORE_UNSUPPORTED and the registry never converts an existing store. Durability still relies on synchronous=FULL and on the OS and disk honoring flushes. Windows durability (write caching, removable drives, power loss) is not verified or claimed.',
+  'Capacity: the default bound is 1024 claims within 2048 pages. The store page_count and the connection effective max_page_count are checked at open and inside every transaction; a store larger than maxPages, or a limit SQLite kept above it, fails closed with STORE_FULL. Every transaction validates the whole store, so cost grows linearly with rows. A larger maxRows needs a matching maxPages.',
   'Not claimed: Windows Stop, actual worker-tree recovery, live runner qualification, browser staging, event cursor replay (RPL-03), result artifact exclusivity (DUR-03) and atomicity across other stores (usage ledger, approval audit, result files).',
   'Hashes of low-entropy synthetic values can be guessed. Callers must not place secrets or raw environment data in request ids or scopes.',
 ]);
@@ -71,6 +71,7 @@ const MESSAGES = Object.freeze({
   STORE_BUSY: 'Claim store is busy.',
   STORE_FULL: 'Claim store has reached its bound.',
   STORE_CONFLICT: 'Claim store changed unexpectedly during the transaction.',
+  STORE_UNSUPPORTED: 'Claim store uses an unsupported journal mode.',
   REGISTRY_CLOSED: 'Claim registry is closed.',
   INTERNAL_ERROR: 'Claim registry failed internally.',
 });
@@ -280,14 +281,31 @@ function checkIntegrity(db) {
   if (result.length !== 1 || Object.values(result[0])[0] !== 'ok') fail('STORE_CORRUPT');
 }
 
+const pragmaValue = (db, name) => {
+  const rows = db.prepare(`PRAGMA ${name}`).all();
+  return rows.length === 1 ? Object.values(rows[0])[0] : undefined;
+};
+
+// Journal mode and page bound are read from the live connection, not assumed
+// from the pragmas set at open. Must run after the transaction has read the
+// database, so a mode change made by another connection is visible.
+function checkStorage(db, maxPages) {
+  if (String(pragmaValue(db, 'journal_mode')).toLowerCase() !== 'delete') fail('STORE_UNSUPPORTED');
+  const limit = Number(pragmaValue(db, 'max_page_count'));
+  const pages = Number(pragmaValue(db, 'page_count'));
+  if (!Number.isSafeInteger(limit) || !Number.isSafeInteger(pages)) fail('STORE_CORRUPT');
+  if (limit !== maxPages || pages > maxPages) fail('STORE_FULL');
+}
+
 // Validates the whole store on every transaction, not just the queried row.
 // A corrupted unrelated row, a duplicated nonce or worker identity, a row
 // count or aggregate mismatch, an index that disagrees with its table, or an
 // unexpected schema object fails closed for every request. This is what stops
 // a request key that was altered without resealing from looking like an
 // absent request.
-function validateStore(db, maxRows, {integrity}) {
+function validateStore(db, {maxRows, maxPages}, {integrity}) {
   if (integrity) checkIntegrity(db);
+  checkStorage(db, maxPages);
   validateSchema(readSchema(db));
   const meta = Object.create(null);
   for (const entry of db.prepare('SELECT key, value FROM meta LIMIT 8').all()) {
@@ -365,12 +383,14 @@ function validateOptions(path, options) {
 class DurableRequestClaims {
   #db;
   #maxRows;
+  #maxPages;
   #fault;
   #closed = false;
 
   constructor(path, options) {
     const {initialize, maxRows, busyTimeoutMs, maxPages, testFaultHook} = validateOptions(path, options);
     this.#maxRows = maxRows;
+    this.#maxPages = maxPages;
     this.#fault = testFaultHook;
     // Opening never creates a store unless initialization was requested, so a
     // missing file cannot silently become an empty registry.
@@ -386,6 +406,7 @@ class DurableRequestClaims {
       db.exec('BEGIN IMMEDIATE');
       try {
         checkIntegrity(db);
+        checkStorage(db, maxPages);
         if (readSchema(db).length === 0) {
           if (!initialize) fail('STORE_UNINITIALIZED');
           db.exec(TABLES.claims);
@@ -395,7 +416,7 @@ class DurableRequestClaims {
           insert.run('row_count', '0');
           insert.run('aggregate', aggregateDigest([]));
         }
-        validateStore(db, maxRows, {integrity: false});
+        validateStore(db, {maxRows, maxPages}, {integrity: false});
         db.exec('COMMIT');
       } catch (error) {
         try { db.exec('ROLLBACK'); } catch {}
@@ -408,7 +429,7 @@ class DurableRequestClaims {
     this.#db = db;
   }
 
-  // Ordering: integrity and whole-store validation, then the body, then a
+  // Ordering: integrity, journal mode, page bound and whole-store validation, then the body, then a
   // second whole-store validation of the written state, then COMMIT. A write
   // result is returned only after COMMIT succeeds.
   #transaction(write, label, body) {
@@ -418,9 +439,10 @@ class DurableRequestClaims {
     try {
       db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN');
       open = true;
-      const result = body(validateStore(db, this.#maxRows, {integrity: true}));
+      const bounds = {maxRows: this.#maxRows, maxPages: this.#maxPages};
+      const result = body(validateStore(db, bounds, {integrity: true}));
       if (write) {
-        validateStore(db, this.#maxRows, {integrity: false});
+        validateStore(db, bounds, {integrity: false});
         this.#fault?.(`${label}:before-commit`);
       }
       db.exec('COMMIT');
