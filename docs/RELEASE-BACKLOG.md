@@ -473,6 +473,15 @@ Author dates are UTC-7. Each child is later than the review completion time in s
 
 The patch follow-up subject names the unconditional provenance field and an untrusted verifier flag. That subject does not mention the High host-owned store and out-of-band verifier channel. Even if it did, this note would not treat the subject as closure. Each of the six children still needs its own single Codex `gpt-6.2-sol` high re-review after the fix commit. Those reviews were not launched here.
 
+### Context library nonblocking follow-ups, owner checkpoint 2026-11-19
+
+Owner reports context integration at `24311b784e0289cb3c3713f1156af12b80c2138b`, independent Codex GPT-6.2 Sol High review, 19 focused offline passes and 321/321 full harness passes on that exact commit. These results were not rerun by this coordinator. The library remains disconnected from live authentication and browser callers.
+
+- Reject oversized strings before UTF-8 allocation. Add boundary tests showing rejection occurs before allocating an oversized encoded buffer.
+- Tighten Proxy array-key validation. Add data-only input tests covering unexpected array keys while preserving valid dense arrays and fail-closed behavior.
+
+Both are nonblocking reviewer follow-ups, not claims of completed fixes or authority to connect the library to live callers.
+
 ### 8.8 Limits of this ledger
 
 - Sections 1 through 7 were left in place, including their `7fc7bd8` baseline and their original "can run now" wording.
