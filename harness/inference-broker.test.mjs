@@ -151,8 +151,8 @@ test('settlement confirms complete normal JSON and SSE responses with positive c
         const utf8=Buffer.from('data: {"id":"1","object":"chat.completion.chunk","choices":[{"delta":{"content":"hello 🚀"},"finish_reason":null}]}\r\n\r\n','utf8');
         res.write(utf8.subarray(0,utf8.length-10));
         res.write(utf8.subarray(utf8.length-10));
-        res.write('data: {"id":"2","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}\r\n\r\n');
-        res.write('data: {"id":"3","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2}}\r\n\r\n');
+        res.write('data: {"id":"1","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}\r\n\r\n');
+        res.write('data: {"id":"1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2}}\r\n\r\n');
         res.end('data: [DONE]\r\n\r\n');
         return;
       }
@@ -494,6 +494,27 @@ test('settlement validates per-choice terminal evidence for JSON and SSE includi
         res.end('data: [DONE]\n\n');
         return;
       }
+      if(scenario==='sse-n2-mixed-completion-ids') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"id":"a","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"id":"b","object":"chat.completion.chunk","choices":[{"index":1,"finish_reason":"stop"}]}\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+      if(scenario==='sse-n2-present-then-missing-id') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"id":"a","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"object":"chat.completion.chunk","choices":[{"index":1,"finish_reason":"stop"}]}\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+      if(scenario==='sse-n2-missing-then-present-id') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        res.write('data: {"object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.write('data: {"id":"b","object":"chat.completion.chunk","choices":[{"index":1,"finish_reason":"stop"}]}\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
       res.writeHead(200,{'content-type':'application/json'});
       res.end(JSON.stringify({choices:[{index:0,finish_reason:'stop'}]}));
     });
@@ -521,6 +542,9 @@ test('settlement validates per-choice terminal evidence for JSON and SSE includi
     [{n:2,scenario:'sse-n2-choice1-unfinished'},'sse-n2-choice1-unfinished'],
     [{n:2,scenario:'sse-n2-duplicate-finish'},'sse-n2-duplicate-finish'],
     [{n:1,scenario:'sse-n1-delta-after-finish'},'sse-n1-delta-after-finish'],
+    [{n:2,scenario:'sse-n2-mixed-completion-ids'},'sse-n2-mixed-completion-ids'],
+    [{n:2,scenario:'sse-n2-present-then-missing-id'},'sse-n2-present-then-missing-id'],
+    [{n:2,scenario:'sse-n2-missing-then-present-id'},'sse-n2-missing-then-present-id'],
     [{n:0,scenario:'json-n1-ok'},'invalid-n-zero'],
   ]) {
     const snap=await postScenario(payload);
@@ -637,7 +661,12 @@ test('concurrent observation memory and active entry limits keep outcomes unknow
   while(pending.length<66)await new Promise(resolve=>setTimeout(resolve,5));
   const mid=overflowBroker.settlement();
   assert.equal(mid.state,'unknown');
+  assert.equal(mid.evidence,'in-flight');
+  assert.equal(mid.dispatched,66);
   assert.equal(mid.inFlight,66);
+  assert.equal(mid.completed,0);
+  assert.equal(mid.unknown,0);
+  assert.equal(mid.dispatched,mid.inFlight+mid.completed+mid.unknown);
   for(const finish of pending)finish();
   const bodies=await Promise.all(inflightFetches);
   assert.equal(bodies.length,66);
@@ -648,6 +677,151 @@ test('concurrent observation memory and active entry limits keep outcomes unknow
   assert.equal(end.unknown,2);
   assert.equal(end.completed,64);
   assert.equal(end.recordsTruncated,true);
+  assert.equal(end.dispatched,end.inFlight+end.completed+end.unknown);
+});
+
+test('broker.close settles overflow in-flight dispatches into unknown without leaving inFlight counts',async t=>{
+  const pendingClose=[];
+  const target=await backend(t,(req,res)=>{
+    req.resume();
+    req.on('end',()=>{pendingClose.push(()=>{if(!res.destroyed&&!res.writableEnded){res.writeHead(200);res.end('{}');}});});
+  });
+  const broker=await createInferenceBroker(target,{model:'synthetic-model'});
+  t.after(()=>broker.close());
+  const requests=Array.from({length:66},()=>fetch(broker.endpoint+'/v1/chat/completions',{
+    method:'POST',
+    body:JSON.stringify({model:'synthetic-model'}),
+    headers:{'x-cydeworks-local':broker.token},
+  }).catch(err=>err));
+  while(pendingClose.length<66)await new Promise(resolve=>setTimeout(resolve,5));
+  const mid=broker.settlement();
+  assert.equal(mid.state,'unknown');
+  assert.equal(mid.evidence,'in-flight');
+  assert.equal(mid.dispatched,66);
+  assert.equal(mid.inFlight,66);
+  assert.equal(mid.completed,0);
+  assert.equal(mid.unknown,0);
+  assert.equal(mid.recordsTruncated,true);
+
+  await broker.close();
+  await Promise.all(requests);
+
+  const closedSnap=broker.settlement();
+  assert.equal(closedSnap.state,'unknown');
+  assert.equal(closedSnap.evidence,'broker-closed');
+  assert.equal(closedSnap.closed,true);
+  assert.equal(closedSnap.dispatched,66);
+  assert.equal(closedSnap.inFlight,0);
+  assert.equal(closedSnap.completed,0);
+  assert.equal(closedSnap.unknown,66);
+  assert.equal(closedSnap.modelCancellationVerified,false);
+  assert.equal(closedSnap.dispatched,closedSnap.inFlight+closedSnap.completed+closedSnap.unknown);
+});
+
+test('paused SSE streams bound event names and hit aggregate observation cap without truncating forwarded output',async t=>{
+  const largeEventName='e'.repeat(200000);
+  const largeDelta='d'.repeat(220000);
+  const pendingEvent=[];
+  const pendingSse=[];
+  const target=await backend(t,(req,res)=>{
+    let body='';
+    req.on('data',chunk=>{body+=chunk;});
+    req.on('end',()=>{
+      const {mode}=JSON.parse(body);
+      res.writeHead(200,{'content-type':'text/event-stream'});
+      if(mode==='pause-event') {
+        res.write('event: '+largeEventName+'\n');
+        pendingEvent.push(()=>{
+          res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+          res.end('data: [DONE]\n\n');
+        });
+        return;
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"'+largeDelta+'"},"finish_reason":null}]}\n');
+      pendingSse.push(()=>{
+        res.write('\n');
+        res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}]}\n\n');
+        res.end('data: [DONE]\n\n');
+      });
+    });
+  });
+
+  const eventBroker=await createInferenceBroker(target,{model:'synthetic-model'});
+  t.after(()=>eventBroker.close());
+  const eventDrainers=[];
+  await Promise.all(Array.from({length:21},async()=>{
+    const r=await fetch(eventBroker.endpoint+'/v1/chat/completions',{method:'POST',
+      body:JSON.stringify({model:'synthetic-model',mode:'pause-event'}),
+      headers:{'x-cydeworks-local':eventBroker.token}});
+    assert.equal(r.status,200);
+    const reader=r.body.getReader();
+    const decoder=new TextDecoder();
+    let head='';
+    while(!head.includes('\n')) {
+      const step=await reader.read();
+      assert.equal(step.done,false);
+      head+=decoder.decode(step.value,{stream:true});
+    }
+    eventDrainers.push(async()=>{
+      let text=head;
+      while(true) {
+        const step=await reader.read();
+        if(step.done){text+=decoder.decode();break;}
+        text+=decoder.decode(step.value,{stream:true});
+      }
+      return text;
+    });
+  }));
+  const midEvent=eventBroker.settlement();
+  assert.equal(midEvent.inFlight,21);
+  assert.equal(midEvent.observationBytes,0);
+  for(const finish of pendingEvent)finish();
+  const eventBodies=await Promise.all(eventDrainers.map(fn=>fn()));
+  for(const text of eventBodies)assert.ok(text.includes(largeEventName)&&text.endsWith('data: [DONE]\n\n'));
+  const endEvent=eventBroker.settlement();
+  assert.equal(endEvent.state,'settled');
+  assert.equal(endEvent.completed,21);
+  assert.equal(endEvent.unknown,0);
+  assert.equal(endEvent.observationBytes,0);
+
+  const sseBroker=await createInferenceBroker(target,{model:'synthetic-model'});
+  t.after(()=>sseBroker.close());
+  const sseDrainers=[];
+  await Promise.all(Array.from({length:20},async()=>{
+    const r=await fetch(sseBroker.endpoint+'/v1/chat/completions',{method:'POST',
+      body:JSON.stringify({model:'synthetic-model',mode:'pause-data'}),
+      headers:{'x-cydeworks-local':sseBroker.token}});
+    assert.equal(r.status,200);
+    const reader=r.body.getReader();
+    const decoder=new TextDecoder();
+    let head='';
+    while(!head.includes('\n')) {
+      const step=await reader.read();
+      assert.equal(step.done,false);
+      head+=decoder.decode(step.value,{stream:true});
+    }
+    sseDrainers.push(async()=>{
+      let text=head;
+      while(true) {
+        const step=await reader.read();
+        if(step.done){text+=decoder.decode();break;}
+        text+=decoder.decode(step.value,{stream:true});
+      }
+      return text;
+    });
+  }));
+  const midSse=sseBroker.settlement();
+  assert.equal(midSse.inFlight,20);
+  assert.ok(midSse.observationBytes>3500000&&midSse.observationBytes<=4000000);
+  for(const finish of pendingSse)finish();
+  const sseBodies=await Promise.all(sseDrainers.map(fn=>fn()));
+  for(const text of sseBodies)assert.ok(text.includes(largeDelta)&&text.endsWith('data: [DONE]\n\n'));
+  const endSse=sseBroker.settlement();
+  assert.equal(endSse.state,'unknown');
+  assert.equal(endSse.observationBytes,0);
+  assert.ok(endSse.unknown>=2);
+  assert.ok(endSse.records.some(r=>r.evidence==='observation-limit-exceeded'));
+  assert.equal(endSse.dispatched,endSse.inFlight+endSse.completed+endSse.unknown);
 });
 
 test('overlapping dispatches and late abort races preserve accurate settlement and zero model cancellation claim',async t=>{

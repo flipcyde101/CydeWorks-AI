@@ -1,5 +1,5 @@
 import {Agent,createServer,request} from 'node:http';
-import {randomBytes,timingSafeEqual} from 'node:crypto';
+import {createHash,randomBytes,timingSafeEqual} from 'node:crypto';
 
 const MAX_BODY_BYTES=2000000;
 const MAX_OBSERVATION_BYTES=4000000;
@@ -92,9 +92,11 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
   const decoder=new TextDecoder('utf-8',{fatal:true});
   let lineBuffer='';
   let ignoreNextLf=false;
-  let eventType='';
+  let isErrorEvent=false;
   let eventDataLines=[];
   let eventDataBytes=0;
+  let completionId=null;
+  let sawMissingCompletionId=false;
   let sawDone=false;
   let sawError=false;
   let sawMalformed=expectedChoices===null;
@@ -115,11 +117,12 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
   };
 
   const dispatchEvent=()=>{
-    const currentType=eventType;
-    eventType='';
-    if(currentType==='error') {
+    const wasErrorEvent=isErrorEvent;
+    isErrorEvent=false;
+    if(wasErrorEvent) {
       eventDataLines=[];
       eventDataBytes=0;
+      tryReserveObservation(Buffer.byteLength(lineBuffer));
       sawError=true;
       return;
     }
@@ -127,6 +130,7 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
     const payload=eventDataLines.join('\n');
     eventDataLines=[];
     eventDataBytes=0;
+    tryReserveObservation(Buffer.byteLength(lineBuffer));
     if(sawDone) {
       try {
         const afterDone=JSON.parse(payload);
@@ -144,7 +148,16 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
     catch {sawMalformed=true;return;}
     if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)){sawMalformed=true;return;}
     if(parsed.error!==undefined&&parsed.error!==null){sawError=true;return;}
-    if(parsed.id!==undefined&&(typeof parsed.id!=='string'||!parsed.id)){sawMalformed=true;return;}
+    if(parsed.id!==undefined) {
+      if(typeof parsed.id!=='string'||!parsed.id){sawMalformed=true;return;}
+      const idDigest=createHash('sha256').update(parsed.id).digest('hex');
+      if(sawMissingCompletionId){sawDuplicateOrContradictory=true;return;}
+      if(completionId===null)completionId=idDigest;
+      else if(completionId!==idDigest){sawDuplicateOrContradictory=true;return;}
+    } else {
+      if(completionId!==null){sawDuplicateOrContradictory=true;return;}
+      sawMissingCompletionId=true;
+    }
     if(parsed.object!==undefined&&parsed.object!=='chat.completion.chunk'&&parsed.object!=='chat.completion') {
       sawMalformed=true;return;
     }
@@ -185,10 +198,11 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
     const field=colon===-1?line:line.slice(0,colon);
     let value=colon===-1?'':line.slice(colon+1);
     if(value.startsWith(' '))value=value.slice(1);
-    if(field==='event')eventType=value;
+    if(field==='event')isErrorEvent=value==='error';
     else if(field==='data') {
       const valueBytes=Buffer.byteLength(value);
-      if(eventDataLines.length>=MAX_SSE_EVENT_LINES||eventDataBytes+valueBytes>MAX_SSE_EVENT_BYTES) {
+      if(eventDataLines.length>=MAX_SSE_EVENT_LINES||eventDataBytes+valueBytes>MAX_SSE_EVENT_BYTES||
+          !tryReserveObservation(eventDataBytes+valueBytes)) {
         failObservationLimit();
         return;
       }
@@ -234,7 +248,6 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
         lineBuffer='';
         processLine(fullLine);
         if(observationLimitExceeded)return false;
-        if(!tryReserveObservation(eventDataBytes)){failObservationLimit();return false;}
         if(text[next]==='\r') {
           if(next+1<text.length&&text[next+1]==='\n')pos=next+2;
           else if(next+1===text.length){ignoreNextLf=true;pos=next+1;}
@@ -253,7 +266,7 @@ function createSseTracker(expectedChoices,tryReserveObservation,releaseObservati
           if(tail)lineBuffer+=tail;
         } catch {sawMalformed=true;}
       }
-      if(eventType==='error')sawError=true;
+      if(isErrorEvent)sawError=true;
       const hadDangling=lineBuffer.length>0||eventDataLines.length>0;
       clearBuffers();
       const allChoicesFinished=expectedChoices!==null&&choiceFinishReasons.every(reason=>reason!==null);
@@ -352,42 +365,54 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
       dispatched++;
 
       if(activeEntries.size>=MAX_ACTIVE_ENTRIES) {
-        unknownCount++;
-        lastUnknownEvidence='observation-limit-exceeded';
         recordsTruncated=true;
         overflowInFlight++;
-        let overflowReleased=false;
-        const releaseOverflow=()=>{
-          if(!overflowReleased){overflowReleased=true;if(!isClosed)overflowInFlight=Math.max(0,overflowInFlight-1);}
+        let overflowSettled=false;
+        const settleOverflow=(evidence='observation-limit-exceeded')=>{
+          if(overflowSettled||isClosed)return;
+          overflowSettled=true;
+          overflowInFlight=Math.max(0,overflowInFlight-1);
+          unknownCount++;
+          lastUnknownEvidence=evidence;
         };
         const upstream=request({hostname:'127.0.0.1',port:Number(target.port||'80'),path:'/v1/chat/completions',
           method:'POST',agent,headers:{'Content-Type':'application/json','Accept':incoming.headers.accept??'application/json'}},response=>{
           if(response.statusCode>=300&&response.statusCode<400) {
-            releaseOverflow();
+            settleOverflow('upstream-redirect-blocked');
             response.destroy();outgoing.writeHead(502);outgoing.end();return;
           }
           const headers={};
           if(response.headers['content-type'])headers['Content-Type']=response.headers['content-type'];
           outgoing.writeHead(response.statusCode,headers);
           let responseBytes=0;
+          let overflowTruncated=false;
           response.on('data',chunk=>{
             responseBytes+=chunk.length;
-            if(responseBytes>MAX_BODY_BYTES){releaseOverflow();response.destroy();outgoing.destroy();}
+            if(responseBytes>MAX_BODY_BYTES) {
+              overflowTruncated=true;
+              settleOverflow('response-truncated');
+              response.destroy();outgoing.destroy();
+            }
           });
-          response.once('end',releaseOverflow);
-          response.once('aborted',releaseOverflow);
-          response.once('close',releaseOverflow);
-          response.on('error',()=>{releaseOverflow();outgoing.destroy();});
+          response.once('end',()=>{
+            if(overflowTruncated)settleOverflow('response-truncated');
+            else if(!response.complete)settleOverflow('upstream-incomplete-stream');
+            else if(response.statusCode!==200)settleOverflow('upstream-http-error');
+            else settleOverflow('observation-limit-exceeded');
+          });
+          response.once('aborted',()=>settleOverflow('upstream-incomplete-stream'));
+          response.once('close',()=>settleOverflow('upstream-incomplete-stream'));
+          response.on('error',()=>{settleOverflow('upstream-error');outgoing.destroy();});
           response.pipe(outgoing);
         });
         const failed=()=>{
-          releaseOverflow();
+          settleOverflow('upstream-error');
           if(!outgoing.headersSent){outgoing.writeHead(502);outgoing.end();}else outgoing.destroy();
         };
         upstream.once('error',failed);
         upstream.once('upgrade',(_response,socket)=>{socket.destroy();failed();});
         outgoing.once('close',()=>{
-          if(!outgoing.writableFinished){releaseOverflow();upstream.destroy();}
+          if(!outgoing.writableFinished){settleOverflow('client-aborted');upstream.destroy();}
         });
         upstream.end(body);
         return;
@@ -583,7 +608,11 @@ export async function createInferenceBroker(destination,{signal,model}={}) {
       entry.releaseObservation?.();
       settleEntry(entry,'unknown','broker-closed');
     }
-    overflowInFlight=0;
+    if(overflowInFlight>0) {
+      unknownCount+=overflowInFlight;
+      overflowInFlight=0;
+      lastUnknownEvidence='broker-closed';
+    }
     signal?.removeEventListener('abort',abort);
     agent.destroy();
     server.closeAllConnections();
