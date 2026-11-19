@@ -130,7 +130,7 @@ export function resolveLocalRoot(rawRoot,{useTime=false}={}) {
     fail(errStatus,'PROJECT_ROOT_MISSING','The selected project root could not be resolved.');
   }
   validateLocalPathSyntax(canonical,'INVALID_PROJECT_ROOT','local project root path');
-  if(process.platform==='win32'&&!pathsEqual(canonical,resolved)) {
+  if(!pathsEqual(canonical,resolved)) {
     fail(errStatus,'PROJECT_ROOT_SYMLINK','Project root cannot traverse symbolic links or junctions.');
   }
   if(!statSync(canonical).isDirectory()) {
