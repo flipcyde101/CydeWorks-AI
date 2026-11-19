@@ -21,6 +21,7 @@ inside "workload" frames, so workload bytes can never be read as control.
 Any ambiguity yields cleanup "unknown". Nothing here retries a dispatch.
 """
 
+from collections import deque
 import hashlib
 import importlib.util
 import json
@@ -461,16 +462,27 @@ class Supervisor:
         self.profile = profile
         self.lifetime = self.lifetime or LIFETIME_SECONDS[profile]
         info_read, info_write = os.pipe()
-        block_read, block_write = os.pipe()
-        self.release_fd = block_write
         try:
-            argv = build_command(profile, self.sandbox, self.bwrap, info_write, block_read, self.payload)
-            self.process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                            stderr=subprocess.DEVNULL, pass_fds=(info_write, block_read),
-                                            close_fds=True, bufsize=0)
-        finally:
+            block_read, block_write = os.pipe()
+        except Exception:
+            os.close(info_read)
             os.close(info_write)
-            os.close(block_read)
+            raise
+        try:
+            try:
+                argv = build_command(profile, self.sandbox, self.bwrap, info_write, block_read, self.payload)
+                self.process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                stderr=subprocess.DEVNULL, pass_fds=(info_write, block_read),
+                                                close_fds=True, bufsize=0)
+            finally:
+                os.close(info_write)
+                os.close(block_read)
+            self.release_fd = block_write
+        except Exception:
+            os.close(info_read)
+            if self.release_fd is None:
+                os.close(block_write)
+            raise
         try:
             pid, reported_ns = read_info(info_read, self.hold)
         finally:
@@ -516,39 +528,173 @@ class Supervisor:
         if self.release_fd is not None:
             os.close(self.release_fd)
             self.release_fd = None
-        if self.identity is None:
-            # No complete identity: kill only our own bwrap child by handle and
-            # report unknown, because namespace members were never identified.
-            if self.process and self.process.poll() is None:
-                self.process.kill()
-            result = {"cleanup": "unknown", "evidence": {"reason": "identity-incomplete"}}
-        else:
-            result = stop_identity(self.proc, self.identity, self.ops, init_fd=self.init_fd)
-        if self.process:
-            try:
-                self.process.wait(timeout=EXIT_WAIT_SECONDS)
-            except subprocess.TimeoutExpired:
-                result = {"cleanup": "unknown", "evidence": {**result.get("evidence", {}), "bwrapWait": "timeout"}}
-            if self.process.stdout and not self.process.stdout.closed:
+        try:
+            if self.identity is None:
+                # No complete identity: kill only our own bwrap child and any
+                # opened init pidfd by handle, and report unknown because
+                # namespace members were never fully identified.
+                if self.init_fd is not None:
+                    try:
+                        self.ops.kill(self.init_fd)
+                    except (ProcessLookupError, OSError):
+                        pass
+                if self.process and self.process.poll() is None:
+                    self.process.kill()
+                result = {"cleanup": "unknown", "evidence": {"reason": "identity-incomplete"}}
+            else:
+                result = stop_identity(self.proc, self.identity, self.ops, init_fd=self.init_fd)
+            if self.process:
+                try:
+                    self.process.wait(timeout=EXIT_WAIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    result = {"cleanup": "unknown", "evidence": {**result.get("evidence", {}), "bwrapWait": "timeout"}}
+        finally:
+            if self.process and self.process.stdout and not self.process.stdout.closed:
                 self.process.stdout.close()
-        if self.init_fd is not None:
-            self.ops.close(self.init_fd)
-            self.init_fd = None
+            if self.init_fd is not None:
+                self.ops.close(self.init_fd)
+                self.init_fd = None
         result["evidence"]["reason"] = reason
         self.emit({"event": "stopped", "nonce": self.identity and self.identity["nonce"], **result})
         return result
+
+
+_TIMEOUT = object()
+
+
+class LineReader:
+    """Incremental non-blocking line reader for select()-driven streams."""
+
+    def __init__(self, stream, max_bytes, strict=True, max_lines=None):
+        self.stream = stream
+        self.fd = None
+        if hasattr(stream, "fileno"):
+            try:
+                self.fd = stream.fileno()
+            except (OSError, ValueError):
+                self.fd = None
+        self.max_bytes = max_bytes
+        self.strict = strict
+        self.max_lines = max_lines
+        self.lines = deque()
+        self.buf = bytearray()
+        self.eof = False
+        self.total_lines = 0
+        self._discarding = False
+        if self.fd is not None:
+            os.set_blocking(self.fd, False)
+
+    def read_available(self):
+        """Read currently available bytes without blocking on incomplete lines."""
+        if self.eof:
+            return
+        if self.fd is None:
+            chunk = self.stream.read(self.max_bytes + 1)
+        else:
+            try:
+                chunk = os.read(self.fd, self.max_bytes + 1)
+            except BlockingIOError:
+                return
+        if not chunk:
+            self.eof = True
+            return
+        if self.strict:
+            pos = 0
+            while pos < len(chunk):
+                nl = chunk.find(b"\n", pos)
+                if nl == -1:
+                    self.buf.extend(chunk[pos:])
+                    if len(self.buf) >= self.max_bytes:
+                        raise RuntimeError("BLOCKED: control frame invalid")
+                    break
+                part = bytes(self.buf) + chunk[pos:nl + 1]
+                self.buf.clear()
+                if len(part) > self.max_bytes:
+                    raise RuntimeError("BLOCKED: control frame invalid")
+                self.lines.append(part)
+                pos = nl + 1
+        else:
+            if self.max_lines is not None and self.total_lines >= self.max_lines:
+                return
+            pos = 0
+            while pos < len(chunk) and (self.max_lines is None or self.total_lines < self.max_lines):
+                nl = chunk.find(b"\n", pos)
+                if nl == -1:
+                    part = chunk[pos:]
+                    if not self._discarding:
+                        space = self.max_bytes - len(self.buf)
+                        if len(part) <= space:
+                            self.buf.extend(part)
+                        else:
+                            if space > 0:
+                                self.buf.extend(part[:space])
+                            self._discarding = True
+                    break
+                part = chunk[pos:nl + 1]
+                if not self._discarding:
+                    space = self.max_bytes - len(self.buf)
+                    if len(part) <= space:
+                        self.buf.extend(part)
+                    elif space > 0:
+                        self.buf.extend(part[:space])
+                self.lines.append(bytes(self.buf))
+                self.buf.clear()
+                self._discarding = False
+                self.total_lines += 1
+                pos = nl + 1
+
+    def pop_line(self):
+        """Return complete bytes line, None on clean EOF, or False if incomplete."""
+        if self.lines:
+            return self.lines.popleft()
+        if self.eof:
+            if self.buf:
+                if self.strict:
+                    raise RuntimeError("BLOCKED: control frame invalid")
+                if self.max_lines is None or self.total_lines < self.max_lines:
+                    line = bytes(self.buf)
+                    self.buf.clear()
+                    self._discarding = False
+                    self.total_lines += 1
+                    return line
+                self.buf.clear()
+                self._discarding = False
+            return None
+        return False
+
+
+def parse_control_frame(line):
+    if not line or len(line) > FRAME_MAX or not line.endswith(b"\n"):
+        raise RuntimeError("BLOCKED: control frame invalid")
+    frame = json.loads(line)
+    if not isinstance(frame, dict) or not isinstance(frame.get("op"), str):
+        raise RuntimeError("BLOCKED: control frame invalid")
+    return frame
 
 
 def read_frame(stream):
     line = stream.readline(FRAME_MAX + 1)
     if not line:
         return None
-    if len(line) > FRAME_MAX or not line.endswith(b"\n"):
-        raise RuntimeError("BLOCKED: control frame invalid")
-    frame = json.loads(line)
-    if not isinstance(frame, dict) or not isinstance(frame.get("op"), str):
-        raise RuntimeError("BLOCKED: control frame invalid")
-    return frame
+    return parse_control_frame(line)
+
+
+def next_line_bounded(reader, deadline):
+    while True:
+        item = reader.pop_line()
+        if item is not False:
+            return item
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _TIMEOUT
+        if reader.fd is None:
+            reader.read_available()
+            if not reader.lines and not reader.eof:
+                return _TIMEOUT
+            continue
+        if not select.select([reader.fd], [], [], remaining)[0]:
+            return _TIMEOUT
+        reader.read_available()
 
 
 def write_frame(frame):
@@ -563,67 +709,154 @@ def serve(stdin=None, emit=write_frame, **options):
     """Serve one ownership session over NDJSON stdin and stdout.
 
     Stdin EOF, an invalid frame, hold expiry, or lifetime expiry all Stop.
+    A stale-nonce stop frame is rejected without disturbing the live namespace.
     """
     stdin = stdin or sys.stdin.buffer
+    supervisor_factory = options.pop("supervisor_factory", Supervisor)
+    start_hold = options.get("hold", HOLD_SECONDS)
     supervisor = None
     reason = "eof"
     try:
-        frame = read_frame(stdin)
-        if frame is None or frame["op"] != "start":
+        stdin_reader = LineReader(stdin, FRAME_MAX, strict=True)
+        first = next_line_bounded(stdin_reader, time.monotonic() + start_hold)
+        if first is _TIMEOUT:
+            raise RuntimeError("BLOCKED: start frame timeout")
+        if first is None:
             raise RuntimeError("BLOCKED: start frame required")
-        supervisor = Supervisor(emit, **options)
+        frame = parse_control_frame(first)
+        if frame["op"] != "start":
+            raise RuntimeError("BLOCKED: start frame required")
+        supervisor = supervisor_factory(emit, **options)
         supervisor.start(frame.get("nonce"), frame.get("profile"), frame.get("bwrap"))
         started = time.monotonic()
-        relayed = 0
-        workload = supervisor.process.stdout
+        workload_stream = supervisor.process.stdout if supervisor.process else None
+        workload_reader = (
+            LineReader(workload_stream, WORKLOAD_LINE_MAX, strict=False, max_lines=WORKLOAD_FRAMES_MAX)
+            if workload_stream is not None
+            else None
+        )
         while True:
             limit = supervisor.hold if not supervisor.dispatched else supervisor.lifetime
             remaining = started + limit - time.monotonic()
             if remaining <= 0:
                 reason = "hold-expired" if not supervisor.dispatched else "lifetime-expired"
                 break
-            streams = [stdin] + ([workload] if supervisor.dispatched and workload else [])
-            ready = select.select(streams, [], [], remaining)[0]
-            if workload in ready:
-                line = workload.readline(WORKLOAD_LINE_MAX + 1)
-                if not line:
-                    workload = None
-                elif relayed < WORKLOAD_FRAMES_MAX:
-                    relayed += 1
-                    emit({"event": "workload", "data": line[:WORKLOAD_LINE_MAX].decode("utf-8", "replace")})
-            if stdin in ready:
-                frame = read_frame(stdin)
-                if frame is None:
-                    reason = "eof"
-                    break
+
+            if supervisor.dispatched and workload_reader is not None:
+                while True:
+                    wline = workload_reader.pop_line()
+                    if wline is None:
+                        workload_reader = None
+                        break
+                    if wline is False:
+                        break
+                    emit({"event": "workload", "data": wline[:WORKLOAD_LINE_MAX].decode("utf-8", "replace")})
+
+            cline = stdin_reader.pop_line()
+            if cline is None:
+                reason = "eof"
+                break
+            if cline is not False:
+                frame = parse_control_frame(cline)
                 if frame["op"] == "dispatch":
                     supervisor.dispatch(frame.get("nonce"), frame.get("digest"))
                     started = time.monotonic()
-                elif frame["op"] == "stop" and frame.get("nonce") == supervisor.identity["nonce"]:
-                    reason = "stop"
-                    break
+                elif frame["op"] == "stop":
+                    if frame.get("nonce") == supervisor.identity["nonce"]:
+                        reason = "stop"
+                        break
+                    stale_nonce = frame.get("nonce")
+                    emit({
+                        "event": "ignored",
+                        "op": "stop",
+                        "nonce": stale_nonce[:64] if isinstance(stale_nonce, str) else None,
+                        "cleanup": "unknown",
+                        "reason": "stale-nonce",
+                    })
                 else:
                     reason = "invalid-frame"
                     break
+                continue
+
+            fds = []
+            if stdin_reader.fd is not None:
+                fds.append(stdin_reader.fd)
+            elif not stdin_reader.eof:
+                stdin_reader.read_available()
+                continue
+            if supervisor.dispatched and workload_reader is not None:
+                if workload_reader.fd is not None:
+                    fds.append(workload_reader.fd)
+                elif not workload_reader.eof:
+                    workload_reader.read_available()
+                    continue
+            if not fds:
+                reason = "eof"
+                break
+            ready = select.select(fds, [], [], remaining)[0]
+            if not ready:
+                continue
+            if workload_reader is not None and workload_reader.fd in ready:
+                workload_reader.read_available()
+            if stdin_reader.fd in ready:
+                stdin_reader.read_available()
     except Exception as error:  # Any failure stops the owned namespace.
         reason = "blocked"
         emit({"event": "blocked", "reason": str(error)[:500]})
     finally:
-        if supervisor is not None and supervisor.process is not None:
-            supervisor.stop(reason)
+        if supervisor is not None:
+            if supervisor.process is not None:
+                supervisor.stop(reason)
+            elif supervisor.release_fd is not None:
+                os.close(supervisor.release_fd)
+                supervisor.release_fd = None
     return 0
 
 
-def oneshot(op):
-    """Out-of-band confirm or stop for a fresh controller. Identity on stdin."""
-    try:
-        identity = json.loads(sys.stdin.buffer.readline(FRAME_MAX + 1))
-        if op == "confirm":
-            write_frame({"event": "confirmed", **confirm_identity(Proc(), identity)})
+def parse_oneshot_payload(line):
+    if not line or len(line) > FRAME_MAX or not line.endswith(b"\n"):
+        raise RuntimeError("BLOCKED: oneshot frame invalid")
+    payload = json.loads(line)
+    if not isinstance(payload, dict):
+        raise RuntimeError("BLOCKED: oneshot frame invalid")
+    if "identity" in payload:
+        if not set(payload.keys()).issubset({"identity", "expectedNonce"}):
+            raise RuntimeError("BLOCKED: oneshot envelope invalid")
+        identity = payload["identity"]
+        if "expectedNonce" in payload:
+            expected_nonce = payload["expectedNonce"]
+            if not isinstance(expected_nonce, str) or not NONCE.match(expected_nonce):
+                raise RuntimeError("BLOCKED: oneshot expectedNonce invalid")
         else:
-            write_frame({"event": "stopped", **stop_identity(Proc(), identity, Ops)})
+            expected_nonce = None
+        return identity, expected_nonce
+    return payload, None
+
+
+def oneshot(op, stdin=None, emit=write_frame, proc=None, ops=Ops, timeout=HOLD_SECONDS):
+    """Out-of-band confirm or stop for a fresh controller. Identity or envelope on stdin."""
+    if op not in ("confirm", "stop"):
+        emit({"event": "blocked", "reason": "unknown mode"})
+        return 2
+    stdin = stdin or sys.stdin.buffer
+    proc = proc or Proc()
+    try:
+        reader = LineReader(stdin, FRAME_MAX, strict=True)
+        deadline = time.monotonic() + timeout
+        line = next_line_bounded(reader, deadline)
+        if line is _TIMEOUT:
+            raise RuntimeError("BLOCKED: oneshot frame timeout")
+        if line is None:
+            raise RuntimeError("BLOCKED: oneshot frame empty")
+        if next_line_bounded(reader, deadline) is not None:
+            raise RuntimeError("BLOCKED: oneshot trailing data")
+        identity, expected_nonce = parse_oneshot_payload(line)
+        if op == "confirm":
+            emit({"event": "confirmed", **confirm_identity(proc, identity, expected_nonce=expected_nonce)})
+        else:
+            emit({"event": "stopped", **stop_identity(proc, identity, ops, expected_nonce=expected_nonce)})
     except Exception as error:
-        write_frame({"event": "blocked", "reason": type(error).__name__})
+        emit({"event": "blocked", "reason": type(error).__name__})
     return 0
 
 

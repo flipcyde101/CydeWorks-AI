@@ -15,7 +15,11 @@ export const SCHEMA = 'cydeworks.opencode-stop.v1';
 export const ACTUAL_OPENCODE_DISPATCH_ENABLED = false;
 export const QUALIFICATION_SCOPE = 'inert-fixture-only';
 
+const PROFILES = new Set(['inert-fixture', 'actual-opencode']);
 const NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const PID_NS_RE = /^pid:\[\d+\]$/;
+const BOOT_ID_RE = /^[0-9A-Za-z._-]{1,128}$/;
+const DIGITS_RE = /^\d+$/;
 const FRAME_MAX = 8192;
 const GUEST_WIN_PATH = fileURLToPath(new URL('./opencode-stop-guest.py', import.meta.url));
 
@@ -27,8 +31,8 @@ export function toWslPath(windowsPath) {
 
 export function canonicalJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
-  const keys = Object.keys(value).sort();
+  if (Array.isArray(value)) return '[' + value.map(v => (v === undefined ? 'null' : canonicalJson(v))).join(',') + ']';
+  const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
   return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(value[k])).join(',') + '}';
 }
 
@@ -49,18 +53,22 @@ export function digestIdentity(identity) {
 }
 
 export function validateOwnedIdentity(identity, expectedNonce) {
-  if (!identity || typeof identity !== 'object' || identity.schema !== SCHEMA) return false;
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return false;
+  if (identity.schema !== SCHEMA) return false;
   if (typeof identity.nonce !== 'string' || !NONCE_RE.test(identity.nonce)) return false;
   if (expectedNonce !== undefined && identity.nonce !== expectedNonce) return false;
-  if (typeof identity.bootId !== 'string' || !identity.bootId) return false;
-  if (!Number.isInteger(identity.uid) || !Number.isInteger(identity.depth) || identity.depth < 1) return false;
+  if (typeof identity.profile !== 'string' || !PROFILES.has(identity.profile)) return false;
+  if (typeof identity.bootId !== 'string' || !BOOT_ID_RE.test(identity.bootId)) return false;
+  if (!Number.isInteger(identity.uid) || identity.uid < 0) return false;
+  if (!Number.isInteger(identity.depth) || identity.depth < 1) return false;
   for (const role of ['init', 'bwrap']) {
     const proc = identity[role];
-    if (!proc || typeof proc !== 'object') return false;
+    if (!proc || typeof proc !== 'object' || Array.isArray(proc)) return false;
     if (!Number.isInteger(proc.pid) || proc.pid <= 1) return false;
-    if (typeof proc.start !== 'string' || !proc.start) return false;
-    if (typeof proc.pidNs !== 'string' || !proc.pidNs.startsWith('pid:[')) return false;
+    if (typeof proc.start !== 'string' || !DIGITS_RE.test(proc.start)) return false;
+    if (typeof proc.pidNs !== 'string' || !PID_NS_RE.test(proc.pidNs)) return false;
   }
+  if (identity.init.pid === identity.bwrap.pid) return false;
   if (identity.init.pidNs === identity.bwrap.pidNs) return false;
   const expectedBirth = `${identity.bootId}:${identity.init.pid}:${identity.init.start}:${identity.init.pidNs}`;
   if (identity.birthIdentity !== expectedBirth) return false;
@@ -91,6 +99,7 @@ function runOneshot(spawnGuest, mode, payload, timeoutMs) {
       return;
     }
     let stdout = '';
+    let stdoutBytes = 0;
     let settled = false;
     const finish = value => {
       if (settled) return;
@@ -105,8 +114,11 @@ function runOneshot(spawnGuest, mode, payload, timeoutMs) {
     child.stdin.on('error', () => {});
     child.on('error', () => finish(null));
     child.stdout.on('data', chunk => {
-      stdout += chunk.toString('utf8');
-      if (stdout.length > FRAME_MAX * 2) {
+      if (settled) return;
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      stdoutBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : chunk.length;
+      stdout += text;
+      if (stdoutBytes > FRAME_MAX) {
         try { child.kill(); } catch {}
         finish(null);
       }
@@ -116,15 +128,29 @@ function runOneshot(spawnGuest, mode, payload, timeoutMs) {
         finish(null);
         return;
       }
-      const line = stdout.trim().split('\n')[0];
+      if (
+        !stdout ||
+        Buffer.byteLength(stdout, 'utf8') > FRAME_MAX ||
+        !stdout.endsWith('\n') ||
+        stdout.indexOf('\n') !== stdout.length - 1
+      ) {
+        finish(null);
+        return;
+      }
       try {
-        finish(JSON.parse(line));
+        finish(JSON.parse(stdout));
       } catch {
         finish(null);
       }
     });
     try {
-      child.stdin.end(JSON.stringify(payload) + '\n');
+      const encoded = JSON.stringify(payload) + '\n';
+      if (Buffer.byteLength(encoded, 'utf8') > FRAME_MAX) {
+        try { child.kill(); } catch {}
+        finish(null);
+        return;
+      }
+      child.stdin.end(encoded);
     } catch {
       finish(null);
     }
@@ -142,6 +168,7 @@ export function createOpenCodeStopWslAdapter({
   spawnGuest = mode => defaultSpawnGuest(mode, {distribution, user, guestPath}),
 } = {}) {
   const activeSessions = new Map();
+  const inFlightStops = new Map();
 
   return {
     profile,
@@ -202,7 +229,7 @@ export function createOpenCodeStopWslAdapter({
 
       child.stdout.on('data', chunk => {
         buffer += chunk.toString('utf8');
-        if (buffer.length > FRAME_MAX * 4) {
+        if (Buffer.byteLength(buffer, 'utf8') > FRAME_MAX * 4) {
           try { child.stdin.end(); child.kill(); } catch {}
           notify(null, Error('Oversized supervisor frame buffer.'));
           return;
@@ -211,7 +238,7 @@ export function createOpenCodeStopWslAdapter({
           const idx = buffer.indexOf('\n');
           const rawLine = buffer.slice(0, idx);
           buffer = buffer.slice(idx + 1);
-          if (rawLine.length > FRAME_MAX) {
+          if (Buffer.byteLength(rawLine, 'utf8') + 1 > FRAME_MAX) {
             try { child.stdin.end(); child.kill(); } catch {}
             notify(null, Error('Oversized supervisor frame.'));
             return;
@@ -243,16 +270,22 @@ export function createOpenCodeStopWslAdapter({
             reject(exitError);
             return;
           }
+          const removeWaiter = entry => {
+            const idx = waiters.indexOf(entry);
+            if (idx >= 0) waiters.splice(idx, 1);
+          };
           const onAbort = () => {
             clearTimeout(timer);
+            removeWaiter(entry);
             reject(signal?.reason ?? Error('Startup aborted.'));
           };
           signal?.addEventListener('abort', onAbort, {once: true});
           const timer = setTimeout(() => {
             signal?.removeEventListener('abort', onAbort);
+            removeWaiter(entry);
             reject(Error(timeoutMessage));
           }, timeoutMs);
-          waiters.push({
+          const entry = {
             predicate: (frame, err) => {
               if (err || predicate(frame, null)) {
                 signal?.removeEventListener('abort', onAbort);
@@ -263,7 +296,8 @@ export function createOpenCodeStopWslAdapter({
             timer,
             resolve,
             reject,
-          });
+          };
+          waiters.push(entry);
         });
 
       const sendFrame = payload => {
@@ -298,8 +332,15 @@ export function createOpenCodeStopWslAdapter({
           throw Error(`Guest supervisor blocked: ${String(held.reason)}`);
         }
         const candidate = held.identity;
+        if (
+          held.nonce !== nonce ||
+          !validateOwnedIdentity(candidate, nonce) ||
+          candidate.profile !== profile
+        ) {
+          throw Error('Guest supervisor returned an invalid ownership identity.');
+        }
         const computedDigest = digestIdentity(candidate);
-        if (held.nonce !== nonce || held.digest !== computedDigest || !validateOwnedIdentity(candidate, nonce)) {
+        if (held.digest !== computedDigest) {
           throw Error('Guest supervisor returned an invalid ownership identity.');
         }
         heldIdentity = {
@@ -309,6 +350,7 @@ export function createOpenCodeStopWslAdapter({
           synthetic: true,
         };
 
+        session.identity = heldIdentity;
         signal?.throwIfAborted();
         // Durable persistence happens BEFORE releasing the held namespace.
         record(heldIdentity);
@@ -323,12 +365,27 @@ export function createOpenCodeStopWslAdapter({
         if (dispatched.event !== 'dispatched' || dispatched.nonce !== nonce) {
           throw Error(`Guest dispatch rejected: ${String(dispatched.reason ?? 'unexpected frame')}`);
         }
-        session.identity = heldIdentity;
         return heldIdentity;
       } catch (error) {
         try { child.stdin.end(); } catch {}
-        await this.stopAndVerify(heldIdentity, nonce).catch(() => {});
-        activeSessions.delete(nonce);
+        if (heldIdentity) {
+          await this.stopAndVerify(heldIdentity, nonce).catch(() => {});
+        } else {
+          let timer;
+          try {
+            await Promise.race([
+              closedPromise,
+              new Promise((_, reject) => {
+                timer = setTimeout(() => reject(Error('Startup abort cleanup timeout')), stopTimeoutMs);
+              }),
+            ]);
+          } catch {
+            try { child.kill(); } catch {}
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+        if (activeSessions.get(nonce) === session) activeSessions.delete(nonce);
         throw error;
       }
     },
@@ -351,63 +408,119 @@ export function createOpenCodeStopWslAdapter({
       }
 
       const session = activeSessions.get(nonce);
-      let sessionStopped = null;
-      if (session) {
-        activeSessions.delete(nonce);
-        try {
-          session.child.stdin.write(JSON.stringify({op: 'stop', nonce}) + '\n');
-          session.child.stdin.end();
-        } catch {}
-        let timer;
-        try {
-          await Promise.race([
-            session.closedPromise,
-            new Promise((_, reject) => {
-              timer = setTimeout(() => reject(Error('Session stop timeout')), stopTimeoutMs);
-            }),
-          ]);
-          sessionStopped = session.getStoppedFrame();
-        } catch {
-          try { session.child.kill(); } catch {}
-          sessionStopped = null;
-        } finally {
-          clearTimeout(timer);
-        }
+      if (session && session.identity?.identityDigest !== expectedDigest) {
+        return {cleanup: 'unknown', reason: 'session-identity-mismatch', qualificationScope: QUALIFICATION_SCOPE};
       }
 
-      const outOfBand = await runOneshot(spawnGuest, 'stop', identity, stopTimeoutMs);
-      if (!outOfBand || outOfBand.event !== 'stopped' || outOfBand.cleanup !== 'verified') {
+      const flightKey = `${nonce}:${expectedDigest}`;
+      const existing = inFlightStops.get(flightKey);
+      if (existing) {
+        return existing;
+      }
+
+      const runStop = (async () => {
+        let sessionStopped = null;
+        if (session) {
+          try {
+            session.child.stdin.write(JSON.stringify({op: 'stop', nonce}) + '\n');
+            session.child.stdin.end();
+          } catch {}
+          let timer;
+          try {
+            await Promise.race([
+              session.closedPromise,
+              new Promise((_, reject) => {
+                timer = setTimeout(() => reject(Error('Session stop timeout')), stopTimeoutMs);
+              }),
+            ]);
+            sessionStopped = session.getStoppedFrame();
+          } catch {
+            try { session.child.kill(); } catch {}
+            sessionStopped = null;
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+
+        const outOfBand = await runOneshot(
+          spawnGuest,
+          'stop',
+          {identity, expectedNonce: nonce},
+          stopTimeoutMs,
+        );
+        if (!outOfBand || outOfBand.event !== 'stopped' || outOfBand.cleanup !== 'verified') {
+          return {
+            cleanup: 'unknown',
+            reason: outOfBand?.reason ?? outOfBand?.evidence?.reason ?? 'unverified-out-of-band-stop',
+            evidence: outOfBand?.evidence ?? null,
+            qualificationScope: QUALIFICATION_SCOPE,
+          };
+        }
+        if (session && sessionStopped && sessionStopped.cleanup !== 'verified') {
+          return {
+            cleanup: 'unknown',
+            reason: 'supervisor-stop-unverified',
+            evidence: sessionStopped.evidence ?? null,
+            qualificationScope: QUALIFICATION_SCOPE,
+          };
+        }
+
+        const confirmed = await this.confirmAbsent(identity, nonce);
+        if (!confirmed.absent) {
+          return {
+            cleanup: 'unknown',
+            reason: confirmed.reason ?? 'confirm-absent-failed',
+            evidence: {
+              outOfBand: outOfBand.evidence ?? null,
+              confirm: confirmed.frame ?? null,
+            },
+            qualificationScope: QUALIFICATION_SCOPE,
+          };
+        }
+
         return {
-          cleanup: 'unknown',
-          reason: outOfBand?.reason ?? 'unverified-out-of-band-stop',
-          evidence: outOfBand?.evidence ?? null,
+          cleanup: 'verified',
+          evidence: {
+            ...(outOfBand.evidence ?? sessionStopped?.evidence ?? {}),
+            confirmedAbsent: true,
+          },
           qualificationScope: QUALIFICATION_SCOPE,
         };
+      })();
+
+      inFlightStops.set(flightKey, runStop);
+      try {
+        return await runStop;
+      } finally {
+        if (inFlightStops.get(flightKey) === runStop) {
+          inFlightStops.delete(flightKey);
+          if (session && activeSessions.get(nonce) === session) activeSessions.delete(nonce);
+        }
       }
-      if (session && sessionStopped && sessionStopped.cleanup !== 'verified') {
-        return {
-          cleanup: 'unknown',
-          reason: 'supervisor-stop-unverified',
-          evidence: sessionStopped.evidence ?? null,
-          qualificationScope: QUALIFICATION_SCOPE,
-        };
-      }
-      return {
-        cleanup: 'verified',
-        evidence: outOfBand.evidence ?? sessionStopped?.evidence ?? null,
-        qualificationScope: QUALIFICATION_SCOPE,
-      };
     },
 
     async confirmAbsent(identity, nonce = identity?.nonce) {
       if (!validateOwnedIdentity(identity, nonce)) {
         return {absent: false, reason: 'stale-or-invalid-identity'};
       }
-      const frame = await runOneshot(spawnGuest, 'confirm', identity, stopTimeoutMs);
-      if (!frame || frame.event !== 'confirmed') {
-        return {absent: false, reason: 'confirm-failed'};
+      const expectedDigest = digestIdentity(identity);
+      if (identity.identityDigest && identity.identityDigest !== expectedDigest) {
+        return {absent: false, reason: 'identity-digest-mismatch'};
       }
-      return {absent: frame.absent === true, frame};
+      const frame = await runOneshot(
+        spawnGuest,
+        'confirm',
+        {identity, expectedNonce: nonce},
+        stopTimeoutMs,
+      );
+      if (!frame || frame.event !== 'confirmed') {
+        return {absent: false, reason: frame?.reason ?? 'confirm-failed', frame: frame ?? null};
+      }
+      return {
+        absent: frame.absent === true,
+        ...(frame.reason ? {reason: frame.reason} : {}),
+        frame,
+      };
     },
 
     getSession(nonce) {
