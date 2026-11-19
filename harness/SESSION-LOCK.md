@@ -1,6 +1,6 @@
 # Workspace session lock
 
-Backend contract, 2026-11-17. Claude owns UI integration. This endpoint does not add a frontend control or restart the existing preview.
+Backend and UI contract, 2026-11-18. Lock and the inactivity deadline end the single in-memory operator session. They do not restart the existing preview.
 
 ## Request and response
 
@@ -13,6 +13,14 @@ Successful response:
 ```
 
 The server replaces its in-memory session value and expires the calling browser's session cookie. Every existing view's old cookie is rejected, even if a view keeps that cookie locally. The workspace access file is unchanged. A new POST to `/api/session` using that file is required to unlock. A repeated Lock using the revoked cookie returns 401 and does not renew access.
+
+## Inactivity
+
+The workspace session ends 15 minutes after the last operator action. The deadline starts when the in-memory session secret is created, including a desktop bootstrap that creates the secret without `POST /api/session`. It moves on a successful unlock and on an authenticated POST other than a terminal heartbeat. Authenticated GETs do not move it. That includes task lists, task reads, attention, route inventory, and other reads. A terminal heartbeat renews only the 15-second terminal control lease. It does not move the workspace deadline.
+
+At the deadline the server replaces the session secret, revokes terminal control, and expires a cookie that still matches the old secret. It does not stop approved work. The 15-second terminal lease is unchanged. Unlocking after the deadline still requires the access file. The session id is not put in a URL. The cookie stays HttpOnly, SameSite Strict, and Path `/api`. The current HTTP preview does not add Secure.
+
+A Lock request for a session that has already reached the deadline returns 401. The access file is unchanged. An authenticated POST body that is still arriving when the deadline passes is rejected by the same recheck used for Lock. An authenticated POST whose body is later rejected still moves the deadline, because the deadline moves after that recheck and before the route's own validation. A terminal heartbeat is the exception.
 
 ## Running work and request races
 
@@ -30,10 +38,10 @@ Lock cannot undo a mutation already committed or work already approved. A lost r
 - After a lost Lock response, locally lock the view and use a read-only authenticated check if needed. Do not silently unlock or resubmit earlier commands.
 - Unlock using the existing access-file flow, reconcile saved state, and reattach read-only.
 
-This is backend authorization revocation. It does not erase already-rendered text, clipboard contents, downloaded files, browser memory, task records, worker artifacts or provider data. The current frontend and Claude's candidate were not modified, so their display-clearing and Lock-button behavior require separate integration tests. No desktop-bootstrap session is automatically reissued after Lock; the current app view must use the normal unlock flow.
+This is authorization revocation. It does not erase already-rendered text, clipboard contents, downloaded files, browser memory, task records, worker artifacts or provider data. Legacy and experience both offer Lock. Legacy posts exactly `{}` and shows "Workspace session terminated in every view. Approved work keeps running, and terminal control was released. Unlock with the access file." only after the server returns `locked: true`. A lost response is an unconfirmed local lock. A 401 means the session had already ended. Experience uses the same confirmation rule and the same termination sentence. Neither view erases already rendered text. Reading the workspace does not keep the session open. Restart, Lock, and 15 minutes without an operator action end it. No desktop-bootstrap session is automatically reissued after Lock or after the idle deadline; the current app view must use the normal unlock flow.
 
 ## Verification
 
-`node --test session-lock.test.mjs terminal-control.test.mjs terminal-api.test.mjs` from `harness` exercises multiple views, authentication/origin/shape errors, lease revocation, continued approved work, completion while locked, fresh unlock, a delayed task mutation, an older delayed unlock, and an inventory probe that finishes after Lock. Race tests mark the exact wait point in a copied synthetic host. No owner state or real provider is used.
+`node --test session-lock.test.mjs terminal-control.test.mjs terminal-api.test.mjs` from `harness` exercises multiple views, authentication/origin/shape errors, lease revocation, continued approved work, completion while locked, fresh unlock, a delayed task mutation, an older delayed unlock, an inventory probe that finishes after Lock, the 15-minute idle boundary, polls and heartbeats that do not move that deadline, an operator POST that does, a body still in flight at the deadline, approved work that finishes after idle, and the legacy Lock dialog copy. Race tests mark the exact wait point in a copied synthetic host. Idle tests replace only that host's session clock. No owner state or real provider is used. This document does not record that the idle and legacy Lock cases have been run.
 
 Run the full `node --test` suite after changes to session checks, asynchronous HTTP handling or terminal control. Independent review and observed results are recorded in `work/session-lock-20261117/` at the project root.

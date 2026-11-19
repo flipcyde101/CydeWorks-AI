@@ -74,7 +74,7 @@ export function renderUnlock({state, actions}) {
       resumed && state.pendingRun ? notice('warn', h('p', null, 'A run submission outcome was still unknown. Its request identity is kept, and it is checked after you unlock. Nothing is sent again automatically.')) : null,
       mode.synthetic ? h('div', {class: 'row'}, button(state.busy ? 'Opening…' : 'Open synthetic workspace', {kind: 'primary', onClick: () => actions.unlock(), disabled: state.busy, fid: 'unlock'}))
         : accessFileForm(state, actions),
-      h('p', {class: 'faint'}, 'The session ends when the local service restarts or any view locks the workspace.')),
+      h('p', {class: 'faint'}, 'The session ends after 15 minutes without an operator action, when the local service restarts, or when any view locks the workspace. Reading the workspace does not keep it open.')),
     state.session.firstUse && !resumed ? h('section', {class: 'panel'},
       h('h2', null, 'What to expect'),
       h('ol', {class: 'stack'},

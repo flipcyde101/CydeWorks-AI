@@ -3,6 +3,7 @@
 body{margin:0;color:var(--text);background:radial-gradient(ellipse at 76% 0%,#29343f 0%,var(--base) 54%);min-height:100vh}
 .top{height:62px;padding:0 24px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:#13181d}
 .brand{font-weight:750;color:var(--text);text-decoration:none}.mark{color:var(--accent);margin-right:6px}.mode,.muted{color:var(--muted);font-size:.9rem}
+.session-tools{display:flex;gap:12px;align-items:center}
 .workspace{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:calc(100vh - 62px)}
 .rail{padding:20px;background:#171c22;border-right:1px solid var(--line)}.rail .primary{width:100%}.rail ul{padding:0;list-style:none}
 .rail h2{font-size:.95rem;margin:22px 0 4px;color:var(--muted)}

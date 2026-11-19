@@ -49,6 +49,10 @@ if (database !== ':memory:') {
 }
 if (!/^[a-f0-9]{64}$/.test(key ?? '')) throw Error('The workspace access key is invalid.');
 let session=randomBytes(32).toString('hex');
+// Workspace inactivity deadline. This is not the 15-second terminal control lease.
+const sessionIdleMs=15*60*1000;
+const sessionNow = () => Date.now();
+let sessionActivityAt=sessionNow();
 const removalSecret=randomBytes(32);
 function equal(candidate, expected) {
   return typeof candidate==='string' && /^[a-f0-9]{64}$/.test(candidate) &&
@@ -69,6 +73,17 @@ const now = () => new Date().toISOString();
 const hash = value => createHash('sha256').update(value).digest('hex');
 const providers = {fixture, ollama, opencode};
 let active;
+function sessionIdle(at=sessionNow()) {
+  return at-sessionActivityAt>=sessionIdleMs;
+}
+function noteSessionActivity(at=sessionNow()) {
+  sessionActivityAt=at;
+}
+function endWorkspaceSession(at=sessionNow()) {
+  session=randomBytes(32).toString('hex');
+  sessionActivityAt=at;
+  active?.control.revoke();
+}
 
 function save(task, event) {
   task.version++;
@@ -249,27 +264,37 @@ const server=http.createServer(async (req,res) => {
       const data=await jsonBody(req);
       if (!equal(data.key,key)) fail(401,'Choose this workspace’s access.key file.');
       if(sessionAtArrival!==session)fail(409,'The workspace was locked while unlocking. Choose the access file again.');
+      if(sessionIdle())endWorkspaceSession();
+      noteSessionActivity();
       res.setHeader('Set-Cookie','bfe_session='+session+'; HttpOnly; SameSite=Strict; Path=/api');
       return send(200,{authorized:true});
     }
     const cookie=req.headers.cookie?.split(';').map(value=>value.trim()).find(value=>value.startsWith('bfe_session='));
+    const expireSessionCookie=()=>res.setHeader('Set-Cookie','bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api');
     const requireSession=()=>{
+      if(sessionIdle()) {
+        const presented=cookie?.slice('bfe_session='.length);
+        const matched=equal(presented,session);
+        endWorkspaceSession();
+        if(matched)expireSessionCookie();
+        fail(401,'Unlock this workspace with its local access.key file.');
+      }
       if (!equal(cookie?.slice('bfe_session='.length),session)) fail(401,'Unlock this workspace with its local access.key file.');
     };
     requireSession();
     const authenticatedBody=async()=>{
       const data=await jsonBody(req);
-      // Lock may have happened while an authenticated body was still arriving.
+      // Lock or the idle deadline may have happened while an authenticated body was still arriving.
       requireSession();
+      if(!(/^\/api\/tasks\/[a-f0-9-]{36}\/terminal$/.test(path)&&data.command==='heartbeat'))noteSessionActivity();
       return data;
     };
     if(path==='/api/session/lock') {
       if(req.method!=='POST')fail(405,'Use POST to lock the workspace.');
       const data=await authenticatedBody();
       if(Object.keys(data).length)fail(400,'Use an empty object to lock the workspace.');
-      session=randomBytes(32).toString('hex');
-      active?.control.revoke();
-      res.setHeader('Set-Cookie','bfe_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/api');
+      endWorkspaceSession();
+      expireSessionCookie();
       return send(200,{locked:true,scope:'all-workspace-views',terminalControlReleased:true,
         stopsWork:false,requiresAccessFile:true});
     }
