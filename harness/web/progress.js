@@ -2,7 +2,44 @@ export const STALL_THRESHOLD_MS = 60_000;
 export const WAITING_OUTPUT_THRESHOLD_MS = 15_000;
 export const MAX_DATE_MS = 8_640_000_000_000_000;
 
-const UNTRUSTED_SOURCE_RE = /(?:estimat|infer|heuristic|guess|char|token|byte|utf-?16|utf-?8|code[-_. ]?(?:unit|point)|string[-_. ]?len(?:gth)?|text[-_. ]?len(?:gth)?|(?:model|llm|assistant|stream|raw|text|response|completion)[-_ ]?output|output[-_ ]?(?:len(?:gth)?|size|count)|approx|extrapolat|interpolat|simulat|synthetic|synthesiz|mock|fake|dummy|stub|placeholder|predict|unknown|unverif|unmeasur)/i;
+const UNTRUSTED_SOURCE_RE = /(?:estimat|infer|heuristic|guess|char|token|byte|utf-?16|utf-?8|code[-_. ]?(?:unit|point)|string[-_. ]?len(?:gth)?|text[-_. ]?len(?:gth)?|(?:model|llm|assistant|stream|raw|text|response|completion)[-_. ]?output|output[-_. ]?(?:len(?:gth)?|size|count)|approx|extrapolat|interpolat|simulat|synthetic|synthesiz|mock|fake|dummy|stub|placeholder|predict|unknown|unverif|unmeasur)/i;
+const MAX_SOURCE_LENGTH = 64;
+const SAFE_SOURCE_RE = /^[a-z0-9]+(?:[-_.:\s][a-z0-9]+)*$/i;
+const ALLOWED_MEASURED_SOURCES = new Set([
+  'worker',
+  'runner',
+  'harness',
+  'scheduler',
+  'executor',
+  'dispatcher',
+  'pipeline',
+  'workflow',
+  'orchestrator',
+  'scanner',
+  'file-scanner',
+  'test-runner',
+  'build-runner',
+  'task-runner',
+  'job-runner',
+  'step-runner',
+  'command-runner',
+  'compiler',
+  'builder',
+  'linter',
+  'formatter',
+  'indexer',
+  'parser',
+  'analyzer',
+  'checker',
+  'type-checker',
+  'typechecker',
+  'verifier',
+  'validator',
+  'migrator',
+  'importer',
+  'exporter',
+  'batch-processor',
+]);
 const MAX_UNIT_LENGTH = 24;
 const SAFE_UNIT_RE = /^[a-z][a-z0-9-]*$/;
 const UNTRUSTED_UNITS = new Set([
@@ -90,6 +127,16 @@ function isPlainObject(value) {
   }
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+function normalizeSourceId(source) {
+  return source
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/([a-zA-Z])(\d)/g, '$1-$2')
+    .replace(/(\d)([a-zA-Z])/g, '$1-$2')
+    .toLowerCase()
+    .replace(/[-_.:\s]+/g, '-');
 }
 
 function isValidNow(now) {
@@ -264,11 +311,15 @@ function evaluateStepSeries(raw, {
       return invalid('Counter source must be a non-empty string when provided.');
     }
     const trimmedSource = raw.source.trim();
-    if (trimmedSource.length > 64 || /[\x00-\x1f<>]/.test(trimmedSource)) {
+    if (trimmedSource.length > MAX_SOURCE_LENGTH || /[\x00-\x1f<>]/.test(trimmedSource) || !SAFE_SOURCE_RE.test(trimmedSource)) {
       return invalid('Counter source must be a bounded, display-safe identifier.');
     }
-    if (UNTRUSTED_SOURCE_RE.test(trimmedSource)) {
-      return invalid('Counters come from an untrusted or output-derived source.');
+    const normalizedSource = normalizeSourceId(trimmedSource);
+    if (UNTRUSTED_SOURCE_RE.test(normalizedSource)) {
+      return invalid('Counters come from an output-derived, estimated, or non-discrete source.');
+    }
+    if (!ALLOWED_MEASURED_SOURCES.has(normalizedSource)) {
+      return invalid('Counter source is not a recognized discrete measurement source.');
     }
   }
 
@@ -711,6 +762,7 @@ function finalizeCurrentStep(parsedStep, {
  *
  * Overall measured counter fields (when valid discrete counters are supplied):
  * - `unit` / `unitSingular`: allowlisted, bounded, display-safe plural/singular unit (e.g. `'steps'`/`'step'`, `'files'`/`'file'`), or `null` when unmeasured/rejected.
+ * - `source` (optional input field): when supplied, normalized across separators/case and checked against a bounded allowlist of discrete measurement source identifiers (unknown or output-derived identifiers are rejected; caller-supplied strings remain self-reported labels and do not establish host-verified provenance).
  * - `totalKnown`, `completedSteps`, `totalSteps`, `remainingSteps`, `doneTotal`, `percent`, `stepRate` (units/s), `stepSamplesValid`, `stepRejectionReason`.
  * - `overallEtaMs` / `overallEta`: overall remaining time (`0` only when remaining work is `0`; positive sub-millisecond estimates round up to `>= 1` ms; `null` when blocked/stale/unknown).
  *
