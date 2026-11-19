@@ -1,24 +1,22 @@
 // Fixed child entry for the disconnected claims supervisor prototype.
 //
-// Runs exactly one durable-request-claims operation for one request read from
-// stdin, writes exactly one JSON reply line to stdout and exits. It writes
-// nothing to stderr on purpose and never logs request data. Not an OS
-// sandbox, not Windows qualified, not production safe.
+// Reads one bounded request from stdin, validates it, and answers with
+// exactly one JSON reply line: a refusal with REGISTRY_BOUNDARY_UNAVAILABLE.
+// It does not import the registry or node:sqlite and never touches the store
+// path, so SQLite never opens the store. It writes nothing to stderr and
+// never logs request data. Not an OS sandbox, not Windows qualified, not
+// production safe.
 //
-// Before SQLite opens the store, a bounded preflight checks the path shape,
-// that the path and its ancestors are not links, the 100-byte SQLite header
-// (page size 4096, rollback journal, no reserved bytes, schema format 4,
-// UTF-8, no auto-vacuum), the file size and page count against maxPages, and
-// the -wal, -shm and -journal siblings. This is a snapshot preflight. It does
-// not close pathname, symlink, hot-journal or concurrent-growth races; see
-// MISSING_BOUNDARIES in claims-supervisor.mjs.
+// preflightStore below is a SKETCH of a bounded pre-open file and header
+// check. It is not called by this child and authorizes nothing. It is a
+// snapshot only and does not close pathname, symlink, hot-journal or
+// concurrent-growth races; see MISSING_BOUNDARIES in claims-supervisor.mjs.
 import {constants as fsConstants, closeSync, fstatSync, lstatSync, openSync, readSync} from 'node:fs';
 import {basename, dirname, isAbsolute, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {DatabaseSync} from 'node:sqlite';
-import {ClaimRegistryError, openClaimRegistry} from './durable-request-claims.mjs';
 
 export const HARD_MAX_REQUEST_BYTES = 262144;
+export const BOUNDARY_CODE = 'REGISTRY_BOUNDARY_UNAVAILABLE';
 export const PAGE_SIZE = 4096;
 export const MAX_PAGES_CAP = 262143;
 // A rollback journal record is the page plus a 4-byte page number and a
@@ -28,19 +26,15 @@ export const JOURNAL_HEADER_ALLOWANCE = 65536;
 export const EXIT_BAD_REQUEST = 3;
 export const EXIT_INTERNAL = 70;
 
+const OPERATION_NAMES = new Set([
+  'reserve', 'recordDispatchIntent', 'recordWorkerIdentity', 'recordHostCompletion',
+  'hostContinuePreDispatch', 'inspect', 'assessWorkerIdentity',
+]);
 const SQLITE_MAGIC = Buffer.from('SQLite format 3\0', 'latin1');
 const CORRELATION = /^[A-Za-z0-9_-]{32}$/;
 const MAX_ANCESTORS = 128;
 
-const OPERATIONS = Object.freeze({
-  reserve: (registry, args) => registry.reserve(args),
-  recordDispatchIntent: (registry, args) => registry.recordDispatchIntent(args),
-  recordWorkerIdentity: (registry, args) => registry.recordWorkerIdentity(args),
-  recordHostCompletion: (registry, args) => registry.recordHostCompletion(args),
-  hostContinuePreDispatch: (registry, args) => registry.hostContinuePreDispatch(args),
-  inspect: (registry, args) => registry.inspect(args),
-  assessWorkerIdentity: (registry, args) => registry.assessWorkerIdentity(args),
-});
+// ---------- Preflight sketch (not used for authorization) ----------
 
 const refuse = code => Object.freeze({ok: false, code});
 
@@ -78,8 +72,6 @@ function lstatOrNull(path) {
   }
 }
 
-// Sidecars: any -wal or -shm file is unsupported. A -journal file must be a
-// regular, non-link file whose size bounds rollback work.
 function checkSiblings(path, maxPages) {
   if (lstatOrNull(`${path}-wal`) !== null || lstatOrNull(`${path}-shm`) !== null) return 'PREFLIGHT_UNSUPPORTED';
   const journal = lstatOrNull(`${path}-journal`);
@@ -104,8 +96,9 @@ function readHeader(path, expected) {
   }
 }
 
-// Returns {ok: true, pages, sizeBytes, identity, guarantee: 'snapshot-only'}
-// or {ok: false, code}. Never throws and never includes the path.
+// Returns {ok: true, pages, sizeBytes, identity, guarantee: 'snapshot-only',
+// authorizes: false} or {ok: false, code}. Never throws, never includes the
+// path.
 export function preflightStore(path, maxPages) {
   try {
     if (!Number.isSafeInteger(maxPages) || maxPages < 16 || maxPages > MAX_PAGES_CAP) return refuse('PREFLIGHT_UNSUPPORTED');
@@ -113,7 +106,7 @@ export function preflightStore(path, maxPages) {
     const linkStats = lstatOrNull(path);
     if (linkStats === null) return refuse('PREFLIGHT_UNAVAILABLE');
     if (linkStats.isSymbolicLink() || !linkStats.isFile()) return refuse('PREFLIGHT_PATH');
-    if (linkStats.ino === 0n) return refuse('PREFLIGHT_PATH'); // identity cannot be compared
+    if (linkStats.ino === 0n) return refuse('PREFLIGHT_PATH');
     if (!ancestorsAreDirectories(path)) return refuse('PREFLIGHT_PATH');
     const limitBytes = BigInt(maxPages) * BigInt(PAGE_SIZE);
     if (linkStats.size > limitBytes) return refuse('PREFLIGHT_OVERSIZE');
@@ -144,14 +137,14 @@ export function preflightStore(path, maxPages) {
     const sibling = checkSiblings(path, maxPages);
     if (sibling) return refuse(sibling);
     return Object.freeze({ok: true, code: null, pages: Math.max(effectivePages, sizePages), sizeBytes: Number(size),
-      identity, guarantee: 'snapshot-only'});
+      identity, guarantee: 'snapshot-only', authorizes: false});
   } catch {
     return refuse('PREFLIGHT_UNAVAILABLE');
   }
 }
 
-// Detects a simple replacement of the store path since the snapshot. It does
-// not detect a swap that was restored before this check.
+// Detects a simple replacement of the path since a snapshot. It does not
+// detect a swap that was restored before this check.
 export function sameStoreIdentity(path, identity) {
   try {
     const stats = lstatSync(path, {bigint: true});
@@ -161,23 +154,7 @@ export function sameStoreIdentity(path, identity) {
   }
 }
 
-// SQLite hard_heap_limit is process-global, so setting it on a private
-// in-memory connection also bounds the registry connection. It bounds only
-// SQLite allocations.
-export function applySqliteHeapLimit(bytes) {
-  let db;
-  try {
-    db = new DatabaseSync(':memory:');
-    db.exec(`PRAGMA hard_heap_limit=${Number(bytes)}`);
-    const row = db.prepare('PRAGMA hard_heap_limit').get();
-    const value = Number(row ? Object.values(row)[0] : NaN);
-    return Number.isSafeInteger(value) && value > 0 && value <= bytes;
-  } catch {
-    return false;
-  } finally {
-    try { db?.close(); } catch {}
-  }
-}
+// ---------- Child protocol ----------
 
 const isPlain = value => value !== null && typeof value === 'object' && !Array.isArray(value) &&
   Object.getPrototypeOf(value) === Object.prototype;
@@ -187,60 +164,32 @@ const intIn = (value, min, max) => Number.isSafeInteger(value) && value >= min &
 
 // Returns the validated request or null. Never echoes request content.
 export function parseRequest(buffer) {
-  let text;
-  try { text = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(buffer); }
-  catch { return null; }
-  const newline = text.indexOf('\n');
-  if (newline === -1 || newline !== text.length - 1) return null;
-  let request;
-  try { request = JSON.parse(text.slice(0, newline)); }
-  catch { return null; }
-  if (!exactKeys(request, ['v', 'correlation', 'operation', 'args', 'store'])) return null;
-  if (request.v !== 1 || typeof request.correlation !== 'string' || !CORRELATION.test(request.correlation)) return null;
-  if (typeof request.operation !== 'string' || !Object.hasOwn(OPERATIONS, request.operation)) return null;
-  if (!isPlain(request.args)) return null;
-  const {store} = request;
-  if (!exactKeys(store, ['path', 'maxPages', 'maxRows', 'busyTimeoutMs', 'heapLimitBytes'])) return null;
-  if (typeof store.path !== 'string' || !isAbsolute(store.path)) return null;
-  if (!intIn(store.maxPages, 16, MAX_PAGES_CAP) || !intIn(store.maxRows, 1, 100000)) return null;
-  if (!intIn(store.busyTimeoutMs, 0, 60000) || !intIn(store.heapLimitBytes, 8 * 1048576, 1024 * 1048576)) return null;
-  return request;
+  try {
+    const text = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(buffer);
+    const newline = text.indexOf('\n');
+    if (newline === -1 || newline !== text.length - 1) return null;
+    const request = JSON.parse(text.slice(0, newline));
+    if (!exactKeys(request, ['v', 'correlation', 'operation', 'args', 'store'])) return null;
+    if (request.v !== 1 || typeof request.correlation !== 'string' || !CORRELATION.test(request.correlation)) return null;
+    if (typeof request.operation !== 'string' || !OPERATION_NAMES.has(request.operation)) return null;
+    if (!isPlain(request.args)) return null;
+    const {store} = request;
+    if (!exactKeys(store, ['path', 'maxPages', 'maxRows', 'busyTimeoutMs'])) return null;
+    if (typeof store.path !== 'string' || !isAbsolute(store.path)) return null;
+    if (!intIn(store.maxPages, 16, MAX_PAGES_CAP) || !intIn(store.maxRows, 1, 100000) || !intIn(store.busyTimeoutMs, 0, 60000)) return null;
+    return request;
+  } catch {
+    return null;
+  }
 }
 
-const codeOf = error => (error instanceof ClaimRegistryError ? error.code : 'INTERNAL_ERROR');
-
-// Runs one validated request. faultHook is a test seam passed only by the
-// synthetic test fixture; the fixed entry point never passes one.
-export function runRequest(request, {faultHook} = {}) {
-  const base = {v: 1, correlation: request.correlation, operation: request.operation};
-  const {store} = request;
-  const preflight = preflightStore(store.path, store.maxPages);
-  if (!preflight.ok) return {...base, status: 'rejected', code: preflight.code};
-  if (!applySqliteHeapLimit(store.heapLimitBytes)) return {...base, status: 'rejected', code: 'CHILD_LIMIT_UNAVAILABLE'};
-  if (!sameStoreIdentity(store.path, preflight.identity)) return {...base, status: 'rejected', code: 'PREFLIGHT_PATH'};
-  let registry;
-  try {
-    const options = {maxRows: store.maxRows, maxPages: store.maxPages, busyTimeoutMs: store.busyTimeoutMs};
-    if (typeof faultHook === 'function') options.testFaultHook = faultHook;
-    registry = openClaimRegistry(store.path, options);
-  } catch (error) {
-    return {...base, status: 'error', phase: 'open', code: codeOf(error)};
-  }
-  let reply;
-  try {
-    reply = {...base, status: 'ok', result: OPERATIONS[request.operation](registry, request.args)};
-  } catch (error) {
-    reply = {...base, status: 'error', phase: 'operation', code: codeOf(error)};
-  } finally {
-    registry.close();
-  }
-  // If the path now names a different file, the operation may have run on a
-  // substituted store, so the outcome is unknown.
-  if (!sameStoreIdentity(store.path, preflight.identity)) return {...base, status: 'unknown', code: 'STORE_PATH_CHANGED'};
-  return reply;
+// The only reply this child gives. Registry access is refused before the
+// registry module or SQLite is loaded and before the store path is touched.
+export function buildReply(request) {
+  return {v: 1, correlation: request.correlation, operation: request.operation, status: 'rejected', code: BOUNDARY_CODE};
 }
 
-function readBoundedStdin(limit) {
+export function readRequestFromStdin(limit = HARD_MAX_REQUEST_BYTES) {
   return new Promise(resolvePromise => {
     const chunks = [];
     let size = 0;
@@ -261,24 +210,27 @@ function readBoundedStdin(limit) {
       }
       chunks.push(chunk);
     });
-    process.stdin.on('end', () => stop(Buffer.concat(chunks)));
+    process.stdin.on('end', () => stop(parseRequest(Buffer.concat(chunks))));
     process.stdin.on('error', () => stop(null));
   });
 }
 
-const quietExit = code => process.exit(code);
+export const quietExit = code => process.exit(code);
 
-export async function childMain({faultHook} = {}) {
+export function installQuietHandlers() {
   process.on('uncaughtException', () => quietExit(EXIT_INTERNAL));
   process.on('unhandledRejection', () => quietExit(EXIT_INTERNAL));
-  const raw = await readBoundedStdin(HARD_MAX_REQUEST_BYTES);
-  const request = raw === null ? null : parseRequest(raw);
+}
+
+export function replyLine(reply) {
+  return `${JSON.stringify(reply)}\n`;
+}
+
+export async function childMain() {
+  installQuietHandlers();
+  const request = await readRequestFromStdin();
   if (request === null) return quietExit(EXIT_BAD_REQUEST);
-  let reply;
-  try { reply = runRequest(request, {faultHook}); }
-  catch { return quietExit(EXIT_INTERNAL); }
-  const line = `${JSON.stringify(reply)}\n`;
-  process.stdout.write(line, error => quietExit(error ? EXIT_INTERNAL : 0));
+  process.stdout.write(replyLine(buildReply(request)), error => quietExit(error ? EXIT_INTERNAL : 0));
 }
 
 function isEntryPoint() {
