@@ -43,6 +43,7 @@ class TestNode {
     this.children = [];
     this.parentNode = null;
     this.ownText = text;
+    if (tag === 'button') this.disabled = false;
   }
   setAttribute(name, value) {
     this.attributes[name] = String(value);
