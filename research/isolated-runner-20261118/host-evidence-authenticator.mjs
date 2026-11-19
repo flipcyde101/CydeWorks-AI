@@ -57,6 +57,10 @@ export const FIXED_CASES = Object.freeze([
 ]);
 
 const controllers = new WeakMap();
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer').get;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset').get;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength').get;
 
 function isPlainObj(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value) || utilTypes.isProxy(value)) return false;
@@ -120,11 +124,24 @@ function copyKey(attestationKey) {
       !ArrayBuffer.isView(attestationKey) || utilTypes.isDataView(attestationKey)) {
     throw new Error('Host attestation key is invalid.');
   }
-  const copy = Buffer.from(attestationKey.buffer, attestationKey.byteOffset, attestationKey.byteLength);
-  if (copy.length < MIN_HMAC_KEY_BYTES || copy.length > MAX_HMAC_KEY_BYTES) {
+  let backing;
+  let offset;
+  let length;
+  try {
+    backing = typedArrayBuffer.call(attestationKey);
+    offset = typedArrayByteOffset.call(attestationKey);
+    length = typedArrayByteLength.call(attestationKey);
+  } catch {
     throw new Error('Host attestation key is invalid.');
   }
-  return copy;
+  if (utilTypes.isSharedArrayBuffer(backing) || length < MIN_HMAC_KEY_BYTES || length > MAX_HMAC_KEY_BYTES) {
+    throw new Error('Host attestation key is invalid.');
+  }
+  try {
+    return Buffer.from(new Uint8Array(backing, offset, length));
+  } catch {
+    throw new Error('Host attestation key is invalid.');
+  }
 }
 
 function signableCanonical(evidence) {
