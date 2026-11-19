@@ -960,8 +960,8 @@ class ProtectedFixtureVerifierTests(unittest.TestCase):
         if not vp_path.is_file():
             self.skipTest("verified-patch.mjs absent")
         vp_source = vp_path.read_text(encoding="utf-8", errors="replace")
-        if "buildScope" not in vp_source or "resolveClaim" not in vp_source:
-            self.skipTest("checkout verified-patch.mjs predates 5706845 buildScope/resolveClaim contract")
+        self.assertIn("buildScope", vp_source)
+        self.assertIn("createVerifiedPatchController", vp_source)
 
         node_bin = shutil.which("node")
         git_bin = shutil.which("git")
@@ -1032,6 +1032,8 @@ import {pathToFileURL} from 'node:url';
 
 const [vpPath, attPath, baseRepoDir, baseRevision, scratchRoot] = process.argv.slice(1);
 const vp = await import(pathToFileURL(vpPath).href);
+// This synthetic host fixture is supplied independently from verifier evidence.
+const host = JSON.parse(readFileSync(0, 'utf8'));
 const verification = JSON.parse(readFileSync(attPath, 'utf8'));
 const candidateFiles = {
   'limits.py': readFileSync(process.env.CAND_LIMITS),
@@ -1040,18 +1042,23 @@ const candidateFiles = {
 const built = vp.buildCandidatePatch({baseRepoDir, baseRevision, candidateFiles, scratchRoot});
 const {scope, scopeHash} = vp.buildScope({
   baseRevision,
-  baseFileDigests: verification.baseFileDigests,
+  baseFileDigests: host.claim.scope.baseFileDigests,
   cases: JSON.parse(process.env.APPROVED_CASES_JSON),
 });
-assert.equal(scopeHash, verification.scopeHash);
-const claim = {claimId: verification.claimId, scope, scopeHash};
+assert.deepEqual(scope, host.claim.scope);
+assert.equal(scopeHash, host.claim.scopeHash);
+const makeController = () => vp.createVerifiedPatchController({
+  attestationKey: Buffer.from(host.keyHex, 'hex'),
+  expectedInvocationNonce: host.nonce,
+  claimRecord: host.claim,
+});
+const controller = makeController();
 const bound = vp.verifyAndBindPatch({
+  controller,
   baseRepoDir,
   baseRevision,
-  claim,
-  resolveClaim: (id) => (id === claim.claimId ? {trusted: true, ...claim} : null),
   approvedCases: JSON.parse(process.env.APPROVED_CASES_JSON),
-  verification,
+  evidence: verification,
   patch: built.patch,
   candidateFiles,
   scratchRoot,
@@ -1061,16 +1068,26 @@ assert.deepEqual(bound.fileDigests, verification.fileDigests);
 assert.equal(bound.treeSha256, verification.treeSha256);
 
 assert.throws(() => vp.verifyAndBindPatch({
+  controller,
   baseRepoDir,
   baseRevision,
-  claim: {...claim, scopeHash: '0'.repeat(64)},
-  resolveClaim: (id) => (id === claim.claimId ? {trusted: true, ...claim} : null),
   approvedCases: JSON.parse(process.env.APPROVED_CASES_JSON),
-  verification,
+  evidence: verification,
   patch: built.patch,
   candidateFiles,
   scratchRoot,
-}));
+}), /Replayed invocation nonce/);
+const tampered = {...verification, treeSha256: '0'.repeat(64)};
+assert.throws(() => vp.verifyAndBindPatch({
+  controller: makeController(),
+  baseRepoDir,
+  baseRevision,
+  approvedCases: JSON.parse(process.env.APPROVED_CASES_JSON),
+  evidence: tampered,
+  patch: built.patch,
+  candidateFiles,
+  scratchRoot,
+}), /HMAC verification failed/);
 console.log(JSON.stringify({status: bound.status, treeSha256: bound.treeSha256}));
 """
             cand_limits = root / "cand_limits.py"
@@ -1096,6 +1113,7 @@ console.log(JSON.stringify({status: bound.status, treeSha256: bound.treeSha256})
                     str(scratch),
                 ],
                 env=env,
+                input=json.dumps({"claim": claim, "nonce": TEST_NONCE, "keyHex": TEST_HMAC_KEY.hex()}),
                 capture_output=True,
                 text=True,
                 check=False,
