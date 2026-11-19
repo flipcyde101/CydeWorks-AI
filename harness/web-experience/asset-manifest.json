@@ -108,6 +108,14 @@
     "sha256": "d2f1c3024306329a9f98403e165c6ef5205fb7cd402aee3fcc87eeba3be10f30"
   },
   {
+    "file": "vendor/harness-web/progress-view.js",
+    "sha256": "8043216dd7b6191500202c602f60c6edbf314ff0e76017375983f3987717fb9e"
+  },
+  {
+    "file": "vendor/harness-web/progress.js",
+    "sha256": "88941e6a8086aedfd06f4242d67d2711e9567e0ebbad8456167a829956b99536"
+  },
+  {
     "file": "vendor/harness-web/usage.js",
     "sha256": "f40518bb20ca5c085a02a81af121582141da4b977f7a91bc77246ec9a36c9df3"
   },
@@ -141,7 +149,7 @@
   },
   {
     "file": "views/task.js",
-    "sha256": "1d68c52d25c4c7701cb47061e4fa27bbfdc37e0081d89b990c6981d3a3f1c459"
+    "sha256": "fe5afd69406b3635d3626013b68a0b2220265fde51d706d99e8f4755acee9ef0"
   },
   {
     "file": "views/usage.js",

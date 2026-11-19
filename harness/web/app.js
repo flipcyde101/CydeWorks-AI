@@ -2,6 +2,7 @@ import {createObserver} from './observer.js';
 import {bindExportDialog} from './export-dialog.js';
 import {summarizeUsage,describeStepReceipt} from './usage.js';
 import {describeProgress,progressAnnouncement} from './progress.js';
+import {presentProgress} from './progress-view.js';
 import {bindRemovalDialog} from './removal-dialog.js';
 import {diagnosticMessages} from './route-diagnostics.js';
 import {bindProposalEditor} from './proposal-editor.js';
@@ -228,15 +229,10 @@ function renderProgress(attempt) {
     return;
   }
   box.append(element('h2',attempt?.provider==='fixture'?'Synthetic fixture request':'Local model request'));
-  box.append(element('p',progress.explanation));
+  const presentation=presentProgress(progress);
+  box.append(element('p',presentation.explanation));
   const dl=element('dl');
-  definition(dl,[['Status',progress.status],['Current step',progress.status],
-    ['Completed','Scope approved'],['Remaining',progress.remaining],
-    ['Elapsed',seconds(progress.elapsedMs)],['Output',progress.chars===null?null:progress.chars+' characters; total unknown'],
-    ['Rate',progress.rate===null?null:progress.rate.toFixed(1)+' characters/s since dispatch'],
-    ['Workspace heartbeat',progress.heartbeat===null?null:new Date(progress.heartbeat).toLocaleTimeString()],
-    ['Last activity recorded',progress.lastActivity===null?null:new Date(progress.lastActivity).toLocaleTimeString()],
-    ['Current step ETA',progress.eta],['Projected local completion',progress.completion]]);
+  definition(dl,presentation.pairs);
   box.append(dl);
   // Keep the control stable while polling so keyboard focus is retained.
 }

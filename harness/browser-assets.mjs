@@ -4,7 +4,7 @@ import {extname, join} from 'node:path';
 
 const legacyFiles = [
   'index.html', 'app.js', 'style.css', 'observer.js', 'export-dialog.js', 'usage.js',
-  'progress.js', 'removal-dialog.js', 'route-diagnostics.js', 'proposal-editor.js',
+  'progress.js', 'progress-view.js', 'removal-dialog.js', 'route-diagnostics.js', 'proposal-editor.js',
   'terminal-request.js', 'draft-copy-dialog.js',
 ];
 const contentTypes = new Map([

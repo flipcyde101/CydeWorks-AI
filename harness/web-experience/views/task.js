@@ -1,8 +1,10 @@
 import {h, icon, swap, stableKey} from '../core/dom.js';
 import {button, chip, notice, kv, panel, disclosure, planned, simulated, approximation, confirmDialog} from '../ui/primitives.js';
-import {STATUS_LABEL, STATUS_TONE, STEPS, journeyStep, describeSituation, dispatchEvidence, progressModel, attemptTiming, timingLine} from '../logic/situation.js';
+import {STATUS_LABEL, STATUS_TONE, STEPS, journeyStep, describeSituation, dispatchEvidence, attemptTiming, timingLine} from '../logic/situation.js';
+import {describeProgress, progressAnnouncement} from '../vendor/harness-web/progress.js';
+import {presentProgress} from '../vendor/harness-web/progress-view.js';
 import {terminalTarget, terminalTargetHolds} from '../logic/approval.js';
-import {describeCost, formatDuration, formatClock, formatDateTime, formatRate, formatCount, formatAge, shortHash} from '../core/format.js';
+import {describeCost, formatDuration, formatClock, formatDateTime, formatCount, formatAge, shortHash} from '../core/format.js';
 import {demoAcceptance} from '../demo/acceptance.js';
 import {openProposalEditor, openCopyDialog, openExportDialog, openRemovalDialog} from './dialogs.js';
 import {summarizeUsage, describeStepReceipt} from '../vendor/harness-web/usage.js';
@@ -15,13 +17,19 @@ const TYPE_LABEL = {local: 'Local', subscription: 'Subscription', metered: 'Mete
 export function renderTask(container, ctx) {
   const {state} = ctx, task = state.task;
   if (container.dataset.swapKey !== 'task:' + task.id) {
-    container.replaceChildren(...['head', 'steps', 'overview', 'pending', 'primary', 'usage', 'foot'].map(id => h('div', {id: 'task-' + id, class: 'stack'})));
+    container.replaceChildren(h('p', {id: 'task-progress-announcement', class: 'sr-only', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true'}),
+      ...['head', 'steps', 'overview', 'pending', 'primary', 'usage', 'foot'].map(id => h('div', {id: 'task-' + id, class: 'stack'})));
     container.dataset.swapKey = 'task:' + task.id;
   }
   const region = id => container.querySelector('#task-' + id);
   const locked = state.connection !== 'connected' || state.needsReconcile || state.busy;
   const attempt = task.attempts.at(-1);
   const owns = ctx.ownsControl();
+  const progressConnection = state.needsReconcile && state.connection === 'connected' ? 'checking' : state.connection;
+  const progress = progressConnection === 'connected' && attempt ? describeProgress(task, attempt, state.now) : null;
+  const announcement = progressAnnouncement(task, progress, progressConnection);
+  const announcementNode = container.querySelector('#task-progress-announcement');
+  if (announcementNode.textContent !== announcement) announcementNode.textContent = announcement;
 
   swap(region('head'), stableKey([task.title, task.status, locked, task.copy]), () => [
     h('a', {class: 'btn btn-quiet back', href: '#/work'}, icon('back'), 'All tasks'),
@@ -54,7 +62,7 @@ export function renderTask(container, ctx) {
   swap(region('pending'), stableKey([pending, locked]), () => pending ? pendingPanel(ctx, pending, locked) : []);
 
   const primary = region('primary');
-  if (task.status === 'running') renderRunning(primary, ctx, {locked, owns});
+  if (task.status === 'running') renderRunning(primary, ctx, {locked, owns, progress, progressConnection});
   else {
     const decided = ['accepted', 'rejected'].includes(task.status);
     const showApproval = !task.recovery?.blocked && task.status !== 'review' && (!decided || state.anotherAttempt === task.id);
@@ -194,36 +202,27 @@ function problemPanel(task, attempt) {
 
 // ---- Running: progress and terminal ----------------------------------------------------------
 
-function renderRunning(container, ctx, {locked, owns}) {
+function renderRunning(container, ctx, {locked, owns, progress, progressConnection}) {
   const {state, actions} = ctx, task = state.task, attempt = task.attempts.at(-1);
   if (container.dataset.swapKey !== 'running') {
     container.replaceChildren(h('div', {id: 'run-progress', class: 'stack'}), h('div', {id: 'run-terminal', class: 'stack'}));
     container.dataset.swapKey = 'running';
   }
-  const stale = state.connection !== 'connected';
-  const model = stale ? null : progressModel(task, state.now);
+  const stale = progressConnection !== 'connected';
+  const model = progress ? presentProgress(progress) : null;
   swap(container.querySelector('#run-progress'), stableKey([model, stale, locked, attempt.provider]), () => {
     if (!model) return panel('Progress', notice('warn', h('p', null, 'Progress is hidden while the connection is unverified. The last saved state may be out of date.')));
-    const rate = formatRate(model.chars, model.windowMs);
+    const stopping = model.phase === 'stopping';
     return panel([h('div', {class: 'row'}, h('h2', null, 'Progress'), simulated()),
-      h('div', {class: 'row'}, h('span', {class: 'pulse' + (model.stalled || model.stopping ? ' pulse-off' : ''), 'aria-hidden': 'true'}), chip(model.state, model.stalled || model.stopping ? 'warn' : 'active'))],
+      h('div', {class: 'row'}, h('span', {class: 'pulse' + (model.stalled || stopping ? ' pulse-off' : ''), 'aria-hidden': 'true'}), chip(model.status, model.stalled || stopping || model.failed ? 'warn' : 'active'))],
     h('p', null, model.explanation),
-    h('ol', {class: 'progress-steps', 'aria-label': 'Steps: ' + model.completed + ' of ' + model.total + ' complete'}, model.steps.map(item =>
-      h('li', {class: item.status}, h('span', {class: 'mark', 'aria-hidden': 'true'}, item.status === 'done' ? '✓' : item.status === 'current' ? '▸' : '·'),
-        h('span', null, item.label), h('span', {class: 'sr-only'}, ' (' + item.status + ')')))),
-    kv([['Steps', model.completed + ' of ' + model.total + ' complete, ' + (model.total - model.completed) + ' remaining'],
-      ['Elapsed', formatDuration(model.elapsedMs)],
-      ['Output so far', model.chars === null ? 'Unavailable' : formatCount(model.chars) + ' characters. Total unknown.'],
-      ['Measured rate', rate ?? 'Unavailable until output arrives'],
-      ['Latest activity', model.lastActivity === null ? 'Unavailable' : formatClock(model.lastActivity) + ' (' + formatAge(model.idleMs) + ')'],
-      ['Workspace heartbeat', model.heartbeat === null ? 'Unavailable' : formatClock(model.heartbeat)],
-      ['Time remaining', model.eta]]),
+    kv(model.pairs),
     attempt.provider !== 'opencode' ? h('div', {class: 'row'},
-      button('Stop this request', {kind: 'danger', fid: 'cancel-request', disabled: locked || model.stopping, onClick: event => confirmDialog({
+      button('Stop this request', {kind: 'danger', fid: 'cancel-request', disabled: locked || stopping, onClick: event => confirmDialog({
         title: 'Stop this request?', opener: event.currentTarget, confirmLabel: 'Stop request', destructive: true, onConfirm: actions.cancelRequest,
         lines: ['Attempt ' + task.attempts.length + ' on ' + attempt.routeLabel + ' will be asked to stop.',
           'If the request was already sent, the workspace cannot confirm the route stopped working on it. The outcome is then recorded as unknown and a retry is held.']})}),
-      model.stopping ? h('span', {class: 'faint'}, 'Stop requested. Waiting for confirmation.') : null) : null);
+      stopping ? h('span', {class: 'faint'}, 'Stop requested. Waiting for confirmation.') : null) : null);
   });
 
   const live = task.live, control = live?.control;
