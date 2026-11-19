@@ -163,9 +163,15 @@ test('durable identity is persisted before dispatch releases the held namespace'
       'execute-ran',
       'guest-stopped',
       'oneshot-stop',
+      'oneshot-confirm',
     ]);
     assert.equal(log.serveFrames[0].op, 'start');
     assert.equal(log.serveFrames[1].op, 'dispatch');
+    assert.equal(log.oneshotCalls.length, 2);
+    assert.equal(log.oneshotCalls[0].mode, 'stop');
+    assert.equal(log.oneshotCalls[0].payload.expectedNonce, log.serveFrames[0].nonce);
+    assert.equal(log.oneshotCalls[1].mode, 'confirm');
+    assert.equal(log.oneshotCalls[1].payload.expectedNonce, log.serveFrames[0].nonce);
     assert.equal(reconcileClaim(claimPath).state, 'complete');
   } finally {
     claim.close();
@@ -188,8 +194,11 @@ test('failure or abort during record never sends dispatch and stops held namespa
         queueMicrotask(() => child.emit('close', 0));
       }
     },
-    onOneshot(_mode, _payload, child) {
-      child.stdout.write(JSON.stringify({event: 'stopped', cleanup: 'verified'}) + '\n');
+    onOneshot(mode, _payload, child) {
+      const reply = mode === 'stop'
+        ? {event: 'stopped', cleanup: 'verified'}
+        : {event: 'confirmed', absent: true};
+      child.stdout.write(JSON.stringify(reply) + '\n');
       child.stdout.end();
       queueMicrotask(() => child.emit('close', 0));
     },
@@ -206,10 +215,12 @@ test('failure or abort during record never sends dispatch and stops held namespa
     /Disk full/,
   );
   assert.equal(log.serveFrames.some(f => f.op === 'dispatch'), false);
-  assert.equal(log.oneshotCalls.length, 1);
+  assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm']);
+  assert.equal(log.oneshotCalls[0].payload.expectedNonce, NONCE_1);
+  assert.equal(log.oneshotCalls[1].payload.expectedNonce, NONCE_1);
 });
 
-test('stale nonce, forged birthIdentity, and non-private namespace return unknown without Guest call', async () => {
+test('stale nonce, forged birthIdentity, and strict identity violations return unknown without Guest call', async () => {
   const {spawnGuest, log} = createFakeSpawn();
   const adapter = createOpenCodeStopWslAdapter({spawnGuest});
   const {digest, ...valid} = makeIdentity(NONCE_1);
@@ -234,10 +245,42 @@ test('stale nonce, forged birthIdentity, and non-private namespace return unknow
   const sharedRes = await adapter.stopAndVerify(sharedNs, NONCE_1);
   assert.equal(sharedRes.cleanup, 'unknown');
 
+  // Strict Windows validation checks: malformed pidNs, colliding pid, non-numeric start, negative uid, bad profile/bootId
+  const badPidNs = structuredClone(owned);
+  badPidNs.init.pidNs = 'pid:[not-a-number';
+  badPidNs.birthIdentity = `${BOOT_ID}:302:88002:${badPidNs.init.pidNs}`;
+  assert.equal(validateOwnedIdentity(badPidNs, NONCE_1), false);
+
+  const collidingPid = structuredClone(owned);
+  collidingPid.init.pid = collidingPid.bwrap.pid;
+  collidingPid.birthIdentity = `${BOOT_ID}:${collidingPid.init.pid}:88002:${collidingPid.init.pidNs}`;
+  assert.equal(validateOwnedIdentity(collidingPid, NONCE_1), false);
+
+  const nonNumericStart = structuredClone(owned);
+  nonNumericStart.init.start = '88002abc';
+  nonNumericStart.birthIdentity = `${BOOT_ID}:302:88002abc:${nonNumericStart.init.pidNs}`;
+  assert.equal(validateOwnedIdentity(nonNumericStart, NONCE_1), false);
+
+  const negativeUid = structuredClone(owned);
+  negativeUid.uid = -1;
+  assert.equal(validateOwnedIdentity(negativeUid, NONCE_1), false);
+
+  const badProfile = structuredClone(owned);
+  badProfile.profile = 'untrusted-profile';
+  assert.equal(validateOwnedIdentity(badProfile, NONCE_1), false);
+
+  const badBoot = structuredClone(owned);
+  badBoot.bootId = 'bad boot id!';
+  badBoot.birthIdentity = `${badBoot.bootId}:302:88002:${badBoot.init.pidNs}`;
+  assert.equal(validateOwnedIdentity(badBoot, NONCE_1), false);
+
   // Tampered identityDigest
   const tampered = {...owned, identityDigest: '0'.repeat(64)};
   const tamperedRes = await adapter.stopAndVerify(tampered, NONCE_1);
   assert.equal(tamperedRes.cleanup, 'unknown');
+  const tamperedConfirm = await adapter.confirmAbsent(tampered, NONCE_1);
+  assert.equal(tamperedConfirm.absent, false);
+  assert.equal(tamperedConfirm.reason, 'identity-digest-mismatch');
 
   assert.equal(log.oneshotCalls.length, 0);
 });
@@ -259,8 +302,11 @@ test('repeated Stop is idempotent and ambiguous cleanup leaves claim unresolved'
           queueMicrotask(() => child.emit('close', 0));
         }
       },
-      onOneshot(_mode, _payload, child) {
-        child.stdout.write(JSON.stringify(stopResult) + '\n');
+      onOneshot(mode, _payload, child) {
+        const reply = mode === 'stop'
+          ? stopResult
+          : {event: 'confirmed', absent: stopResult.cleanup === 'verified'};
+        child.stdout.write(JSON.stringify(reply) + '\n');
         child.stdout.end();
         queueMicrotask(() => child.emit('close', 0));
       },
@@ -277,6 +323,7 @@ test('repeated Stop is idempotent and ambiguous cleanup leaves claim unresolved'
 
     const firstStop = await adapter.stopAndVerify(savedIdentity, NONCE_1);
     assert.equal(firstStop.cleanup, 'verified');
+    assert.equal(firstStop.evidence.confirmedAbsent, true);
     const secondStop = await adapter.stopAndVerify(savedIdentity, NONCE_1);
     assert.equal(secondStop.cleanup, 'verified');
 
@@ -303,6 +350,82 @@ test('repeated Stop is idempotent and ambiguous cleanup leaves claim unresolved'
   } finally {
     rmSync(dir, {recursive: true, force: true});
   }
+});
+
+test('concurrent stopAndVerify calls coalesce single-flight and independent confirm failure returns unknown', async () => {
+  let confirmAbsentResult = true;
+  let releaseSessionStop = null;
+  const {spawnGuest, log} = createFakeSpawn({
+    onServeFrame(frame, child) {
+      if (frame.op === 'start') {
+        const {digest, ...identity} = makeIdentity(frame.nonce);
+        child.stdout.write(JSON.stringify({event: 'held', nonce: frame.nonce, identity, digest}) + '\n');
+      } else if (frame.op === 'dispatch') {
+        child.stdout.write(JSON.stringify({event: 'dispatched', nonce: frame.nonce}) + '\n');
+      } else if (frame.op === 'stop') {
+        releaseSessionStop = () => {
+          child.stdout.write(
+            JSON.stringify({event: 'stopped', nonce: frame.nonce, cleanup: 'verified', evidence: {signalled: ['init']}}) + '\n',
+          );
+          child.stdout.end();
+          queueMicrotask(() => child.emit('close', 0));
+        };
+      }
+    },
+    onOneshot(mode, payload, child) {
+      assert.equal(payload.expectedNonce, NONCE_1);
+      const reply = mode === 'stop'
+        ? {event: 'stopped', cleanup: 'verified', evidence: {signalled: []}}
+        : confirmAbsentResult
+          ? {event: 'confirmed', absent: true}
+          : {event: 'confirmed', absent: false, remaining: [302]};
+      child.stdout.write(JSON.stringify(reply) + '\n');
+      child.stdout.end();
+      queueMicrotask(() => child.emit('close', 0));
+    },
+  });
+
+  const adapter = createOpenCodeStopWslAdapter({spawnGuest});
+  let savedIdentity;
+  await adapter.start({
+    nonce: NONCE_1,
+    record: id => {
+      savedIdentity = id;
+    },
+  });
+
+  const differentBirth = {
+    ...savedIdentity,
+    identityDigest: undefined,
+    init: {...savedIdentity.init, start: '999999'},
+  };
+  differentBirth.birthIdentity = `${differentBirth.bootId}:${differentBirth.init.pid}:${differentBirth.init.start}:${differentBirth.init.pidNs}`;
+  assert.equal((await adapter.stopAndVerify(differentBirth)).reason, 'session-identity-mismatch');
+  assert.equal(log.serveFrames.filter(f => f.op === 'stop').length, 0);
+  assert.equal(log.oneshotCalls.length, 0);
+
+  // Launch two concurrent Stop calls while the in-session Stop is still pending.
+  const p1 = adapter.stopAndVerify(savedIdentity, NONCE_1);
+  const p2 = adapter.stopAndVerify(savedIdentity, NONCE_1);
+  // A stale concurrent call must return unknown immediately without joining the valid flight.
+  const staleRes = await adapter.stopAndVerify(savedIdentity, NONCE_2);
+  assert.equal(staleRes.cleanup, 'unknown');
+
+  assert.equal(typeof releaseSessionStop, 'function');
+  releaseSessionStop();
+
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.equal(r1.cleanup, 'verified');
+  assert.equal(r2.cleanup, 'verified');
+  assert.equal(r1.evidence.confirmedAbsent, true);
+  assert.equal(log.serveFrames.filter(f => f.op === 'stop').length, 1);
+  assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm']);
+
+  // If out-of-band stop reports verified but independent confirm reports a survivor, result must be unknown.
+  confirmAbsentResult = false;
+  const failConfirm = await adapter.stopAndVerify(savedIdentity, NONCE_1);
+  assert.equal(failConfirm.cleanup, 'unknown');
+  assert.deepEqual(log.oneshotCalls.map(c => c.mode), ['stop', 'confirm', 'stop', 'confirm']);
 });
 
 test('canonicalJson and digestIdentity match Python canonical sha256', () => {

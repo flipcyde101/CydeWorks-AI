@@ -12,7 +12,10 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent
@@ -251,6 +254,322 @@ class OpenCodeStopGuestUnitTests(unittest.TestCase):
         self.assertEqual(ops_reboot.signalled_pids, [])
         self.assertTrue(GUEST.confirm_identity(rebooted, identity, expected_nonce=NONCE_A)["absent"])
 
+    def _make_pipe_supervisor_factory(self, workload_read_file, nonce=NONCE_A):
+        identity = sample_identity(nonce)
+        expected_digest = GUEST.digest(identity)
+        records = {"stop_reasons": [], "dispatched": False}
+
+        class FakeProcess:
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        class FakeSupervisor:
+            def __init__(self, emit, hold=5.0, lifetime=5.0, **_kwargs):
+                self.emit = emit
+                self.hold = hold
+                self.lifetime = lifetime
+                self.process = FakeProcess(workload_read_file)
+                self.identity = None
+                self.dispatched = False
+                self.release_fd = None
+
+            def start(self, req_nonce, _profile, _bwrap=None):
+                self.identity = sample_identity(req_nonce)
+                self.emit({"event": "held", "nonce": req_nonce, "identity": self.identity, "digest": expected_digest})
+
+            def dispatch(self, req_nonce, identity_digest):
+                if req_nonce != self.identity["nonce"] or identity_digest != expected_digest:
+                    raise RuntimeError("BLOCKED: invalid dispatch")
+                self.dispatched = True
+                records["dispatched"] = True
+                self.emit({"event": "dispatched", "nonce": req_nonce})
+
+            def stop(self, reason):
+                records["stop_reasons"].append(reason)
+                if self.process.stdout and not self.process.stdout.closed:
+                    self.process.stdout.close()
+                result = {"cleanup": "verified", "evidence": {"reason": reason}}
+                self.emit({"event": "stopped", "nonce": self.identity and self.identity["nonce"], **result})
+                return result
+
+        return FakeSupervisor, expected_digest, records
+
+    def test_serve_partial_workload_line_does_not_block_stop_or_lifetime(self):
+        # Case A: workload emits a partial line without newline, then valid stop arrives.
+        in_r, in_w = os.pipe()
+        wl_r, wl_w = os.pipe()
+        in_read = os.fdopen(in_r, "rb", buffering=0)
+        wl_read = os.fdopen(wl_r, "rb", buffering=0)
+        frames = []
+        factory, expected_digest, records = self._make_pipe_supervisor_factory(wl_read, NONCE_A)
+        try:
+            def driver():
+                os.write(in_w, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
+                os.write(in_w, (json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": expected_digest}) + "\n").encode())
+                time.sleep(0.03)
+                os.write(wl_w, b"partial-without-newline")
+                time.sleep(0.03)
+                os.write(in_w, (json.dumps({"op": "stop", "nonce": NONCE_A}) + "\n").encode())
+
+            t = threading.Thread(target=driver, daemon=True)
+            t.start()
+            t0 = time.monotonic()
+            GUEST.serve(stdin=in_read, emit=frames.append, supervisor_factory=factory, hold=2.0, lifetime=5.0)
+            elapsed = time.monotonic() - t0
+            t.join(timeout=2.0)
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(records["stop_reasons"], ["stop"])
+            self.assertTrue(any(f.get("event") == "stopped" and f["evidence"]["reason"] == "stop" for f in frames))
+        finally:
+            for fd in (in_w, wl_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            for stream in (in_read, wl_read):
+                if not stream.closed:
+                    stream.close()
+
+        # Case B: workload emits a partial line without newline and never sends stop; lifetime must expire.
+        in_r2, in_w2 = os.pipe()
+        wl_r2, wl_w2 = os.pipe()
+        in_read2 = os.fdopen(in_r2, "rb", buffering=0)
+        wl_read2 = os.fdopen(wl_r2, "rb", buffering=0)
+        frames2 = []
+        factory2, expected_digest2, records2 = self._make_pipe_supervisor_factory(wl_read2, NONCE_A)
+        try:
+            os.write(in_w2, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
+            os.write(in_w2, (json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": expected_digest2}) + "\n").encode())
+            os.write(wl_w2, b"stalled-partial-line")
+            t0 = time.monotonic()
+            GUEST.serve(stdin=in_read2, emit=frames2.append, supervisor_factory=factory2, hold=1.0, lifetime=0.15)
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(records2["stop_reasons"], ["lifetime-expired"])
+        finally:
+            for fd in (in_w2, wl_w2):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            for stream in (in_read2, wl_read2):
+                if not stream.closed:
+                    stream.close()
+
+    def test_serve_partial_stdin_line_does_not_block_hold_or_start_timeout(self):
+        # Partial control frame after start must still hit hold-expired without wedging.
+        in_r, in_w = os.pipe()
+        wl_r, wl_w = os.pipe()
+        in_read = os.fdopen(in_r, "rb", buffering=0)
+        wl_read = os.fdopen(wl_r, "rb", buffering=0)
+        frames = []
+        factory, _, records = self._make_pipe_supervisor_factory(wl_read, NONCE_A)
+        try:
+            os.write(in_w, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
+            os.write(in_w, b'{"op":"dispatch","partial')
+            t0 = time.monotonic()
+            GUEST.serve(stdin=in_read, emit=frames.append, supervisor_factory=factory, hold=0.15, lifetime=1.0)
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(records["stop_reasons"], ["hold-expired"])
+        finally:
+            for fd in (in_w, wl_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            for stream in (in_read, wl_read):
+                if not stream.closed:
+                    stream.close()
+
+        # Partial initial start frame must time out instead of blocking indefinitely.
+        in_r2, in_w2 = os.pipe()
+        in_read2 = os.fdopen(in_r2, "rb", buffering=0)
+        frames2 = []
+        try:
+            os.write(in_w2, b'{"op":"sta')
+            t0 = time.monotonic()
+            GUEST.serve(stdin=in_read2, emit=frames2.append, hold=0.15, lifetime=1.0)
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 1.5)
+            self.assertTrue(any(f.get("event") == "blocked" and "timeout" in f.get("reason", "") for f in frames2))
+        finally:
+            try:
+                os.close(in_w2)
+            except OSError:
+                pass
+            if not in_read2.closed:
+                in_read2.close()
+
+    def test_serve_stale_nonce_stop_does_not_kill_active_namespace(self):
+        in_r, in_w = os.pipe()
+        wl_r, wl_w = os.pipe()
+        in_read = os.fdopen(in_r, "rb", buffering=0)
+        wl_read = os.fdopen(wl_r, "rb", buffering=0)
+        frames = []
+        factory, expected_digest, records = self._make_pipe_supervisor_factory(wl_read, NONCE_A)
+        try:
+            def driver():
+                os.write(in_w, (json.dumps({"op": "start", "nonce": NONCE_A, "profile": "inert-fixture"}) + "\n").encode())
+                os.write(in_w, (json.dumps({"op": "dispatch", "nonce": NONCE_A, "digest": expected_digest}) + "\n").encode())
+                time.sleep(0.03)
+                # Stale stop must be ignored without stopping the live namespace.
+                os.write(in_w, (json.dumps({"op": "stop", "nonce": NONCE_B}) + "\n").encode())
+                time.sleep(0.03)
+                os.write(wl_w, b"still-alive-after-stale-stop\n")
+                time.sleep(0.03)
+                os.write(in_w, (json.dumps({"op": "stop", "nonce": NONCE_A}) + "\n").encode())
+
+            t = threading.Thread(target=driver, daemon=True)
+            t.start()
+            GUEST.serve(stdin=in_read, emit=frames.append, supervisor_factory=factory, hold=2.0, lifetime=2.0)
+            t.join(timeout=2.0)
+            ignored = [f for f in frames if f.get("event") == "ignored"]
+            self.assertEqual(len(ignored), 1)
+            self.assertEqual(ignored[0]["reason"], "stale-nonce")
+            self.assertEqual(ignored[0]["cleanup"], "unknown")
+            workloads = [f["data"] for f in frames if f.get("event") == "workload"]
+            self.assertEqual(workloads, ["still-alive-after-stale-stop\n"])
+            self.assertEqual(records["stop_reasons"], ["stop"])
+        finally:
+            for fd in (in_w, wl_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            for stream in (in_read, wl_read):
+                if not stream.closed:
+                    stream.close()
+
+    def test_start_failure_in_build_command_or_popen_leaks_no_fds(self):
+        proc = FakeProc()
+        ops = FakeOps(proc)
+
+        class DummySandbox:
+            PINNED = {"runner-bwrap": "0" * 64}
+            PYTHON = "/usr/bin/python3"
+
+            @staticmethod
+            def pinned(name):
+                return f"/{name}"
+
+            @staticmethod
+            def command(_mode):
+                return ["/fake-bwrap", "--unshare-all", "--die-with-parent", "--", "/usr/bin/python3"]
+
+        # Case A: build_command raises (missing payload file).
+        before_a = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+        sup_a = GUEST.Supervisor(lambda _f: None, proc=proc, ops=ops, sandbox=DummySandbox(),
+                                 payload="/nonexistent-payload-file.py")
+        with mock.patch.object(GUEST, "pinned_bwrap", return_value="/fake-bwrap"):
+            with self.assertRaisesRegex(RuntimeError, "inert payload unavailable"):
+                sup_a.start(NONCE_A, "inert-fixture")
+        self.assertIsNone(sup_a.process)
+        self.assertIsNone(sup_a.release_fd)
+        if before_a is not None:
+            after_a = set(os.listdir("/proc/self/fd"))
+            self.assertEqual(after_a, before_a)
+
+        # Case B: subprocess.Popen raises OSError.
+        before_b = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+        sup_b = GUEST.Supervisor(lambda _f: None, proc=proc, ops=ops, sandbox=DummySandbox(),
+                                 payload=str(ROOT / "opencode-stop-payload.py"))
+        with mock.patch.object(GUEST, "pinned_bwrap", return_value="/fake-bwrap"), \
+             mock.patch.object(GUEST.subprocess, "Popen", side_effect=OSError("simulated Popen error")):
+            with self.assertRaises(OSError):
+                sup_b.start(NONCE_A, "inert-fixture")
+        self.assertIsNone(sup_b.process)
+        self.assertIsNone(sup_b.release_fd)
+        if before_b is not None:
+            after_b = set(os.listdir("/proc/self/fd"))
+            self.assertEqual(after_b, before_b)
+
+    def test_oneshot_bounds_newline_trailing_data_and_expected_nonce(self):
+        proc = FakeProc()
+        proc.add(419, "99001", "pid:[4026531836]", nspid=(419,))
+        proc.add(420, "99002", "pid:[4026532500]", ppid=419, nspid=(420, 1))
+        identity = sample_identity(NONCE_A)
+
+        def run_one(op, raw_bytes, local_proc=proc, local_ops=None):
+            out = []
+            local_ops = local_ops or FakeOps(local_proc)
+            GUEST.oneshot(op, stdin=io.BytesIO(raw_bytes), emit=out.append, proc=local_proc, ops=local_ops, timeout=0.2)
+            self.assertEqual(len(out), 1)
+            return out[0], local_ops
+
+        # Missing trailing newline rejected without signalling.
+        reply, ops = run_one("stop", json.dumps(identity).encode())
+        self.assertEqual(reply["event"], "blocked")
+        self.assertEqual(ops.signalled_pids, [])
+
+        # Oversized frame (> FRAME_MAX) rejected without signalling.
+        oversized = (json.dumps({"identity": identity, "expectedNonce": NONCE_A}) + (" " * GUEST.FRAME_MAX) + "\n").encode()
+        reply, ops = run_one("stop", oversized)
+        self.assertEqual(reply["event"], "blocked")
+        self.assertEqual(ops.signalled_pids, [])
+
+        # Trailing data after newline rejected without signalling.
+        trailing = (json.dumps(identity) + "\n" + "{}\n").encode()
+        reply, ops = run_one("stop", trailing)
+        self.assertEqual(reply["event"], "blocked")
+        self.assertEqual(ops.signalled_pids, [])
+
+        # Empty input rejected without signalling.
+        reply, ops = run_one("confirm", b"")
+        self.assertEqual(reply["event"], "blocked")
+        self.assertEqual(ops.signalled_pids, [])
+
+        # Unknown envelope keys and malformed expectedNonce rejected without signalling.
+        bad_env = (json.dumps({"identity": identity, "expectedNonce": NONCE_A, "extra": 1}) + "\n").encode()
+        reply, ops = run_one("stop", bad_env)
+        self.assertEqual(reply["event"], "blocked")
+        self.assertEqual(ops.signalled_pids, [])
+
+        for bad_nonce in (None, "", "not-a-uuid", 123):
+            bad_nonce_env = (json.dumps({"identity": identity, "expectedNonce": bad_nonce}) + "\n").encode()
+            reply, ops = run_one("stop", bad_nonce_env)
+            self.assertEqual(reply["event"], "blocked")
+            self.assertEqual(ops.signalled_pids, [])
+
+        # Stale expectedNonce returns unknown / absent: False with zero signals.
+        stale_env = (json.dumps({"identity": identity, "expectedNonce": NONCE_B}) + "\n").encode()
+        reply, ops = run_one("stop", stale_env)
+        self.assertEqual(reply["event"], "stopped")
+        self.assertEqual(reply["cleanup"], "unknown")
+        self.assertEqual(reply["evidence"].get("reason"), "stale-nonce")
+        self.assertEqual(ops.signalled_pids, [])
+
+        reply_c, _ = run_one("confirm", stale_env)
+        self.assertEqual(reply_c["event"], "confirmed")
+        self.assertFalse(reply_c["absent"])
+        self.assertEqual(reply_c.get("reason"), "stale-nonce")
+
+        # Partial line on a pipe times out cleanly instead of blocking forever.
+        p_r, p_w = os.pipe()
+        p_read = os.fdopen(p_r, "rb", buffering=0)
+        out_timeout = []
+        try:
+            os.write(p_w, b'{"identity":')
+            t0 = time.monotonic()
+            GUEST.oneshot("confirm", stdin=p_read, emit=out_timeout.append, proc=proc, ops=FakeOps(proc), timeout=0.1)
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertEqual(out_timeout[0]["event"], "blocked")
+        finally:
+            os.close(p_w)
+            if not p_read.closed:
+                p_read.close()
+
+        # Matching expectedNonce stops and then confirms absent cleanly.
+        valid_env = (json.dumps({"identity": identity, "expectedNonce": NONCE_A}) + "\n").encode()
+        reply_ok, ops_ok = run_one("stop", valid_env)
+        self.assertEqual(reply_ok["event"], "stopped")
+        self.assertEqual(reply_ok["cleanup"], "verified")
+        self.assertEqual(ops_ok.signalled_pids, [420, 419])
+
+        reply_ok_c, _ = run_one("confirm", valid_env)
+        self.assertEqual(reply_ok_c["event"], "confirmed")
+        self.assertTrue(reply_ok_c["absent"])
+
 
 @unittest.skipUnless(
     os.environ.get("CYDEWORKS_PINNED_BWRAP") and Path(os.environ["CYDEWORKS_PINNED_BWRAP"]).is_file(),
@@ -360,7 +679,20 @@ class OpenCodeStopGuestSandboxLiveTests(unittest.TestCase):
             self.assertGreaterEqual(len(members), 3)
             self.assertEqual(ambiguous, [])
 
-            # Issue Stop and confirm every process in the namespace exits.
+            # Stale nonce stop must not kill the live namespace.
+            stale_stop = json.dumps({"op": "stop", "nonce": NONCE_A}) + "\n"
+            proc.stdin.write(stale_stop.encode())
+            ignored = json.loads(proc.stdout.readline().decode())
+            self.assertEqual(ignored["event"], "ignored")
+            self.assertEqual(ignored["reason"], "stale-nonce")
+            self.assertEqual(ignored["cleanup"], "unknown")
+            still_members, still_ambiguous = GUEST.namespace_members(
+                GUEST.Proc(), identity["init"]["pidNs"], identity["uid"], identity["depth"]
+            )
+            self.assertGreaterEqual(len(still_members), 3)
+            self.assertEqual(still_ambiguous, [])
+
+            # Issue matching Stop and confirm every process in the namespace exits.
             stop_cmd = json.dumps({"op": "stop", "nonce": NONCE_B}) + "\n"
             proc.stdin.write(stop_cmd.encode())
             proc.stdin.close()
@@ -370,11 +702,28 @@ class OpenCodeStopGuestSandboxLiveTests(unittest.TestCase):
             self.assertEqual(stopped["cleanup"], "verified")
             self.assertTrue(GUEST.confirm_identity(GUEST.Proc(), identity)["absent"])
 
-            # Out-of-band oneshot stop and confirm on the exited identity are idempotent.
+            # Out-of-band oneshot stop and confirm with expectedNonce envelope.
             for mode, expected_event in (("stop", "stopped"), ("confirm", "confirmed")):
+                stale_oneshot = subprocess.run(
+                    ["/usr/bin/python3", "-I", "-B", str(ROOT / "opencode-stop-guest.py"), mode],
+                    input=(json.dumps({"identity": identity, "expectedNonce": NONCE_A}) + "\n").encode(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=5,
+                )
+                stale_reply = json.loads(stale_oneshot.stdout.decode())
+                self.assertEqual(stale_reply["event"], expected_event)
+                if mode == "stop":
+                    self.assertEqual(stale_reply["cleanup"], "unknown")
+                    self.assertEqual(stale_reply["evidence"].get("reason"), "stale-nonce")
+                else:
+                    self.assertFalse(stale_reply["absent"])
+                    self.assertEqual(stale_reply.get("reason"), "stale-nonce")
+
                 oneshot = subprocess.run(
                     ["/usr/bin/python3", "-I", "-B", str(ROOT / "opencode-stop-guest.py"), mode],
-                    input=(json.dumps(identity) + "\n").encode(),
+                    input=(json.dumps({"identity": identity, "expectedNonce": NONCE_B}) + "\n").encode(),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=True,
