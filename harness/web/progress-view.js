@@ -647,7 +647,10 @@ export function presentProgress(progress, options = undefined) {
   const reasonCurrentEta = sanitizeText(raw.unavailableReasons?.currentStepEta);
   const reasonOverallEta = sanitizeText(raw.unavailableReasons?.overallEta);
   const reasonCompletion = sanitizeText(raw.unavailableReasons?.completion);
-  const rawCurrentEtaText = sanitizeText(raw.currentStepEta ?? raw.eta ?? currentStep?.eta);
+  const rawCurrentEtaInput = raw.currentStepEta === undefined
+    ? (raw.eta === undefined ? currentStep?.eta : raw.eta)
+    : raw.currentStepEta;
+  const rawCurrentEtaText = sanitizeText(rawCurrentEtaInput);
   const rawOverallEtaText = sanitizeText(raw.overallEta);
   const rawRemainingNote = sanitizeText(raw.remaining);
   const remainingNote = phase === 'failed'
@@ -659,16 +662,27 @@ export function presentProgress(progress, options = undefined) {
   const missingOverallDone = phase === 'complete' && totalKnown && completedSteps === null;
   const missingSubDone = phase === 'complete' && currentStep !== null && currentStep.total !== null && currentStep.completed === null;
 
+  const isSettlementWait = phase === 'waiting'
+    && remainingSteps === 0
+    && (
+      /\bwaiting for (?:authoritative )?(?:run )?completion\b/i.test(statusText ?? '')
+      || /\bwaiting for (?:authoritative )?(?:run )?completion\b/i.test(explanationText ?? '')
+      || /\bwaiting for (?:authoritative )?(?:run )?completion\b/i.test(rawRemainingNote ?? '')
+    );
+
   const overallExplicitlyUnavailable = reasonOverallEta !== null
     || (rawOverallEtaText !== null && /^unavailable/i.test(rawOverallEtaText));
   let overallEtaMs = null;
   if (!isBlocked && !overallExplicitlyUnavailable) {
     if (phase === 'complete') {
-      if (!missingOverallDone && raw.overallEtaMs === 0) {
+      if (!missingOverallDone && totalKnown && remainingSteps === 0 && raw.overallEtaMs === 0) {
         overallEtaMs = 0;
       }
-    } else if (totalKnown && completedSteps !== null && remainingSteps !== null && stepRate !== null && stepRate > 0) {
-      overallEtaMs = validNonNegFinite(raw.overallEtaMs);
+    } else if (totalKnown && completedSteps !== null && remainingSteps !== null && remainingSteps > 0 && stepRate !== null && stepRate > 0) {
+      const candidateOverallEta = validNonNegFinite(raw.overallEtaMs);
+      if (candidateOverallEta !== null && candidateOverallEta > 0) {
+        overallEtaMs = candidateOverallEta;
+      }
     }
   }
 
@@ -676,22 +690,27 @@ export function presentProgress(progress, options = undefined) {
     && currentStep.total !== null
     && currentStep.completed !== null
     && currentStep.remaining !== null;
+  const authoritativeSubEtaMs = currentStep !== null
+    ? (raw.currentStepEtaMs === undefined ? currentStep.etaMs : raw.currentStepEtaMs)
+    : raw.currentStepEtaMs;
   const currentExplicitlyUnavailable = reasonCurrentEta !== null
     || (rawCurrentEtaText !== null && /^unavailable/i.test(rawCurrentEtaText));
   let currentStepEtaMs = null;
   if (!isBlocked && !currentExplicitlyUnavailable) {
     if (phase === 'complete') {
-      if (!missingOverallDone && hasMeasuredCurrentSub && currentStep.remaining === 0 && (raw.currentStepEtaMs === 0 || currentStep.etaMs === 0)) {
+      if (!missingOverallDone && hasMeasuredCurrentSub && currentStep.remaining === 0 && authoritativeSubEtaMs === 0) {
         currentStepEtaMs = 0;
       }
     } else if (hasMeasuredCurrentSub) {
-      const authoritativeSubEtaMs = raw.currentStepEtaMs ?? currentStep.etaMs;
       if (currentStep.remaining === 0) {
         if (authoritativeSubEtaMs === 0) {
           currentStepEtaMs = 0;
         }
       } else if (currentStep.rate !== null && currentStep.rate > 0) {
-        currentStepEtaMs = validNonNegFinite(authoritativeSubEtaMs);
+        const candidateSubEta = validNonNegFinite(authoritativeSubEtaMs);
+        if (candidateSubEta !== null && candidateSubEta > 0) {
+          currentStepEtaMs = candidateSubEta;
+        }
       }
     }
   }
@@ -793,7 +812,7 @@ export function presentProgress(progress, options = undefined) {
     rows.push(row('remaining', 'Remaining', `Unknown (${stepRejectionReason})`, false, stepRejectionReason));
   } else if (totalKnown && remainingSteps !== null && totalSteps !== null) {
     const unitLabel = formatUnitCount(totalSteps, overallUnit);
-    const text = remainingSteps === 0 && phase === 'waiting'
+    const text = isSettlementWait
       ? `0 of ${totalSteps} ${unitLabel} remaining (waiting for completion)`
       : `${remainingSteps} of ${totalSteps} ${unitLabel} remaining`;
     rows.push(row('remaining', 'Remaining', text, true));
@@ -918,8 +937,12 @@ export function presentProgress(progress, options = undefined) {
         : 'Unavailable because completed count is not recorded.')
       : missingSubDone
         ? 'Unavailable because completed current-step count is not recorded.'
-        : 'Unavailable because current-step sub-progress is not measured.';
-    const safeRawCurrentEta = rawCurrentEtaText && !/^complete\b/i.test(rawCurrentEtaText)
+        : hasMeasuredCurrentSub
+          ? (currentStep.remaining === 0
+            ? 'Unavailable until current-step completion is confirmed.'
+            : 'Unavailable until a reliable current-step remaining time can be measured.')
+          : 'Unavailable because current-step sub-progress is not measured.';
+    const safeRawCurrentEta = rawCurrentEtaText && !/^(?:complete\b|current step complete\b|0(?:\.0+)?\s*ms\b)/i.test(rawCurrentEtaText)
       ? rawCurrentEtaText
       : null;
     const reason = reasonCurrentEta ?? safeRawCurrentEta ?? fallbackReason;
@@ -944,8 +967,15 @@ export function presentProgress(progress, options = undefined) {
         ? (overallUnit.known
           ? `Unavailable because completed ${overallUnit.singular} count is not recorded.`
           : 'Unavailable because completed count is not recorded.')
-        : 'Unavailable because total work and remaining output are unknown.';
-    const reason = reasonOverallEta ?? rawOverallEtaText ?? fallbackReason;
+        : totalKnown && remainingSteps !== null && remainingSteps > 0
+          ? 'Unavailable until a reliable remaining time can be measured.'
+          : totalKnown && remainingSteps === 0
+            ? 'Unavailable until completion is confirmed.'
+            : 'Unavailable because total work and remaining output are unknown.';
+    const safeRawOverallEta = rawOverallEtaText && !/^(?:complete\b|0(?:\.0+)?\s*ms\b)/i.test(rawOverallEtaText)
+      ? rawOverallEtaText
+      : null;
+    const reason = reasonOverallEta ?? safeRawOverallEta ?? fallbackReason;
     rows.push(row('overallEta', 'Overall ETA', ensureUnavailablePrefix(reason, fallbackReason), false, reason));
   }
 

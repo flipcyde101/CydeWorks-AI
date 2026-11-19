@@ -1265,4 +1265,300 @@ test('validated unit contract formats allowlisted units accurately and falls bac
   assert.equal(rowByKey(measuredCompleteSubEta,'currentStepEta').value,'Complete. No remaining work.');
 });
 
+test('zero ETAs require validated zero remaining counts, explicit top-level null is preserved, and settlement label excludes claimed 5/5 waits',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
 
+  // Missing counts on complete never turn overallEtaMs:0 into "Complete. No remaining time."
+  for (const input of [
+    {phase:'complete',overallEtaMs:0},
+    {
+      phase:'complete',
+      complete:true,
+      status:'Complete',
+      overallEtaMs:0,
+      overallEta:'Complete. No remaining time.',
+    },
+  ]) {
+    const view=presentProgress(input,{formatLocalTime:fixedClock});
+    assert.equal(view.phase,'complete');
+    assert.equal(rowByKey(view,'overallEta').available,false);
+    assert.equal(rowByKey(view,'overallEta').value,'Unavailable because total work and remaining output are unknown.');
+    assert.doesNotMatch(rowByKey(view,'overallEta').value,/complete\.|no remaining time|0 ms/i);
+  }
+
+  // Real helper complete without measured counters also suppresses unmeasured zero overall ETA
+  const unmeasuredComplete=describeProgress({
+    status:'complete',
+    live:{
+      complete:true,
+      chars:120,
+      lastActivity:new Date(then+4000).toISOString(),
+      heartbeat:new Date(then+4000).toISOString(),
+    },
+  },{
+    status:'completed',
+    started:start,
+    ended:new Date(then+4000).toISOString(),
+    execution:{phase:'settled',dispatchedAt:start},
+  },then+5000);
+  const unmeasuredCompleteView=presentProgress(unmeasuredComplete,{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(unmeasuredCompleteView,'overallEta').available,false);
+  assert.match(rowByKey(unmeasuredCompleteView,'overallEta').value,/^Unavailable/i);
+  assert.doesNotMatch(rowByKey(unmeasuredCompleteView,'overallEta').value,/complete\.|no remaining time|0 ms/i);
+
+  // Positive remaining counts reject overallEtaMs:0 and nested or top-level currentStep etaMs:0
+  const activeZeroOverall=presentProgress({
+    phase:'active',
+    status:'Running',
+    totalKnown:true,
+    unit:'steps',
+    unitSingular:'step',
+    completedSteps:1,
+    totalSteps:5,
+    remainingSteps:4,
+    stepRate:0.5,
+    overallEtaMs:0,
+    overallEta:'Complete. No remaining time.',
+    projectedCompletionMs:then+10000,
+    currentStep:{
+      index:2,
+      label:'Verify step',
+      unit:'checks',
+      unitSingular:'check',
+      completed:1,
+      total:5,
+      remaining:4,
+      rate:2,
+      etaMs:0,
+      eta:'Current step complete.',
+    },
+  },{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(activeZeroOverall,'overallEta').available,false);
+  assert.equal(rowByKey(activeZeroOverall,'overallEta').value,'Unavailable until a reliable remaining time can be measured.');
+  assert.doesNotMatch(rowByKey(activeZeroOverall,'overallEta').value,/complete\.|no remaining time|0 ms/i);
+  assert.equal(rowByKey(activeZeroOverall,'completion').available,false);
+  assert.doesNotMatch(rowByKey(activeZeroOverall,'completion').value,/projected around/i);
+  assert.equal(rowByKey(activeZeroOverall,'currentStepEta').available,false);
+  assert.equal(rowByKey(activeZeroOverall,'currentStepEta').value,'Unavailable until a reliable current-step remaining time can be measured.');
+  assert.doesNotMatch(rowByKey(activeZeroOverall,'currentStepEta').value,/current step complete|complete\.|0 ms/i);
+
+  const activeZeroTopSub=presentProgress({
+    phase:'active',
+    status:'Running',
+    totalKnown:true,
+    completedSteps:1,
+    totalSteps:5,
+    remainingSteps:4,
+    stepRate:0.5,
+    overallEtaMs:8000,
+    currentStepEtaMs:0,
+    currentStep:{
+      index:2,
+      label:'Verify step',
+      completed:1,
+      total:5,
+      remaining:4,
+      rate:2,
+      etaMs:2000,
+    },
+  });
+  assert.equal(rowByKey(activeZeroTopSub,'overallEta').value,'8.0 s');
+  assert.equal(rowByKey(activeZeroTopSub,'currentStepEta').available,false);
+  assert.equal(rowByKey(activeZeroTopSub,'currentStepEta').value,'Unavailable until a reliable current-step remaining time can be measured.');
+
+  // Explicit top-level currentStepEtaMs:null (even with no unavailableReasons) is not replaced by nested etaMs:0
+  const explicitNullActiveSub=presentProgress({
+    phase:'active',
+    status:'Running',
+    totalKnown:true,
+    unit:'steps',
+    unitSingular:'step',
+    completedSteps:1,
+    totalSteps:5,
+    remainingSteps:4,
+    stepRate:0.5,
+    overallEtaMs:8000,
+    currentStepEtaMs:null,
+    currentStep:{
+      index:2,
+      label:'Run checks',
+      unit:'checks',
+      unitSingular:'check',
+      completed:4,
+      total:4,
+      remaining:0,
+      etaMs:0,
+      eta:'Current step complete.',
+    },
+  });
+  assert.equal(rowByKey(explicitNullActiveSub,'currentStepEta').available,false);
+  assert.equal(rowByKey(explicitNullActiveSub,'currentStepEta').value,'Unavailable until current-step completion is confirmed.');
+  assert.doesNotMatch(rowByKey(explicitNullActiveSub,'currentStepEta').value,/current step complete|complete\.|0 ms/i);
+
+  const explicitNullCompleteSub=presentProgress({
+    phase:'complete',
+    complete:true,
+    status:'Complete',
+    totalKnown:true,
+    unit:'steps',
+    unitSingular:'step',
+    completedSteps:4,
+    totalSteps:4,
+    remainingSteps:0,
+    overallEtaMs:0,
+    currentStepEtaMs:null,
+    currentStep:{
+      label:'Finalize checks',
+      unit:'checks',
+      unitSingular:'check',
+      completed:3,
+      total:3,
+      remaining:0,
+      etaMs:0,
+      eta:'Complete. No remaining work.',
+    },
+  });
+  assert.equal(rowByKey(explicitNullCompleteSub,'overallEta').available,true);
+  assert.equal(rowByKey(explicitNullCompleteSub,'overallEta').value,'Complete. No remaining time.');
+  assert.equal(rowByKey(explicitNullCompleteSub,'currentStepEta').available,false);
+  assert.equal(rowByKey(explicitNullCompleteSub,'currentStepEta').value,'Unavailable until current-step completion is confirmed.');
+  assert.doesNotMatch(rowByKey(explicitNullCompleteSub,'currentStepEta').value,/complete\.|current step complete|no remaining work|0 ms/i);
+
+  // Genuine zero ETAs still render when validated remaining === 0 and not explicitly null
+  const genuineActiveSubZero=presentProgress({
+    phase:'active',
+    status:'Running',
+    totalKnown:true,
+    completedSteps:1,
+    totalSteps:5,
+    remainingSteps:4,
+    stepRate:0.5,
+    overallEtaMs:8000,
+    currentStep:{
+      index:2,
+      label:'Run checks',
+      completed:4,
+      total:4,
+      remaining:0,
+      etaMs:0,
+    },
+  });
+  assert.equal(rowByKey(genuineActiveSubZero,'overallEta').value,'8.0 s');
+  assert.equal(rowByKey(genuineActiveSubZero,'currentStepEta').available,true);
+  assert.equal(rowByKey(genuineActiveSubZero,'currentStepEta').value,'Current step complete.');
+
+  // Real helper active 1/5 with positive rate vs completed 4/4 currentStep
+  const helperActivePositive=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+2500).toISOString(),
+      heartbeat:new Date(then+2500).toISOString(),
+      steps:{
+        measured:true,
+        completed:1,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+2000).toISOString(),done:1},
+        ],
+        currentStep:{
+          index:2,
+          label:'Run checks',
+          measured:true,
+          completed:1,
+          total:5,
+          samples:[
+            {at:new Date(then+2000).toISOString(),done:0},
+            {at:new Date(then+2500).toISOString(),done:1},
+          ],
+        },
+      },
+    },
+  },attempt,then+3000);
+  const helperActivePositiveView=presentProgress(helperActivePositive,{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(helperActivePositiveView,'overallEta').available,true);
+  assert.equal(rowByKey(helperActivePositiveView,'overallEta').value,'8.0 s');
+  assert.equal(rowByKey(helperActivePositiveView,'currentStepEta').available,true);
+  assert.equal(rowByKey(helperActivePositiveView,'currentStepEta').value,'2.0 s');
+
+  const helperActiveSubDone=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+2500).toISOString(),
+      heartbeat:new Date(then+2500).toISOString(),
+      steps:{
+        measured:true,
+        completed:1,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+2000).toISOString(),done:1},
+        ],
+        currentStep:{
+          index:2,
+          label:'Run checks',
+          measured:true,
+          completed:4,
+          total:4,
+          samples:[
+            {at:new Date(then+2000).toISOString(),done:0},
+            {at:new Date(then+2500).toISOString(),done:4},
+          ],
+        },
+      },
+    },
+  },attempt,then+3000);
+  const helperActiveSubDoneView=presentProgress(helperActiveSubDone,{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(helperActiveSubDoneView,'overallEta').available,true);
+  assert.equal(rowByKey(helperActiveSubDoneView,'overallEta').value,'8.0 s');
+  assert.equal(rowByKey(helperActiveSubDoneView,'currentStepEta').available,true);
+  assert.equal(rowByKey(helperActiveSubDoneView,'currentStepEta').value,'Current step complete.');
+
+  // Real helper claimed 5/5 ("Checking selected route") vs genuine settlement wait 5/5 ("Waiting for completion")
+  const fullSteps={
+    measured:true,
+    completed:5,
+    total:5,
+    samples:[
+      {at:start,done:0},
+      {at:new Date(then+5000).toISOString(),done:5},
+    ],
+  };
+  const claimed5=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+5000).toISOString(),
+      heartbeat:new Date(then+5000).toISOString(),
+      steps:fullSteps,
+    },
+  },{
+    started:start,
+    execution:{phase:'claimed'},
+  },then+6000);
+  const claimed5View=presentProgress(claimed5,{formatLocalTime:fixedClock});
+  const claimed5Unit='unit' in claimed5 ? 'steps' : 'units';
+  assert.equal(claimed5View.phase,'waiting');
+  assert.equal(claimed5View.waiting,true);
+  assert.equal(rowByKey(claimed5View,'status').value,'Waiting: Checking selected route');
+  assert.equal(rowByKey(claimed5View,'remaining').value,`0 of 5 ${claimed5Unit} remaining`);
+  assert.doesNotMatch(rowByKey(claimed5View,'remaining').value,/waiting for completion/i);
+  assert.equal(rowByKey(claimed5View,'overallEta').available,false);
+
+  const realSettlement5=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+5000).toISOString(),
+      heartbeat:new Date(then+5000).toISOString(),
+      steps:fullSteps,
+    },
+  },{
+    started:start,
+    execution:{phase:'dispatching',dispatchedAt:start},
+  },then+6000);
+  const realSettlement5View=presentProgress(realSettlement5,{formatLocalTime:fixedClock});
+  const settle5Unit='unit' in realSettlement5 ? 'steps' : 'units';
+  assert.equal(realSettlement5View.phase,'waiting');
+  assert.equal(realSettlement5View.waiting,true);
+  assert.equal(rowByKey(realSettlement5View,'status').value,'Waiting for completion');
+  assert.equal(rowByKey(realSettlement5View,'remaining').value,`0 of 5 ${settle5Unit} remaining (waiting for completion)`);
+});
