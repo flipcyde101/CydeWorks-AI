@@ -9,7 +9,7 @@ export function claimRun(path, scope) {
   const id = randomUUID();
   let sequence = 0;
   const append = event => {
-    writeSync(fd, JSON.stringify({id, sequence: sequence++, ...event}) + '\n');
+    writeSync(fd, JSON.stringify({...event, id, sequence: sequence++}) + '\n');
     fsyncSync(fd);
   };
   try { append({state: 'claimed', scopeHash: digest(scope), scope}); }
@@ -51,7 +51,14 @@ export async function runOwned({claim, adapter, signal, execute, cleanupTimeoutM
       claim.append({state: 'owned', identity});
     }});
     controller.signal.throwIfAborted();
-    result = await execute(worker, controller.signal);
+    let cancel;
+    try {
+      result = await Promise.race([execute(worker, controller.signal), new Promise((_, reject) => {
+        cancel = () => reject(controller.signal.reason);
+        controller.signal.addEventListener('abort', cancel, {once: true});
+        if (controller.signal.aborted) cancel();
+      })]);
+    } finally { controller.signal.removeEventListener('abort', cancel); }
     controller.signal.throwIfAborted();
   } catch (error) { failure = error; }
   finally { signal?.removeEventListener('abort', abort); controller.abort(); }
