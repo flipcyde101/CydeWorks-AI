@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {describeProgress,progressAnnouncement} from './web/progress.js';
+import {MAX_DATE_MS,describeProgress,progressAnnouncement} from './web/progress.js';
 
 const start='2026-11-14T12:00:00.000Z';
 const then=Date.parse(start);
@@ -134,7 +134,9 @@ test('unknown total work is preserved and model output characters never imply a 
   assert.equal(openState.stepRate,0.5);
   assert.equal(openState.overallEtaMs,null);
   assert.equal(openState.projectedCompletionMs,null);
-  assert.match(openState.eta,/unknown/i);
+  assert.match(openState.overallEta,/unknown/i);
+  assert.match(openState.eta,/unavailable/i);
+  assert.equal(openState.eta,openState.currentStepEta);
 });
 
 test('trustworthy measured step counters derive counts, rate, elapsed, separate ETAs and projected completion',()=>{
@@ -187,6 +189,8 @@ test('trustworthy measured step counters derive counts, rate, elapsed, separate 
   assert.equal(state.overallEtaMs,6000);
   assert.equal(state.currentStepEtaMs,1500);
   assert.notEqual(state.currentStepEtaMs,state.overallEtaMs);
+  assert.equal(state.eta,state.currentStepEta);
+  assert.notEqual(state.eta,state.overallEta);
   assert.equal(state.currentStep.label,'Run protected checks');
   assert.equal(state.currentStep.doneTotal,'2/8');
   assert.equal(state.currentStep.percent,25);
@@ -199,7 +203,7 @@ test('trustworthy measured step counters derive counts, rate, elapsed, separate 
   assert.equal(state.lastActivity,then+4500);
   assert.equal(state.idleMs,500);
 
-  // When current-step sub-progress is unmeasured, overall ETA remains valid while current-step ETA is unavailable.
+  // When current-step sub-progress is unmeasured, overall ETA remains valid while current-step ETA (progress.eta) is unavailable.
   const withoutSubSteps={
     status:'running',
     live:{
@@ -219,9 +223,11 @@ test('trustworthy measured step counters derive counts, rate, elapsed, separate 
   };
   const noSub=describeProgress(withoutSubSteps,attempt,then+5000);
   assert.equal(noSub.overallEtaMs,6000);
+  assert.match(noSub.overallEta,/6\.0 s/i);
   assert.equal(noSub.currentStepEtaMs,null);
   assert.equal(noSub.currentStep.label,'Validate patch');
   assert.match(noSub.currentStepEta,/unavailable/i);
+  assert.equal(noSub.eta,noSub.currentStepEta);
   assert.match(noSub.unavailableReasons.currentStepEta,/not measured/i);
 });
 
@@ -254,7 +260,9 @@ test('zero measured step rate reports 0 rate without dividing by zero or inventi
   assert.equal(state.stepRate,0);
   assert.equal(state.overallEtaMs,null);
   assert.equal(state.projectedCompletionMs,null);
-  assert.match(state.eta,/0 steps\/s/i);
+  assert.match(state.overallEta,/0 steps\/s/i);
+  assert.match(state.eta,/unavailable/i);
+  assert.equal(state.eta,state.currentStepEta);
   assert.match(state.completion,/0 steps\/s/i);
 });
 
@@ -628,3 +636,295 @@ test('invalid current-step sub-counters, heartbeat-only stalls, and interrupted 
   assert.equal(cancelled.overallEtaMs,null);
   assert.match(cancelled.eta,/cancelled/i);
 });
+
+test('authoritative status prevents done equal to total from declaring completion, missing ended is not invented, and 99999/100000 never rounds to 100',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  const runningAllSteps=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+5000).toISOString(),
+      heartbeat:new Date(then+5000).toISOString(),
+      steps:{
+        measured:true,
+        completed:5,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+5000).toISOString(),done:5},
+        ],
+      },
+    },
+  },attempt,then+6000);
+  assert.equal(runningAllSteps.complete,false);
+  assert.equal(runningAllSteps.phase,'waiting');
+  assert.equal(runningAllSteps.status,'Waiting for completion');
+  assert.equal(runningAllSteps.doneTotal,'5/5');
+  assert.equal(runningAllSteps.percent,100);
+  assert.equal(runningAllSteps.overallEtaMs,null);
+  assert.equal(runningAllSteps.currentStepEtaMs,null);
+  assert.equal(runningAllSteps.projectedCompletionMs,null);
+  assert.match(runningAllSteps.overallEta,/completion/i);
+
+  const failedAllSteps=describeProgress({
+    status:'failed',
+    live:{
+      lastActivity:new Date(then+5000).toISOString(),
+      heartbeat:new Date(then+5000).toISOString(),
+      steps:{
+        measured:true,
+        completed:5,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+5000).toISOString(),done:5},
+        ],
+      },
+    },
+  },attempt,then+6000);
+  assert.equal(failedAllSteps.complete,false);
+  assert.equal(failedAllSteps.failed,true);
+  assert.equal(failedAllSteps.phase,'failed');
+  assert.equal(failedAllSteps.overallEtaMs,null);
+  assert.equal(failedAllSteps.projectedCompletionMs,null);
+
+  const completeWithoutEnded=describeProgress({
+    status:'complete',
+    live:{
+      complete:true,
+      steps:{
+        measured:true,
+        completed:4,
+        total:4,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:4},
+        ],
+      },
+    },
+  },{started:start,status:'completed',execution:{phase:'settled',dispatchedAt:start}},then+10000);
+  assert.equal(completeWithoutEnded.complete,true);
+  assert.equal(completeWithoutEnded.phase,'complete');
+  assert.equal(completeWithoutEnded.projectedCompletionMs,null);
+  assert.equal(completeWithoutEnded.projectedCompletionAt,null);
+  assert.equal(completeWithoutEnded.elapsedMs,null);
+  assert.match(completeWithoutEnded.completion,/not recorded/i);
+  assert.match(completeWithoutEnded.unavailableReasons.completion,/not recorded/i);
+
+  const nearlyComplete=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+10000).toISOString(),
+      heartbeat:new Date(then+10000).toISOString(),
+      steps:{
+        measured:true,
+        completed:99999,
+        total:100000,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+10000).toISOString(),done:99999},
+        ],
+      },
+    },
+  },attempt,then+11000);
+  assert.equal(nearlyComplete.doneTotal,'99999/100000');
+  assert.equal(nearlyComplete.percent,99.99);
+  assert.ok(nearlyComplete.percent<100);
+  assert.equal(nearlyComplete.complete,false);
+});
+
+test('clock anomalies suppress all ETAs and projections, validate current-step samples against step start, and guard Date overflow',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  const futureActivityWithValidSteps=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+120000).toISOString(),
+      heartbeat:new Date(then+4000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Run step 3',
+          startedAt:new Date(then+4000).toISOString(),
+          measured:true,
+          completed:1,
+          total:2,
+          samples:[
+            {at:new Date(then+4000).toISOString(),done:0},
+            {at:new Date(then+4500).toISOString(),done:1},
+          ],
+        },
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(futureActivityWithValidSteps.clockAnomaly,true);
+  assert.equal(futureActivityWithValidSteps.overallEtaMs,null);
+  assert.equal(futureActivityWithValidSteps.currentStepEtaMs,null);
+  assert.equal(futureActivityWithValidSteps.eta,futureActivityWithValidSteps.currentStepEta);
+  assert.equal(futureActivityWithValidSteps.projectedCompletionMs,null);
+  assert.match(futureActivityWithValidSteps.overallEta,/clock anomaly/i);
+  assert.match(futureActivityWithValidSteps.currentStepEta,/clock anomaly/i);
+  assert.match(futureActivityWithValidSteps.completion,/clock anomaly/i);
+
+  const subSampleBeforeStepStart=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+5000).toISOString(),
+      heartbeat:new Date(then+5000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Run step 3',
+          startedAt:new Date(then+4000).toISOString(),
+          measured:true,
+          completed:1,
+          total:2,
+          samples:[
+            {at:new Date(then+3000).toISOString(),done:0},
+            {at:new Date(then+4500).toISOString(),done:1},
+          ],
+        },
+      },
+    },
+  },attempt,then+5000);
+  assert.equal(subSampleBeforeStepStart.clockAnomaly,true);
+  assert.match(subSampleBeforeStepStart.clockAnomalyReason,/current step start/i);
+  assert.equal(subSampleBeforeStepStart.currentStepEtaMs,null);
+  assert.equal(subSampleBeforeStepStart.overallEtaMs,null);
+  assert.equal(subSampleBeforeStepStart.projectedCompletionMs,null);
+
+  const nearMaxNow=MAX_DATE_MS-1000;
+  const nearMaxStart=MAX_DATE_MS-5000;
+  const overflowProjection=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:nearMaxNow-500,
+      heartbeat:nearMaxNow-200,
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:nearMaxStart,done:0},
+          {at:nearMaxNow-1000,done:2},
+        ],
+      },
+    },
+  },{started:nearMaxStart,execution:{phase:'dispatching',dispatchedAt:nearMaxStart}},nearMaxNow);
+  assert.equal(overflowProjection.clockAnomaly,false);
+  assert.equal(overflowProjection.overallEtaMs,6000);
+  assert.equal(overflowProjection.projectedCompletionMs,null);
+  assert.equal(overflowProjection.projectedCompletionAt,null);
+  assert.match(overflowProjection.completion,/calendar range/i);
+  assert.match(overflowProjection.unavailableReasons.completion,/calendar range/i);
+
+  const outOfRangeNow=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:MAX_DATE_MS,
+      heartbeat:MAX_DATE_MS,
+    },
+  },{started:MAX_DATE_MS-1000},MAX_DATE_MS+1);
+  assert.equal(outOfRangeNow.clockAnomaly,true);
+  assert.equal(outOfRangeNow.projectedCompletionMs,null);
+  assert.equal(outOfRangeNow.projectedCompletionAt,null);
+  assert.equal(outOfRangeNow.heartbeatAt,null);
+  assert.equal(outOfRangeNow.lastActivityAt,null);
+});
+
+test('stall detection considers valid work samples without treating heartbeat as work, and stale samples expire ETAs',()=>{
+  const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
+
+  // Recent valid work sample prevents false stall even if lastActivity is older than 60s.
+  const activeWorkRecentSample=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+1000).toISOString(),
+      heartbeat:new Date(then+63000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+55000).toISOString(),done:2},
+        ],
+      },
+    },
+  },attempt,then+65000);
+  assert.equal(activeWorkRecentSample.stalled,false);
+  assert.equal(activeWorkRecentSample.phase,'active');
+  assert.equal(activeWorkRecentSample.overallEtaMs,82500);
+
+  // Fresh heartbeat alone does not prevent a stall when measured work samples are >= 60s old and output is absent.
+  const heartbeatMasksNoWork=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:null,
+      heartbeat:new Date(then+64000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+      },
+    },
+  },attempt,then+65000);
+  assert.equal(heartbeatMasksNoWork.stalled,true);
+  assert.equal(heartbeatMasksNoWork.phase,'stalled');
+  assert.equal(heartbeatMasksNoWork.overallEtaMs,null);
+  assert.equal(heartbeatMasksNoWork.projectedCompletionMs,null);
+
+  // Active streaming output avoids output stall, but stale step samples must still invalidate ETA and completion projection.
+  const activeOutputStaleSamples=describeProgress({
+    status:'running',
+    live:{
+      chars:800,
+      lastActivity:new Date(then+64000).toISOString(),
+      heartbeat:new Date(then+64000).toISOString(),
+      steps:{
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          label:'Compile',
+          startedAt:new Date(then+3000).toISOString(),
+          measured:true,
+          completed:1,
+          total:4,
+          samples:[
+            {at:new Date(then+3000).toISOString(),done:0},
+            {at:new Date(then+4000).toISOString(),done:1},
+          ],
+        },
+      },
+    },
+  },attempt,then+65000);
+  assert.equal(activeOutputStaleSamples.stalled,false);
+  assert.equal(activeOutputStaleSamples.overallEtaMs,null);
+  assert.equal(activeOutputStaleSamples.currentStepEtaMs,null);
+  assert.equal(activeOutputStaleSamples.projectedCompletionMs,null);
+  assert.match(activeOutputStaleSamples.overallEta,/stale/i);
+  assert.match(activeOutputStaleSamples.currentStepEta,/stale/i);
+  assert.match(activeOutputStaleSamples.completion,/stale/i);
+});
+

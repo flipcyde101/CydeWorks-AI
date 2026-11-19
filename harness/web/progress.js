@@ -1,5 +1,6 @@
 export const STALL_THRESHOLD_MS = 60_000;
 export const WAITING_OUTPUT_THRESHOLD_MS = 15_000;
+export const MAX_DATE_MS = 8_640_000_000_000_000;
 
 const UNTRUSTED_SOURCE_RE = /(?:estimat|infer|heuristic|guess|char|token|byte|simulat|synthetic|mock|predict|unknown|unverif)/i;
 const UNTRUSTED_UNITS = new Set(['char', 'chars', 'character', 'characters', 'token', 'tokens', 'byte', 'bytes']);
@@ -13,18 +14,18 @@ function isPlainObject(value) {
 }
 
 function isValidNow(now) {
-  return typeof now === 'number' && Number.isFinite(now) && now >= 0;
+  return typeof now === 'number' && Number.isFinite(now) && now >= 0 && now <= MAX_DATE_MS;
 }
 
 function parseTimestamp(value) {
   if (typeof value === 'number') {
-    return Number.isFinite(value) && value >= 0 ? value : null;
+    return Number.isFinite(value) && value >= 0 && value <= MAX_DATE_MS ? value : null;
   }
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   if (trimmed.length < 4 || /^\d+$/.test(trimmed)) return null;
   const time = Date.parse(trimmed);
-  return Number.isFinite(time) && time >= 0 ? time : null;
+  return Number.isFinite(time) && time >= 0 && time <= MAX_DATE_MS ? time : null;
 }
 
 function inspectTime(value, validNow, label) {
@@ -33,7 +34,7 @@ function inspectTime(value, validNow, label) {
   }
   const parsed = parseTimestamp(value);
   if (parsed === null) {
-    return { time: null, anomaly: `${label} timestamp is invalid.` };
+    return { time: null, anomaly: `${label} timestamp is invalid or out of range.` };
   }
   if (validNow === null) {
     return { time: null, anomaly: `Cannot validate ${label} timestamp without a valid current clock.` };
@@ -44,6 +45,27 @@ function inspectTime(value, validNow, label) {
   return { time: parsed, anomaly: null };
 }
 
+function safeDateIso(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0 || ms > MAX_DATE_MS) return null;
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function safeLocalClock(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0 || ms > MAX_DATE_MS) return null;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function computePercent(completed, total) {
+  if (completed === null || total === null) return null;
+  if (completed === total) return 100;
+  const basisPoints = Number((BigInt(completed) * 10000n) / BigInt(total));
+  const pct = basisPoints / 100;
+  return pct >= 100 ? 99.99 : pct;
+}
+
 function formatDuration(ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return 'Unavailable';
   if (ms < 1000) return Math.round(ms) + ' ms';
@@ -52,14 +74,19 @@ function formatDuration(ms) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = String(totalSeconds % 60).padStart(2, '0');
   if (minutes < 60) return minutes + ' min ' + seconds + ' s';
-  return Math.floor(minutes / 60) + ' h ' + String(minutes % 60).padStart(2, '0') + ' min';
+  const hours = Math.floor(minutes / 60);
+  if (!Number.isFinite(hours)) return 'Unavailable';
+  return hours + ' h ' + String(minutes % 60).padStart(2, '0') + ' min';
 }
 
-function formatLocalClock(ms) {
-  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+function computeRemainingEtaMs(remaining, spanInfo) {
+  if (remaining === null || !spanInfo || !(spanInfo.deltaSteps > 0) || !(spanInfo.spanMs > 0)) return null;
+  const etaMs = Math.round((remaining * spanInfo.spanMs) / spanInfo.deltaSteps);
+  if (!Number.isFinite(etaMs) || etaMs < 0) return null;
+  return etaMs;
 }
 
-function evaluateStepSeries(raw, { validNow, started }) {
+function evaluateStepSeries(raw, { validNow, started, minSampleTime = null, minSampleLabel = null }) {
   if (raw === undefined || raw === null) {
     return {
       present: false,
@@ -73,7 +100,10 @@ function evaluateStepSeries(raw, { validNow, started }) {
       rate: null,
       spanInfo: null,
       samplesCount: 0,
+      firstSampleAt: null,
+      lastSampleAt: null,
       lastProgressAt: null,
+      samplesStale: false,
       clockAnomaly: null,
       rejectionReason: null,
       rateUnavailableReason: 'No measured step counters were supplied.',
@@ -92,7 +122,10 @@ function evaluateStepSeries(raw, { validNow, started }) {
     rate: null,
     spanInfo: null,
     samplesCount: 0,
+    firstSampleAt: null,
+    lastSampleAt: null,
     lastProgressAt: null,
+    samplesStale: false,
     clockAnomaly,
     rejectionReason,
     rateUnavailableReason: rejectionReason,
@@ -174,6 +207,10 @@ function evaluateStepSeries(raw, { validNow, started }) {
         const reason = 'Step sample timestamp precedes attempt start time.';
         return invalid(reason, reason);
       }
+      if (minSampleTime !== null && sampleAt < minSampleTime) {
+        const reason = minSampleLabel ?? 'Step sample timestamp precedes step start time.';
+        return invalid(reason, reason);
+      }
 
       const sComp = sample.completed !== undefined && sample.completed !== null;
       const sDone = sample.done !== undefined && sample.done !== null;
@@ -226,7 +263,7 @@ function evaluateStepSeries(raw, { validNow, started }) {
   const totalKnown = total !== null;
   const remaining = totalKnown && completed !== null ? total - completed : null;
   const doneTotal = totalKnown && completed !== null ? `${completed}/${total}` : null;
-  const percent = totalKnown && completed !== null ? Math.round((completed * 10000) / total) / 100 : null;
+  const percent = computePercent(completed, total);
 
   let rate = null;
   let spanInfo = null;
@@ -248,6 +285,13 @@ function evaluateStepSeries(raw, { validNow, started }) {
     }
   }
 
+  const firstSampleAt = validSamples.length > 0 ? validSamples[0].at : null;
+  const lastSampleAt = validSamples.length > 0 ? validSamples[validSamples.length - 1].at : null;
+  const samplesStale = validSamples.length > 0 && validNow !== null && (
+    (validNow - lastSampleAt) >= STALL_THRESHOLD_MS
+    || (lastProgressAt !== null && (validNow - lastProgressAt) >= STALL_THRESHOLD_MS)
+  );
+
   return {
     present: true,
     valid: true,
@@ -260,67 +304,45 @@ function evaluateStepSeries(raw, { validNow, started }) {
     rate,
     spanInfo,
     samplesCount: validSamples.length,
+    firstSampleAt,
+    lastSampleAt,
     lastProgressAt,
+    samplesStale,
     clockAnomaly: null,
     rejectionReason: null,
     rateUnavailableReason,
   };
 }
 
-function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, blockedReason }) {
+function inspectCurrentStep(rawCurrent, { validNow, started }) {
   if (rawCurrent === undefined || rawCurrent === null) {
-    if (overallComplete) {
-      return {
-        info: null,
-        etaMs: 0,
-        eta: 'Complete. No remaining work.',
-        unavailableReason: null,
-        clockAnomaly: null,
-      };
-    }
     return {
-      info: null,
-      etaMs: null,
-      eta: blockedReason ?? 'Unavailable because current-step sub-progress is not measured.',
-      unavailableReason: blockedReason ?? 'Current-step sub-progress is not measured.',
+      kind: 'none',
+      index: null,
+      label: null,
+      subEval: null,
       clockAnomaly: null,
+      metadataError: null,
     };
   }
-
   if (typeof rawCurrent === 'string') {
-    const label = rawCurrent.trim() || null;
-    const etaMs = overallComplete ? 0 : null;
-    const eta = overallComplete
-      ? 'Complete. No remaining work.'
-      : blockedReason ?? 'Unavailable because current-step sub-progress is not measured.';
     return {
-      info: {
-        index: null,
-        label,
-        completed: null,
-        total: null,
-        remaining: null,
-        doneTotal: null,
-        percent: null,
-        rate: null,
-        etaMs,
-        eta,
-      },
-      etaMs,
-      eta,
-      unavailableReason: overallComplete ? null : (blockedReason ?? 'Current-step sub-progress is not measured.'),
+      kind: 'label',
+      index: null,
+      label: rawCurrent.trim() || null,
+      subEval: null,
       clockAnomaly: null,
+      metadataError: null,
     };
   }
-
   if (!isPlainObject(rawCurrent)) {
-    const reason = 'Current-step metadata must be a string or plain object.';
     return {
-      info: null,
-      etaMs: null,
-      eta: 'Unavailable: ' + reason,
-      unavailableReason: reason,
+      kind: 'invalid',
+      index: null,
+      label: null,
+      subEval: null,
       clockAnomaly: null,
+      metadataError: 'Current-step metadata must be a string or plain object.',
     };
   }
 
@@ -332,12 +354,16 @@ function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, b
   const index = Number.isSafeInteger(rawCurrent.index) && rawCurrent.index >= 0 ? rawCurrent.index : null;
 
   let clockAnomaly = null;
+  let stepStarted = null;
   if (rawCurrent.startedAt !== undefined && rawCurrent.startedAt !== null) {
     const stepStart = inspectTime(rawCurrent.startedAt, validNow, 'Current step start');
     if (stepStart.anomaly !== null) {
       clockAnomaly = stepStart.anomaly;
-    } else if (started !== null && stepStart.time !== null && stepStart.time < started) {
-      clockAnomaly = 'Current step start timestamp precedes attempt start time.';
+    } else {
+      stepStarted = stepStart.time;
+      if (started !== null && stepStarted !== null && stepStarted < started) {
+        clockAnomaly = 'Current step start timestamp precedes attempt start time.';
+      }
     }
   }
 
@@ -347,14 +373,83 @@ function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, b
     || rawCurrent.samples !== undefined;
 
   if (!hasSubCounters) {
-    const etaMs = overallComplete ? 0 : null;
-    const eta = overallComplete
-      ? 'Complete. No remaining work.'
-      : blockedReason ?? 'Unavailable because current-step sub-progress is not measured.';
+    return {
+      kind: 'label',
+      index,
+      label,
+      subEval: null,
+      clockAnomaly,
+      metadataError: null,
+    };
+  }
+
+  const subEval = evaluateStepSeries(rawCurrent, {
+    validNow,
+    started,
+    minSampleTime: stepStarted,
+    minSampleLabel: 'Current-step sample timestamp precedes current step start time.',
+  });
+  if (subEval.clockAnomaly && !clockAnomaly) {
+    clockAnomaly = subEval.clockAnomaly;
+  }
+
+  return {
+    kind: 'measured',
+    index,
+    label,
+    subEval,
+    clockAnomaly,
+    metadataError: null,
+  };
+}
+
+function finalizeCurrentStep(parsedStep, { overallComplete, blockedReason, defaultUnavailableEta }) {
+  if (parsedStep.kind === 'none') {
+    if (blockedReason !== null) {
+      return {
+        info: null,
+        etaMs: null,
+        eta: blockedReason,
+        unavailableReason: blockedReason,
+      };
+    }
+    if (overallComplete) {
+      return {
+        info: null,
+        etaMs: 0,
+        eta: 'Complete. No remaining work.',
+        unavailableReason: null,
+      };
+    }
+    return {
+      info: null,
+      etaMs: null,
+      eta: defaultUnavailableEta,
+      unavailableReason: 'Current-step sub-progress is not measured.',
+    };
+  }
+
+  if (parsedStep.kind === 'invalid') {
+    const eta = blockedReason ?? ('Unavailable: ' + parsedStep.metadataError);
+    return {
+      info: null,
+      etaMs: null,
+      eta,
+      unavailableReason: parsedStep.metadataError,
+    };
+  }
+
+  if (parsedStep.kind === 'label') {
+    const etaMs = blockedReason !== null ? null : overallComplete ? 0 : null;
+    const eta = blockedReason !== null
+      ? blockedReason
+      : overallComplete
+        ? 'Complete. No remaining work.'
+        : defaultUnavailableEta;
     return {
       info: {
-        index,
-        label,
+        index: parsedStep.index,
+        label: parsedStep.label,
         completed: null,
         total: null,
         remaining: null,
@@ -366,21 +461,21 @@ function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, b
       },
       etaMs,
       eta,
-      unavailableReason: overallComplete ? null : (blockedReason ?? 'Current-step sub-progress is not measured.'),
-      clockAnomaly,
+      unavailableReason: blockedReason !== null
+        ? blockedReason
+        : overallComplete
+          ? null
+          : 'Current-step sub-progress is not measured.',
     };
   }
 
-  const subEval = evaluateStepSeries(rawCurrent, { validNow, started });
-  if (subEval.clockAnomaly && !clockAnomaly) {
-    clockAnomaly = subEval.clockAnomaly;
-  }
-
+  const subEval = parsedStep.subEval;
   if (!subEval.valid) {
+    const eta = blockedReason ?? ('Unavailable: ' + subEval.rejectionReason);
     return {
       info: {
-        index,
-        label,
+        index: parsedStep.index,
+        label: parsedStep.label,
         completed: null,
         total: null,
         remaining: null,
@@ -388,12 +483,11 @@ function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, b
         percent: null,
         rate: null,
         etaMs: null,
-        eta: 'Unavailable: ' + subEval.rejectionReason,
+        eta,
       },
       etaMs: null,
-      eta: 'Unavailable: ' + subEval.rejectionReason,
+      eta,
       unavailableReason: subEval.rejectionReason,
-      clockAnomaly,
     };
   }
 
@@ -401,10 +495,7 @@ function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, b
   let eta;
   let unavailableReason = null;
 
-  if (clockAnomaly !== null) {
-    unavailableReason = clockAnomaly;
-    eta = 'Unavailable: ' + clockAnomaly;
-  } else if (blockedReason !== null) {
+  if (blockedReason !== null) {
     unavailableReason = blockedReason;
     eta = blockedReason;
   } else if (overallComplete || (subEval.totalKnown && subEval.remaining === 0)) {
@@ -419,15 +510,23 @@ function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, b
   } else if (subEval.rate === 0) {
     unavailableReason = 'Measured current-step rate is 0 steps/s.';
     eta = 'Unavailable because the measured current-step rate is 0 steps/s.';
+  } else if (subEval.samplesStale) {
+    unavailableReason = 'Latest current-step samples are stale.';
+    eta = 'Unavailable because the latest current-step samples are stale.';
   } else {
-    etaMs = Math.round((subEval.remaining * subEval.spanInfo.spanMs) / subEval.spanInfo.deltaSteps);
-    eta = formatDuration(etaMs);
+    etaMs = computeRemainingEtaMs(subEval.remaining, subEval.spanInfo);
+    if (etaMs === null) {
+      unavailableReason = 'Current-step ETA could not be calculated safely.';
+      eta = 'Unavailable because current-step ETA could not be calculated safely.';
+    } else {
+      eta = formatDuration(etaMs);
+    }
   }
 
   return {
     info: {
-      index,
-      label,
+      index: parsedStep.index,
+      label: parsedStep.label,
       completed: subEval.completed,
       total: subEval.total,
       remaining: subEval.remaining,
@@ -440,7 +539,6 @@ function evaluateCurrentStep(rawCurrent, { validNow, started, overallComplete, b
     etaMs,
     eta,
     unavailableReason,
-    clockAnomaly,
   };
 }
 
@@ -452,7 +550,7 @@ export function describeProgress(task, attempt, now = Date.now()) {
   const validNow = isValidNow(now) ? now : null;
   const anomalies = [];
   if (validNow === null) {
-    anomalies.push('Current clock timestamp is invalid.');
+    anomalies.push('Current clock timestamp is invalid or out of range.');
   }
 
   const startedCheck = inspectTime(attemptObj?.started, validNow, 'Attempt start');
@@ -502,6 +600,12 @@ export function describeProgress(task, attempt, now = Date.now()) {
   const stepEval = evaluateStepSeries(rawStepInput, { validNow, started });
   if (stepEval.clockAnomaly) anomalies.push(stepEval.clockAnomaly);
 
+  const parsedCurrentStep = inspectCurrentStep(
+    isPlainObject(rawStepInput) ? rawStepInput.currentStep : null,
+    { validNow, started },
+  );
+  if (parsedCurrentStep.clockAnomaly) anomalies.push(parsedCurrentStep.clockAnomaly);
+
   const taskStatus = taskObj.status;
   const attemptStatus = attemptObj?.status;
   const hasLiveError = typeof live?.error === 'string'
@@ -512,7 +616,8 @@ export function describeProgress(task, attempt, now = Date.now()) {
   const isInterrupted = !isFailed && taskStatus === 'interrupted';
   const isCancelled = !isFailed && !isInterrupted && taskStatus === 'cancelled';
   const isDraft = !isFailed && !isInterrupted && !isCancelled && taskStatus === 'draft';
-  const declaredComplete = !isFailed && !isInterrupted && !isCancelled && !isDraft && (
+  const isRunningAuthoritative = taskStatus === 'running';
+  const declaredComplete = !isFailed && !isInterrupted && !isCancelled && !isDraft && !isRunningAuthoritative && (
     taskStatus === 'complete'
     || taskStatus === 'completed'
     || taskStatus === 'review'
@@ -524,7 +629,32 @@ export function describeProgress(task, attempt, now = Date.now()) {
   );
   const stepsComplete = stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed === stepEval.total;
   const prematureComplete = declaredComplete && stepEval.valid && stepEval.totalKnown && stepEval.completed !== null && stepEval.completed < stepEval.total;
-  const isComplete = !prematureComplete && (declaredComplete || (stepsComplete && !live?.stopping));
+  const isComplete = !prematureComplete && declaredComplete;
+  const waitingForSettlementAfterSteps = isRunningAuthoritative && stepsComplete && !isFailed && !live?.stopping;
+
+  const outputActive = chars !== null && chars > 0 && idle !== null && idle < STALL_THRESHOLD_MS;
+  const workProgressActive = stepEval.present && stepEval.valid && stepEval.lastProgressAt !== null
+    && validNow !== null && (validNow - stepEval.lastProgressAt) < STALL_THRESHOLD_MS;
+
+  let isStalled = false;
+  if (live && !isFailed && !isInterrupted && !isCancelled && !isDraft && !isComplete && !live.stopping && attemptObj?.execution?.phase !== 'claimed') {
+    if (!outputActive && !workProgressActive) {
+      if (idle !== null && idle >= STALL_THRESHOLD_MS) {
+        isStalled = true;
+      } else if (stepEval.present && stepEval.valid && stepEval.samplesCount > 0 && validNow !== null) {
+        const refWorkAt = stepEval.lastProgressAt ?? stepEval.firstSampleAt;
+        if (refWorkAt !== null && (validNow - refWorkAt) >= STALL_THRESHOLD_MS) {
+          isStalled = true;
+        }
+      } else if (idle === null && validNow !== null) {
+        const refSince = dispatched ?? started;
+        if ((heartbeatAgeMs !== null && heartbeatAgeMs >= STALL_THRESHOLD_MS)
+          || (refSince !== null && (validNow - refSince) >= STALL_THRESHOLD_MS)) {
+          isStalled = true;
+        }
+      }
+    }
+  }
 
   let phase = 'waiting';
   let status = 'Waiting for run state';
@@ -590,14 +720,20 @@ export function describeProgress(task, attempt, now = Date.now()) {
     phase = 'waiting';
     status = 'Checking selected route';
     explanation = 'The request has not yet been dispatched.';
-  } else if (live && ((idle !== null && idle >= STALL_THRESHOLD_MS) || (idle === null && heartbeatAgeMs !== null && heartbeatAgeMs >= STALL_THRESHOLD_MS))) {
+  } else if (isStalled) {
     phase = 'stalled';
     status = 'Possibly stalled';
     explanation = stepEval.valid && (stepEval.totalKnown || stepEval.completed !== null)
       ? 'No new step progress or activity for at least 60 seconds. The worker may still be working.'
       : 'No new model output for at least 60 seconds. The model may still be working.';
+  } else if (waitingForSettlementAfterSteps) {
+    phase = 'waiting';
+    status = 'Waiting for completion';
+    explanation = `All ${stepEval.total} measured steps completed, waiting for authoritative run completion.`;
+    remaining = `0 of ${stepEval.total} steps remaining; waiting for completion.`;
   } else if (live && stepEval.present && stepEval.valid && (stepEval.completed !== null || stepEval.totalKnown)) {
-    if (stepEval.completed === 0 || stepEval.completed === null || (idle !== null && idle >= WAITING_OUTPUT_THRESHOLD_MS) || stepEval.rate === 0) {
+    const recentStepProgress = stepEval.lastProgressAt !== null && validNow !== null && (validNow - stepEval.lastProgressAt) < WAITING_OUTPUT_THRESHOLD_MS;
+    if (stepEval.completed === 0 || stepEval.completed === null || (idle !== null && idle >= WAITING_OUTPUT_THRESHOLD_MS && !recentStepProgress) || stepEval.rate === 0) {
       phase = 'waiting';
       status = stepEval.totalKnown && stepEval.completed !== null
         ? `Waiting on step ${Math.min(stepEval.completed + 1, stepEval.total)} of ${stepEval.total}`
@@ -635,64 +771,73 @@ export function describeProgress(task, attempt, now = Date.now()) {
   const clockAnomalyReason = hasClockAnomaly ? anomalies[0] : null;
 
   const etaBlockedReason = validNow === null
-    ? 'Unavailable because the current clock timestamp is invalid.'
-    : prematureComplete
-      ? 'Unavailable because completion was reported with remaining steps.'
-      : phase === 'failed'
-        ? 'Unavailable because the attempt failed.'
-        : phase === 'interrupted'
-          ? 'Unavailable because the run was interrupted.'
-          : phase === 'cancelled'
-            ? 'Unavailable because the request was cancelled.'
-            : phase === 'stopping'
-              ? 'Unavailable because stop was requested.'
-              : phase === 'stalled'
-                ? 'Unavailable because the run appears stalled with no recent activity.'
-                : isDraft
-                  ? 'Unavailable because the attempt has not started.'
-                  : null;
+    ? 'Unavailable because the current clock timestamp is invalid or out of range.'
+    : hasClockAnomaly
+      ? 'Unavailable due to clock anomaly: ' + clockAnomalyReason
+      : prematureComplete
+        ? 'Unavailable because completion was reported with remaining steps.'
+        : phase === 'failed'
+          ? 'Unavailable because the attempt failed.'
+          : phase === 'interrupted'
+            ? 'Unavailable because the run was interrupted.'
+            : phase === 'cancelled'
+              ? 'Unavailable because the request was cancelled.'
+              : phase === 'stopping'
+                ? 'Unavailable because stop was requested.'
+                : phase === 'stalled'
+                  ? 'Unavailable because the run appears stalled with no recent activity.'
+                  : waitingForSettlementAfterSteps
+                    ? 'Unavailable until the workspace confirms run completion.'
+                    : isDraft
+                      ? 'Unavailable because the attempt has not started.'
+                      : null;
 
-  const currentStepEval = evaluateCurrentStep(
-    isPlainObject(rawStepInput) ? rawStepInput.currentStep : null,
-    {
-      validNow,
-      started,
-      overallComplete: isComplete,
-      blockedReason: etaBlockedReason,
-    },
-  );
-  if (currentStepEval.clockAnomaly) {
-    anomalies.push(currentStepEval.clockAnomaly);
-  }
+  const defaultUnavailableCurrentStepEta = stepEval.present && stepEval.valid && stepEval.totalKnown
+    ? 'Unavailable because current-step sub-progress is not measured.'
+    : 'Unavailable because total work and remaining output are unknown.';
+
+  const currentStepEval = finalizeCurrentStep(parsedCurrentStep, {
+    overallComplete: isComplete,
+    blockedReason: etaBlockedReason,
+    defaultUnavailableEta: defaultUnavailableCurrentStepEta,
+  });
 
   let overallEtaMs = null;
-  let eta = 'Unavailable because total work and remaining output are unknown.';
+  let overallEta = 'Unavailable because total work and remaining output are unknown.';
   let overallEtaUnavailableReason = null;
 
   if (etaBlockedReason !== null) {
     overallEtaUnavailableReason = etaBlockedReason;
-    eta = etaBlockedReason;
+    overallEta = etaBlockedReason;
   } else if (isComplete) {
     overallEtaMs = 0;
-    eta = 'Complete. No remaining time.';
+    overallEta = 'Complete. No remaining time.';
   } else if (stepEval.present && !stepEval.valid) {
     overallEtaUnavailableReason = stepEval.rejectionReason;
-    eta = 'Unavailable: ' + stepEval.rejectionReason;
+    overallEta = 'Unavailable: ' + stepEval.rejectionReason;
   } else if (!stepEval.totalKnown) {
     overallEtaUnavailableReason = 'Total work and remaining output are unknown.';
-    eta = 'Unavailable because total work and remaining output are unknown.';
+    overallEta = 'Unavailable because total work and remaining output are unknown.';
   } else if (stepEval.completed === null || stepEval.remaining === null) {
     overallEtaUnavailableReason = 'Completed step count is not recorded.';
-    eta = 'Unavailable because completed step count is not recorded.';
+    overallEta = 'Unavailable because completed step count is not recorded.';
   } else if (stepEval.rate === null) {
     overallEtaUnavailableReason = stepEval.rateUnavailableReason;
-    eta = 'Unavailable: ' + stepEval.rateUnavailableReason;
+    overallEta = 'Unavailable: ' + stepEval.rateUnavailableReason;
   } else if (stepEval.rate === 0) {
     overallEtaUnavailableReason = 'Measured step rate is 0 steps/s.';
-    eta = 'Unavailable because the measured step rate is 0 steps/s.';
+    overallEta = 'Unavailable because the measured step rate is 0 steps/s.';
+  } else if (stepEval.samplesStale) {
+    overallEtaUnavailableReason = 'Latest measured step samples are stale.';
+    overallEta = 'Unavailable because the latest measured step samples are stale.';
   } else {
-    overallEtaMs = Math.round((stepEval.remaining * stepEval.spanInfo.spanMs) / stepEval.spanInfo.deltaSteps);
-    eta = formatDuration(overallEtaMs);
+    overallEtaMs = computeRemainingEtaMs(stepEval.remaining, stepEval.spanInfo);
+    if (overallEtaMs === null) {
+      overallEtaUnavailableReason = 'Overall ETA could not be calculated safely.';
+      overallEta = 'Unavailable because overall ETA could not be calculated safely.';
+    } else {
+      overallEta = formatDuration(overallEtaMs);
+    }
   }
 
   let projectedCompletionMs = null;
@@ -700,18 +845,37 @@ export function describeProgress(task, attempt, now = Date.now()) {
   let completion = 'Unavailable until a reliable remaining time can be measured.';
   let completionUnavailableReason = null;
 
-  if (isComplete) {
-    projectedCompletionMs = ended ?? validNow;
-    if (projectedCompletionMs !== null) {
-      projectedCompletionAt = new Date(projectedCompletionMs).toISOString();
-      completion = 'Completed at ' + formatLocalClock(projectedCompletionMs) + '.';
+  if (hasClockAnomaly) {
+    completionUnavailableReason = etaBlockedReason;
+    completion = etaBlockedReason;
+  } else if (isComplete) {
+    if (ended !== null) {
+      const iso = safeDateIso(ended);
+      const clock = safeLocalClock(ended);
+      if (iso !== null && clock !== null) {
+        projectedCompletionMs = ended;
+        projectedCompletionAt = iso;
+        completion = 'Completed at ' + clock + '.';
+      } else {
+        completionUnavailableReason = 'Recorded completion timestamp is out of range.';
+        completion = 'Completed. Completion timestamp is out of range.';
+      }
     } else {
-      completion = 'Completed.';
+      completionUnavailableReason = 'Completion timestamp was not recorded.';
+      completion = 'Completed. Completion time was not recorded.';
     }
   } else if (overallEtaMs !== null && validNow !== null) {
-    projectedCompletionMs = validNow + overallEtaMs;
-    projectedCompletionAt = new Date(projectedCompletionMs).toISOString();
-    completion = 'Projected around ' + formatLocalClock(projectedCompletionMs) + ' (in ' + formatDuration(overallEtaMs) + ').';
+    const candidateMs = Math.round(validNow + overallEtaMs);
+    const iso = safeDateIso(candidateMs);
+    const clock = safeLocalClock(candidateMs);
+    if (iso !== null && clock !== null && Number.isSafeInteger(candidateMs)) {
+      projectedCompletionMs = candidateMs;
+      projectedCompletionAt = iso;
+      completion = 'Projected around ' + clock + ' (in ' + formatDuration(overallEtaMs) + ').';
+    } else {
+      completionUnavailableReason = 'Projected completion exceeds valid calendar range.';
+      completion = 'Unavailable because projected completion exceeds valid calendar range.';
+    }
   } else if (etaBlockedReason !== null) {
     completionUnavailableReason = etaBlockedReason;
     completion = etaBlockedReason;
@@ -721,6 +885,9 @@ export function describeProgress(task, attempt, now = Date.now()) {
   } else if (stepEval.totalKnown && stepEval.rate === 0) {
     completionUnavailableReason = 'Measured step rate is 0 steps/s.';
     completion = 'Unavailable because the measured step rate is 0 steps/s.';
+  } else if (stepEval.totalKnown && stepEval.samplesStale) {
+    completionUnavailableReason = 'Latest measured step samples are stale.';
+    completion = 'Unavailable because the latest measured step samples are stale.';
   } else if (stepEval.totalKnown && stepEval.rate === null) {
     completionUnavailableReason = stepEval.rateUnavailableReason;
     completion = 'Unavailable: ' + stepEval.rateUnavailableReason;
@@ -729,18 +896,18 @@ export function describeProgress(task, attempt, now = Date.now()) {
     completion = 'Unavailable until a reliable remaining time can be measured.';
   }
 
+  const isTerminalState = isComplete || isFailed || isInterrupted || isCancelled;
   const elapsedMs = validNow === null || started === null
     ? null
     : ended !== null
       ? ended - started
-      : validNow - started;
+      : isTerminalState
+        ? null
+        : validNow - started;
 
   const rate = validNow !== null && chars !== null && chars > 0 && dispatched !== null && validNow > dispatched
     ? (chars * 1000) / (validNow - dispatched)
     : null;
-
-  const finalAnomaly = anomalies.length > 0;
-  const finalAnomalyReason = finalAnomaly ? anomalies[0] : null;
 
   return {
     status,
@@ -750,16 +917,16 @@ export function describeProgress(task, attempt, now = Date.now()) {
     stalled: phase === 'stalled',
     failed: phase === 'failed',
     complete: phase === 'complete',
-    clockAnomaly: finalAnomaly,
-    clockAnomalyReason: finalAnomalyReason,
+    clockAnomaly: hasClockAnomaly,
+    clockAnomalyReason,
     elapsedMs,
     chars,
     rate,
     heartbeat,
-    heartbeatAt: heartbeat === null ? null : new Date(heartbeat).toISOString(),
+    heartbeatAt: safeDateIso(heartbeat),
     heartbeatAgeMs,
     lastActivity: last,
-    lastActivityAt: last === null ? null : new Date(last).toISOString(),
+    lastActivityAt: safeDateIso(last),
     idleMs: idle,
     remaining,
     totalKnown: stepEval.valid && stepEval.totalKnown,
@@ -774,9 +941,9 @@ export function describeProgress(task, attempt, now = Date.now()) {
     currentStep: currentStepEval.info,
     currentStepEtaMs: currentStepEval.etaMs,
     currentStepEta: currentStepEval.eta,
+    eta: currentStepEval.eta,
     overallEtaMs,
-    overallEta: eta,
-    eta,
+    overallEta,
     projectedCompletionMs,
     projectedCompletionAt,
     completion,
