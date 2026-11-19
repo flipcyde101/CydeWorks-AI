@@ -29,3 +29,13 @@ When an actual provider error establishes a quota or billing hold, inspect alrea
 Cursor documents its included weekly pool as shared with Grok for the applicable plans. Treat matching Cursor and Grok balances as a possible shared reserve, not independent capacity, and check actual route outcomes. Cursor's third-party models can require prepaid usage even when the model appears in T3's catalog. Do not select such a route as included without account-specific evidence. See [Cursor models and pricing](https://cursor.com/docs/models-and-pricing).
 
 These are coordinator operating rules, not a verified automatic quota watcher or a guarantee that T3 exposes real-time allowance for every model. Record actual provider outcomes and use supported queue controls; do not report instruction-based monitoring as automatic failover.
+
+## Target-code execution hold
+
+On November 19, two workers reported processing project code on the Windows host despite explicit instructions to use a verified offline OS sandbox. One ran node --check; another ran node --test. The reported host results are not sandbox evidence. Preserve their branches and do not integrate the affected codec candidate on that basis.
+
+Until an enforceable boundary has been verified, do not dispatch new full-access T3 coding or target-execution assignments for this workwave. A prompt telling an agent not to run code is not an execution control. Existing design-only and process-investigation work may finish without executing target code.
+
+The parent may inspect source. Run necessary target tests only after independently checking the sandbox: no external network, read-only source and toolchain, scratch-only writes, an allowlisted environment, and explicit time and resource limits. Syntax checks, builds and fixture processing count as target-code processing for this rule.
+
+Before resuming delegated coding, identify the exact provider and thread permission mode, establish how commands are blocked or confined in practice, and verify that the control applies to all relevant child processes. Provider permission modes can differ and are not, by themselves, proof of an OS sandbox. Any persistent T3 permission or security-setting change remains subject to the owner's applicable approval. Record the actual enforcement evidence and any remaining gaps; do not treat this document as enforcement.
