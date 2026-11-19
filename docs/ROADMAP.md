@@ -13,12 +13,16 @@ The November 18 runner reviews identified limits in the pilot's evidence. Its Li
 ## Project handoff and reference material
 
 - [Detailed implementation and reuse plan](superpowers/plans/2026-11-18-cydeworks-ai-feature-and-reuse-plan.md)
+- [Dependency-ordered release backlog](RELEASE-BACKLOG.md)
+- [Runner qualification and browser rehearsal plan](NEXT-WAVE.md)
 - [Project specification](../outputs/Project%20Spec.md) and [completion requirements](../outputs/BFE%20Harness%20Completion%20Plan.md)
 - [Earlier implementation handoff](../outputs/BFE%20Harness%20Implementation%20Handoff%202026-11-14.md)
 
 These documents are historical planning references, not evidence of the current checkout's behavior. Some historical local evidence was not imported. Runtime state, logs, receipts and credentials remain outside the repository.
 
 ## Next gates
+
+The Windows controller has stopped an inert child in the pinned Bubblewrap fixture. The recovery evidence so far covers a separate inert WSL fixture. The standalone patch verifier reproduced the checked bytes from a disposable Git base in its focused tests. The actual worker, protected result source, and integrated proposal path still require qualification and independent review.
 
 1. Verify Windows-initiated Stop against a disposable worker and its descendants, including repeated and stale requests. Keep uncertain outcomes unresolved.
 2. Verify controller restart recovery and request replay without duplicate execution. Record worker identity, outcome, and evidence.
