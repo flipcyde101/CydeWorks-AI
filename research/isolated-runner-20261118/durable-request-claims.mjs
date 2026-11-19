@@ -1,0 +1,554 @@
+// Disconnected, host-owned durable claim registry for synthetic runner requests.
+//
+// Scope: Gate G2 (RB-G01-B) groundwork for RPL-01, RPL-02, RST-03 and
+// DUR-01, DUR-02, DUR-04, DUR-05. This module is NOT wired into the runner,
+// the controller, the browser service or any worker adapter. It never launches,
+// stops or inspects a process. It records synthetic identifiers and hashes and
+// refuses to authorize a second dispatch for the same request.
+//
+// State machine (monotonic, one step at a time):
+//   claimed -> dispatch-intent -> worker-recorded -> completed
+// A crash at any point leaves the last committed state. Every state other than
+// "completed" is reported as unresolved with redispatchAllowed: false. The only
+// recovery this helper offers is an explicit host decision to continue a claim
+// that never recorded a dispatch intent; it issues a new fenced owner
+// generation and never dispatches anything itself.
+import {DatabaseSync} from 'node:sqlite';
+import {existsSync} from 'node:fs';
+import {createHash, randomBytes, randomUUID, timingSafeEqual} from 'node:crypto';
+
+export const SCHEMA_VERSION = 'cydeworks-durable-request-claims/1';
+
+export const TRUST_LIMITS = Object.freeze([
+  'Host authority: the registry trusts the calling host process. Host completion evidence and host continue decisions are recorded as attestations; the registry does not verify cleanup, inference settlement or that no dispatch occurred.',
+  'Checksums are unkeyed SHA-256. They detect accidental corruption and partial edits, including a request key changed without resealing. A writer with file access can rewrite rows and recompute every digest consistently, and that rewrite is accepted. No tamper protection is claimed.',
+  'Rollback is not detected. Restoring an older copy of the store file, or deleting it and initializing a new one, silently forgets claims. initialize: true must only be used for a newly provisioned store.',
+  'Process identity: worker birth identity is stored as a hash. A matching hash is not proof that the OS process is alive, dead or the same process. PID-only identities are rejected and worker death is never inferred.',
+  'Dispatch uncertainty: after a dispatch intent is committed, a crash leaves it unknown whether dispatch happened. The claim stays unresolved; actual worker-tree discovery and termination are outside this helper.',
+  'Not claimed: Windows Stop, actual worker-tree recovery, live runner qualification, browser staging, event cursor replay (RPL-03), result artifact exclusivity (DUR-03) and atomicity across other stores (usage ledger, approval audit, result files).',
+  'Hashes of low-entropy synthetic values can be guessed. Callers must not place secrets or raw environment data in request ids or scopes.',
+]);
+
+const HEX64 = /^[0-9a-f]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const OWNER_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const IDENTITY_TEXT = /^[\x21-\x7e]{1,128}$/;
+const STATES = Object.freeze(['claimed', 'dispatch-intent', 'worker-recorded', 'completed']);
+const MAX_SCOPE_NODES = 2048;
+const MAX_SCOPE_DEPTH = 16;
+const MAX_SCOPE_CHARS = 65536;
+const MAX_STRING_CHARS = 4096;
+const MAX_GENERATION = 1000000;
+
+const TABLES = Object.freeze({
+  claims: 'CREATE TABLE claims (request_key TEXT PRIMARY KEY NOT NULL, scope_hash TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, owner_hash TEXT NOT NULL, nonce TEXT, worker_hash TEXT, result_hash TEXT, row_digest TEXT NOT NULL) STRICT',
+  meta: 'CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) STRICT',
+});
+const AUTO_INDEXES = Object.freeze(['sqlite_autoindex_claims_1', 'sqlite_autoindex_meta_1']);
+
+const MESSAGES = Object.freeze({
+  INVALID_OPTIONS: 'Claim registry options are invalid.',
+  INVALID_INPUT: 'Claim request input is invalid.',
+  NOT_FOUND: 'No durable claim exists for this request.',
+  SCOPE_MISMATCH: 'This request is already bound to a different scope.',
+  OWNER_MISMATCH: 'Owner token does not match the current claim generation.',
+  INVALID_TRANSITION: 'Claim state does not permit this transition.',
+  NONCE_MISMATCH: 'Dispatch nonce does not match the recorded dispatch intent.',
+  INSUFFICIENT_IDENTITY: 'Worker birth identity must include a non-PID component.',
+  IDENTITY_CONFLICT: 'Worker birth identity is already recorded for another claim.',
+  HOST_AUTHORITY_REQUIRED: 'An explicit host decision is required for this action.',
+  RECOVERY_REQUIRES_EXTERNAL_PROOF: 'Claim is unresolved; recovery needs host proof outside this helper.',
+  STORE_UNAVAILABLE: 'Claim store is unavailable.',
+  STORE_UNINITIALIZED: 'Claim store is not initialized.',
+  STORE_CORRUPT: 'Claim store failed integrity validation.',
+  STORE_BUSY: 'Claim store is busy.',
+  STORE_FULL: 'Claim store has reached its bound.',
+  STORE_CONFLICT: 'Claim store changed unexpectedly during the transaction.',
+  REGISTRY_CLOSED: 'Claim registry is closed.',
+  INTERNAL_ERROR: 'Claim registry failed internally.',
+});
+
+// Errors carry only a fixed code and message. No path, request id, scope,
+// token, identity or underlying driver text is attached, and there is no cause.
+export class ClaimRegistryError extends Error {
+  constructor(code) {
+    const known = Object.hasOwn(MESSAGES, code) ? code : 'INTERNAL_ERROR';
+    super(MESSAGES[known]);
+    this.name = 'ClaimRegistryError';
+    this.code = known;
+  }
+  toJSON() { return {name: this.name, code: this.code, message: this.message}; }
+}
+
+const fail = code => { throw new ClaimRegistryError(code); };
+
+function mapStoreError(error) {
+  if (error instanceof ClaimRegistryError) return error;
+  if (error && error.code === 'ERR_SQLITE_ERROR') {
+    const primary = Number(error.errcode) & 0xff;
+    if (primary === 5 || primary === 6) return new ClaimRegistryError('STORE_BUSY');
+    if (primary === 11 || primary === 26) return new ClaimRegistryError('STORE_CORRUPT');
+    if (primary === 13) return new ClaimRegistryError('STORE_FULL');
+    if (primary === 19) return new ClaimRegistryError('STORE_CONFLICT');
+    if (!Number.isInteger(Number(error.errcode))) {
+      const text = String(error.message);
+      if (/locked|busy/i.test(text)) return new ClaimRegistryError('STORE_BUSY');
+      if (/not a database|malformed|corrupt/i.test(text)) return new ClaimRegistryError('STORE_CORRUPT');
+    }
+    return new ClaimRegistryError('STORE_UNAVAILABLE');
+  }
+  return new ClaimRegistryError('INTERNAL_ERROR');
+}
+
+const digest = (domain, text) => createHash('sha256')
+  .update(`${SCHEMA_VERSION}\0${domain}\0${text}`, 'utf8').digest('hex');
+
+const isHex = value => typeof value === 'string' && HEX64.test(value);
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+// Deterministic JSON with sorted keys and bounded size. Rejects functions,
+// accessors, symbols, class instances, sparse arrays and non-finite numbers.
+function canonicalJson(value) {
+  let nodes = 0;
+  const walk = (item, depth) => {
+    if (++nodes > MAX_SCOPE_NODES || depth > MAX_SCOPE_DEPTH) fail('INVALID_INPUT');
+    if (item === null || typeof item === 'boolean') return JSON.stringify(item);
+    if (typeof item === 'string') {
+      if (item.length > MAX_STRING_CHARS) fail('INVALID_INPUT');
+      return JSON.stringify(item);
+    }
+    if (typeof item === 'number') {
+      if (!Number.isFinite(item)) fail('INVALID_INPUT');
+      return JSON.stringify(item);
+    }
+    if (Array.isArray(item)) {
+      if (item.length > MAX_SCOPE_NODES) fail('INVALID_INPUT');
+      const parts = [];
+      for (let index = 0; index < item.length; index++) {
+        if (!Object.hasOwn(item, index)) fail('INVALID_INPUT');
+        parts.push(walk(item[index], depth + 1));
+      }
+      return `[${parts.join(',')}]`;
+    }
+    if (isPlainObject(item)) {
+      if (Object.getOwnPropertySymbols(item).length) fail('INVALID_INPUT');
+      const keys = Object.keys(item).sort();
+      const parts = [];
+      for (const key of keys) {
+        if (key.length > MAX_STRING_CHARS) fail('INVALID_INPUT');
+        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+        if (!descriptor || !Object.hasOwn(descriptor, 'value')) fail('INVALID_INPUT');
+        parts.push(`${JSON.stringify(key)}:${walk(descriptor.value, depth + 1)}`);
+      }
+      return `{${parts.join(',')}}`;
+    }
+    return fail('INVALID_INPUT');
+  };
+  const text = walk(value, 0);
+  if (text.length > MAX_SCOPE_CHARS) fail('INVALID_INPUT');
+  return text;
+}
+
+export function requestKeyOf(requestId) {
+  if (typeof requestId !== 'string' || !REQUEST_ID.test(requestId)) fail('INVALID_INPUT');
+  return digest('request', requestId);
+}
+
+export function scopeHashOf(scope) {
+  if (!isPlainObject(scope)) fail('INVALID_INPUT');
+  return digest('scope', canonicalJson(scope));
+}
+
+function ownerHashOf(token) {
+  if (typeof token !== 'string' || !OWNER_TOKEN.test(token)) fail('INVALID_INPUT');
+  return digest('owner', token);
+}
+
+// Birth identity: {pid, creationTime, bootId?}. pid alone is never enough.
+// Only the hash is persisted.
+function birthHashOf(identity) {
+  if (!isPlainObject(identity)) fail('INVALID_INPUT');
+  const keys = Object.keys(identity);
+  if (keys.some(key => !['pid', 'creationTime', 'bootId'].includes(key))) fail('INVALID_INPUT');
+  const {pid, creationTime, bootId} = identity;
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0xffffffff) fail('INVALID_INPUT');
+  if (creationTime === undefined) fail('INSUFFICIENT_IDENTITY');
+  if (typeof creationTime !== 'string' || !IDENTITY_TEXT.test(creationTime)) fail('INVALID_INPUT');
+  if (bootId !== undefined && (typeof bootId !== 'string' || !IDENTITY_TEXT.test(bootId))) fail('INVALID_INPUT');
+  return digest('birth', canonicalJson(bootId === undefined ? {creationTime, pid} : {bootId, creationTime, pid}));
+}
+
+const ROW_FIELDS = Object.freeze(['request_key', 'scope_hash', 'state', 'generation', 'owner_hash', 'nonce', 'worker_hash', 'result_hash']);
+
+function rowDigest(row) {
+  const bound = {};
+  for (const field of ROW_FIELDS) bound[field] = row[field];
+  return digest('row', canonicalJson(bound));
+}
+
+function aggregateDigest(rows) {
+  const list = [...rows].map(row => [row.request_key, row.row_digest])
+    .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
+  return digest('aggregate', canonicalJson({count: list.length, rows: list}));
+}
+
+const safeEqualHex = (left, right) => isHex(left) && isHex(right) &&
+  timingSafeEqual(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+
+function validRow(row) {
+  if (!isHex(row.request_key) || !isHex(row.scope_hash) || !isHex(row.owner_hash) || !isHex(row.row_digest)) return false;
+  if (!STATES.includes(row.state)) return false;
+  if (!Number.isSafeInteger(row.generation) || row.generation < 1 || row.generation > MAX_GENERATION) return false;
+  const afterClaim = row.state !== 'claimed';
+  const afterIntent = row.state === 'worker-recorded' || row.state === 'completed';
+  if (afterClaim ? !(typeof row.nonce === 'string' && UUID.test(row.nonce)) : row.nonce !== null) return false;
+  if (afterIntent ? !isHex(row.worker_hash) : row.worker_hash !== null) return false;
+  if (row.state === 'completed' ? !isHex(row.result_hash) : row.result_hash !== null) return false;
+  return rowDigest(row) === row.row_digest;
+}
+
+function readSchema(db) {
+  return db.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all();
+}
+
+function validateSchema(entries) {
+  const normalize = text => String(text).replace(/\s+/g, ' ').trim();
+  const tables = new Set();
+  const indexes = new Set();
+  for (const entry of entries) {
+    if (entry.type === 'table' && Object.hasOwn(TABLES, entry.name) && !tables.has(entry.name) &&
+        normalize(entry.sql) === normalize(TABLES[entry.name])) tables.add(entry.name);
+    else if (entry.type === 'index' && AUTO_INDEXES.includes(entry.name) && !indexes.has(entry.name) &&
+        entry.sql === null) indexes.add(entry.name);
+    else fail('STORE_CORRUPT');
+  }
+  if (tables.size !== 2 || indexes.size !== AUTO_INDEXES.length) fail('STORE_CORRUPT');
+}
+
+// Validates the whole store on every transaction, not just the queried row.
+// A corrupted unrelated row, a duplicated nonce or worker identity, a row
+// count or aggregate mismatch, or an unexpected schema object fails closed for
+// every request. This is what stops a request key that was altered without
+// resealing from looking like an absent request.
+function validateStore(db, maxRows) {
+  validateSchema(readSchema(db));
+  const meta = Object.create(null);
+  for (const entry of db.prepare('SELECT key, value FROM meta LIMIT 8').all()) {
+    if (typeof entry.key !== 'string' || typeof entry.value !== 'string' || entry.key in meta) fail('STORE_CORRUPT');
+    meta[entry.key] = entry.value;
+  }
+  if (Object.keys(meta).sort().join(',') !== 'aggregate,row_count,schema') fail('STORE_CORRUPT');
+  if (meta.schema !== SCHEMA_VERSION || !/^(0|[1-9][0-9]{0,6})$/.test(meta.row_count) || !isHex(meta.aggregate)) fail('STORE_CORRUPT');
+  const list = db.prepare(`SELECT ${ROW_FIELDS.join(', ')}, row_digest FROM claims LIMIT ?`).all(maxRows + 1);
+  if (list.length > maxRows) fail('STORE_CORRUPT');
+  const rows = new Map();
+  const nonces = new Set();
+  const workers = new Set();
+  for (const entry of list) {
+    const row = {};
+    for (const field of [...ROW_FIELDS, 'row_digest']) row[field] = entry[field];
+    if (!validRow(row) || rows.has(row.request_key)) fail('STORE_CORRUPT');
+    if (row.nonce !== null) { if (nonces.has(row.nonce)) fail('STORE_CORRUPT'); nonces.add(row.nonce); }
+    if (row.worker_hash !== null) { if (workers.has(row.worker_hash)) fail('STORE_CORRUPT'); workers.add(row.worker_hash); }
+    rows.set(row.request_key, row);
+  }
+  if (rows.size !== Number(meta.row_count) || aggregateDigest(rows.values()) !== meta.aggregate) fail('STORE_CORRUPT');
+  return {rows};
+}
+
+function view(row) {
+  return Object.freeze({
+    requestKey: row.request_key,
+    scopeHash: row.scope_hash,
+    state: row.state,
+    generation: row.generation,
+    nonce: row.nonce,
+    workerIdentityRecorded: row.worker_hash !== null,
+    resultHash: row.result_hash,
+  });
+}
+
+const RECOVERY = Object.freeze({
+  claimed: {hold: 'pre-dispatch', reason: 'The claim holder may be live or crashed. Only an explicit host continue decision can issue a new owner generation; nothing was recorded as dispatched.'},
+  'dispatch-intent': {hold: 'dispatch-uncertain', reason: 'A dispatch intent was committed. Whether dispatch happened cannot be established here.'},
+  'worker-recorded': {hold: 'worker-liveness-unknown', reason: 'A worker birth identity hash is recorded. Liveness and tree termination need host OS proof outside this helper.'},
+});
+
+function recoveryOf(row) {
+  if (row.state === 'completed') {
+    return Object.freeze({resolution: 'complete', redispatchAllowed: false, automaticAction: 'none',
+      reason: 'Host-attested completion is recorded. Replay returns this claim.'});
+  }
+  return Object.freeze({resolution: 'unresolved', redispatchAllowed: false, automaticAction: 'none', ...RECOVERY[row.state]});
+}
+
+function exactHostObject(value, expected, extraKey) {
+  if (!isPlainObject(value)) return false;
+  const keys = Object.keys(value).sort();
+  const wanted = [...Object.keys(expected), ...(extraKey ? [extraKey] : [])].sort();
+  if (keys.join(',') !== wanted.join(',')) return false;
+  return Object.entries(expected).every(([key, item]) => value[key] === item);
+}
+
+function validateOptions(path, options) {
+  if (!isPlainObject(options)) fail('INVALID_OPTIONS');
+  const {initialize = false, maxRows = 1024, busyTimeoutMs = 2000, maxPages = 2048, testFaultHook} = options;
+  const allowed = ['initialize', 'maxRows', 'busyTimeoutMs', 'maxPages', 'testFaultHook'];
+  if (Object.keys(options).some(key => !allowed.includes(key))) fail('INVALID_OPTIONS');
+  if (typeof path !== 'string' || !path || path.includes('\0') || path === ':memory:' || path.startsWith('file:')) fail('INVALID_OPTIONS');
+  if (typeof initialize !== 'boolean') fail('INVALID_OPTIONS');
+  if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > 100000) fail('INVALID_OPTIONS');
+  if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0 || busyTimeoutMs > 60000) fail('INVALID_OPTIONS');
+  if (!Number.isSafeInteger(maxPages) || maxPages < 16 || maxPages > 1000000) fail('INVALID_OPTIONS');
+  if (testFaultHook !== undefined && typeof testFaultHook !== 'function') fail('INVALID_OPTIONS');
+  return {initialize, maxRows, busyTimeoutMs, maxPages, testFaultHook};
+}
+
+class DurableRequestClaims {
+  #db;
+  #maxRows;
+  #fault;
+  #closed = false;
+
+  constructor(path, options) {
+    const {initialize, maxRows, busyTimeoutMs, maxPages, testFaultHook} = validateOptions(path, options);
+    this.#maxRows = maxRows;
+    this.#fault = testFaultHook;
+    // Opening never creates a store unless initialization was requested, so a
+    // missing file cannot silently become an empty registry.
+    if (!initialize && !existsSync(path)) fail('STORE_UNAVAILABLE');
+    let db;
+    try { db = new DatabaseSync(path, {timeout: busyTimeoutMs}); }
+    catch (error) {
+      const mapped = mapStoreError(error);
+      throw mapped.code === 'INTERNAL_ERROR' ? new ClaimRegistryError('STORE_UNAVAILABLE') : mapped;
+    }
+    try {
+      db.exec(`PRAGMA trusted_schema=OFF; PRAGMA cell_size_check=ON; PRAGMA synchronous=FULL; PRAGMA max_page_count=${maxPages}`);
+      const check = db.prepare('PRAGMA quick_check(1)').all();
+      if (check.length !== 1 || Object.values(check[0])[0] !== 'ok') fail('STORE_CORRUPT');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (readSchema(db).length === 0) {
+          if (!initialize) fail('STORE_UNINITIALIZED');
+          db.exec(TABLES.claims);
+          db.exec(TABLES.meta);
+          const insert = db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)');
+          insert.run('schema', SCHEMA_VERSION);
+          insert.run('row_count', '0');
+          insert.run('aggregate', aggregateDigest([]));
+        }
+        validateStore(db, maxRows);
+        db.exec('COMMIT');
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch {}
+        throw error;
+      }
+    } catch (error) {
+      try { db.close(); } catch {}
+      throw mapStoreError(error);
+    }
+    this.#db = db;
+  }
+
+  #transaction(write, label, body) {
+    if (this.#closed) fail('REGISTRY_CLOSED');
+    const db = this.#db;
+    let open = false;
+    try {
+      db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN');
+      open = true;
+      const result = body(validateStore(db, this.#maxRows));
+      if (write) {
+        validateStore(db, this.#maxRows);
+        this.#fault?.(`${label}:before-commit`);
+      }
+      db.exec('COMMIT');
+      open = false;
+      if (write) this.#fault?.(`${label}:after-commit`);
+      return result;
+    } catch (error) {
+      if (open) { try { db.exec('ROLLBACK'); } catch {} }
+      throw mapStoreError(error);
+    }
+  }
+
+  #writeMeta(rows) {
+    const update = this.#db.prepare('UPDATE meta SET value = ? WHERE key = ?');
+    if (Number(update.run(String(rows.size), 'row_count').changes) !== 1) fail('STORE_CONFLICT');
+    if (Number(update.run(aggregateDigest(rows.values()), 'aggregate').changes) !== 1) fail('STORE_CONFLICT');
+  }
+
+  #insert(rows, row) {
+    row.row_digest = rowDigest(row);
+    this.#db.prepare(`INSERT INTO claims (${ROW_FIELDS.join(', ')}, row_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(...ROW_FIELDS.map(field => row[field]), row.row_digest);
+    rows.set(row.request_key, row);
+    this.#writeMeta(rows);
+  }
+
+  #replace(rows, previous, next) {
+    next.row_digest = rowDigest(next);
+    const changes = this.#db.prepare('UPDATE claims SET scope_hash = ?, state = ?, generation = ?, owner_hash = ?, nonce = ?, worker_hash = ?, result_hash = ?, row_digest = ? WHERE request_key = ? AND row_digest = ?')
+      .run(next.scope_hash, next.state, next.generation, next.owner_hash, next.nonce, next.worker_hash, next.result_hash,
+        next.row_digest, previous.request_key, previous.row_digest).changes;
+    if (Number(changes) !== 1) fail('STORE_CONFLICT');
+    rows.set(next.request_key, next);
+    this.#writeMeta(rows);
+  }
+
+  #bound(rows, key, scopeHash) {
+    const row = rows.get(key);
+    if (!row) fail('NOT_FOUND');
+    if (row.scope_hash !== scopeHash) fail('SCOPE_MISMATCH');
+    return row;
+  }
+
+  #owned(rows, key, scopeHash, ownerHash, state) {
+    const row = this.#bound(rows, key, scopeHash);
+    if (row.state !== state) fail('INVALID_TRANSITION');
+    if (!safeEqualHex(row.owner_hash, ownerHash)) fail('OWNER_MISMATCH');
+    return row;
+  }
+
+  // Atomically reserves (requestId, scope). Never authorizes dispatch: the
+  // creator must still commit a dispatch intent. A replay with the same scope
+  // returns the existing claim; a different scope fails closed.
+  reserve({requestId, scope} = {}) {
+    const key = requestKeyOf(requestId);
+    const scopeHash = scopeHashOf(scope);
+    return this.#transaction(true, 'reserve', ({rows}) => {
+      const existing = rows.get(key);
+      if (existing) {
+        if (existing.scope_hash !== scopeHash) fail('SCOPE_MISMATCH');
+        return Object.freeze({outcome: 'existing', dispatchAuthorized: false, claim: view(existing), recovery: recoveryOf(existing)});
+      }
+      if (rows.size >= this.#maxRows) fail('STORE_FULL');
+      const ownerToken = randomBytes(32).toString('base64url');
+      const row = {request_key: key, scope_hash: scopeHash, state: 'claimed', generation: 1,
+        owner_hash: digest('owner', ownerToken), nonce: null, worker_hash: null, result_hash: null};
+      this.#insert(rows, row);
+      return Object.freeze({outcome: 'created', dispatchAuthorized: false, ownerToken, claim: view(row)});
+    });
+  }
+
+  // The single point where the registry stops blocking dispatch. The intent
+  // is durable before this returns, so the caller may dispatch at most once
+  // with the returned nonce. Host authority to dispatch is still required.
+  recordDispatchIntent({requestId, scope, ownerToken} = {}) {
+    const key = requestKeyOf(requestId);
+    const scopeHash = scopeHashOf(scope);
+    const ownerHash = ownerHashOf(ownerToken);
+    return this.#transaction(true, 'dispatch', ({rows}) => {
+      const row = this.#owned(rows, key, scopeHash, ownerHash, 'claimed');
+      const nonce = randomUUID();
+      const next = {...row, state: 'dispatch-intent', nonce};
+      this.#replace(rows, row, next);
+      return Object.freeze({dispatchAuthorized: true, nonce, claim: view(next)});
+    });
+  }
+
+  recordWorkerIdentity({requestId, scope, ownerToken, nonce, birthIdentity} = {}) {
+    const key = requestKeyOf(requestId);
+    const scopeHash = scopeHashOf(scope);
+    const ownerHash = ownerHashOf(ownerToken);
+    if (typeof nonce !== 'string' || !UUID.test(nonce)) fail('INVALID_INPUT');
+    const workerHash = birthHashOf(birthIdentity);
+    return this.#transaction(true, 'worker', ({rows}) => {
+      const row = this.#owned(rows, key, scopeHash, ownerHash, 'dispatch-intent');
+      if (row.nonce !== nonce) fail('NONCE_MISMATCH');
+      for (const other of rows.values()) if (other.worker_hash === workerHash) fail('IDENTITY_CONFLICT');
+      const next = {...row, state: 'worker-recorded', worker_hash: workerHash};
+      this.#replace(rows, row, next);
+      return Object.freeze({claim: view(next)});
+    });
+  }
+
+  // hostEvidence must be exactly {authority: 'host', cleanup: 'verified',
+  // inference: 'settled', resultHash}. It is recorded, not verified.
+  recordHostCompletion({requestId, scope, ownerToken, hostEvidence} = {}) {
+    const key = requestKeyOf(requestId);
+    const scopeHash = scopeHashOf(scope);
+    const ownerHash = ownerHashOf(ownerToken);
+    if (!exactHostObject(hostEvidence, {authority: 'host', cleanup: 'verified', inference: 'settled'}, 'resultHash') ||
+        !isHex(hostEvidence.resultHash)) fail('HOST_AUTHORITY_REQUIRED');
+    return this.#transaction(true, 'complete', ({rows}) => {
+      const row = this.#owned(rows, key, scopeHash, ownerHash, 'worker-recorded');
+      const next = {...row, state: 'completed', result_hash: hostEvidence.resultHash};
+      this.#replace(rows, row, next);
+      return Object.freeze({claim: view(next), recovery: recoveryOf(next)});
+    });
+  }
+
+  // Explicit host continue for a claim that never committed a dispatch
+  // intent. Issues a new owner generation; any previous token is fenced out.
+  // Never available once a dispatch intent exists.
+  hostContinuePreDispatch({requestId, scope, hostDecision} = {}) {
+    const key = requestKeyOf(requestId);
+    const scopeHash = scopeHashOf(scope);
+    if (!exactHostObject(hostDecision, {authority: 'host', decision: 'continue-pre-dispatch'})) fail('HOST_AUTHORITY_REQUIRED');
+    return this.#transaction(true, 'continue', ({rows}) => {
+      const row = this.#bound(rows, key, scopeHash);
+      if (row.state !== 'claimed') fail('RECOVERY_REQUIRES_EXTERNAL_PROOF');
+      if (row.generation >= MAX_GENERATION) fail('STORE_FULL');
+      const ownerToken = randomBytes(32).toString('base64url');
+      const next = {...row, generation: row.generation + 1, owner_hash: digest('owner', ownerToken)};
+      this.#replace(rows, row, next);
+      return Object.freeze({dispatchAuthorized: false, ownerToken, claim: view(next)});
+    });
+  }
+
+  inspect({requestId, scope} = {}) {
+    const key = requestKeyOf(requestId);
+    const scopeHash = scopeHashOf(scope);
+    return this.#transaction(false, 'inspect', ({rows}) => {
+      const row = rows.get(key);
+      if (!row) return Object.freeze({found: false});
+      if (row.scope_hash !== scopeHash) fail('SCOPE_MISMATCH');
+      return Object.freeze({found: true, claim: view(row), recovery: recoveryOf(row)});
+    });
+  }
+
+  // Compares an observed birth identity with the recorded hash. Never reports
+  // a worker as dead, never treats a matching PID as proof, never redispatches.
+  assessWorkerIdentity({requestId, scope, observedBirthIdentity} = {}) {
+    const key = requestKeyOf(requestId);
+    const scopeHash = scopeHashOf(scope);
+    let observed = null;
+    let verdict = null;
+    try { observed = birthHashOf(observedBirthIdentity); }
+    catch (error) {
+      if (!(error instanceof ClaimRegistryError)) throw error;
+      verdict = error.code === 'INSUFFICIENT_IDENTITY' ? 'insufficient-identity' : 'invalid-identity';
+    }
+    return this.#transaction(false, 'assess', ({rows}) => {
+      const row = this.#bound(rows, key, scopeHash);
+      if (!verdict) {
+        if (row.worker_hash === null) verdict = 'no-recorded-identity';
+        else verdict = safeEqualHex(row.worker_hash, observed) ? 'matches-recorded' : 'mismatch';
+      }
+      return Object.freeze({verdict, osProcessProof: 'not-established', workerDeathInferred: false,
+        redispatchAllowed: false, claim: view(row)});
+    });
+  }
+
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    try { this.#db.close(); } catch {}
+  }
+}
+
+export function openClaimRegistry(path, options = {}) {
+  return new DurableRequestClaims(path, options);
+}
+
+// Exposed only so tests can build consistent forgeries that demonstrate the
+// unkeyed-checksum limit. Not an integrity API.
+export const _testing = Object.freeze({rowDigest, aggregateDigest, birthHashOf, ownerHashOf});
