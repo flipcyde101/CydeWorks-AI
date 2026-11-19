@@ -68,7 +68,7 @@ All waves follow strict role and model routing:
 
 **Routing invariants:**
 - Always specify exact provider, model, and effort.
-- If a model or quota is unavailable, halt and report the exact limit; never fall back to paid API billing, spend paid credits, or silently substitute a non-approved reviewer.
+  - Check current route evidence before submitting work. If a builder route fails, hold it and transfer the task to one verified included builder under the [T3 dispatch rules](T3-DISPATCH.md). Hold independent review if Codex GPT-6.2 Sol High is unavailable.
 - Preserve all owner approvals and existing worktrees. Never run destructive git commands or revert peer worktree commits.
 
 ---
