@@ -114,10 +114,8 @@ export async function runOwned({claim, adapter, signal, execute, confirmInferenc
   return result;
 }
 
-export function bindCheckedPatch({files, patch, verification}) {
-  const candidateSha256 = digest(files);
-  if (verification?.trusted !== true || verification.candidateSha256 !== candidateSha256 || verification.passed !== true) {
-    throw Error('Protected verification must bind the exact candidate.');
-  }
-  return {candidateSha256, patchSha256: digest(patch)};
+// Caller-supplied trust flags cannot establish verifier provenance. Keep this
+// legacy export fail-closed until an authenticated host integration replaces it.
+export function bindCheckedPatch() {
+  throw Error('Legacy patch binding is disabled until authenticated host integration.');
 }
