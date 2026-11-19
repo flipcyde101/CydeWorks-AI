@@ -101,6 +101,68 @@ function isSafeFailureRemaining(text) {
   return ALLOWED_MEASURED_UNITS.has(match[1]);
 }
 
+const DEFAULT_CLOCK_ANOMALY_REASON = 'Clock timestamps are inconsistent or out of range.';
+const DEFAULT_STEP_REJECTION_REASON = 'Measured work counters were rejected.';
+
+const SAFE_CLOCK_LABEL_PATTERN = '(?:Current clock|Attempt start|Dispatch|Completion|Last activity|Heartbeat|Step sample|Current step start|Current-step sample)';
+const SAFE_CLOCK_ANOMALY_PATTERNS = [
+  new RegExp(`^${SAFE_CLOCK_LABEL_PATTERN} timestamp is invalid or out of range\\.$`),
+  new RegExp(`^Cannot validate ${SAFE_CLOCK_LABEL_PATTERN} timestamp without a valid current clock\\.$`),
+  new RegExp(`^${SAFE_CLOCK_LABEL_PATTERN} timestamp is in the future\\.$`),
+  /^(?:Dispatch|Completion|Last activity|Current step start|Current-step sample|Step sample) timestamp precedes (?:attempt start|dispatch|completion|current step start|step start) time\.$/,
+  /^(?:Last activity|Current step start|Current-step sample|Step sample) timestamp occurs after completion time\.$/,
+  /^(?:Current-step )?[Ss]tep sample timestamps moved backward\.$/,
+  /^(?:Current-step )?[Ss]tep count changed in zero elapsed time\.$/,
+  /^Clock timestamps are inconsistent or out of range\.$/,
+];
+
+function isSafeClockAnomalyReason(text) {
+  if (text === null) return false;
+  return SAFE_CLOCK_ANOMALY_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+const SAFE_STEP_REJECTION_REASONS = new Set([
+  'Measured step counters must be a plain object.',
+  'Measured work counters must be a plain object.',
+  'Measured work counters were rejected.',
+  'Step counters are not marked as measured.',
+  'Work counters are not marked as measured.',
+  'Step counters are not marked as trustworthy.',
+  'Work counters are not marked as trustworthy.',
+  'Estimated, inferred, or simulated counters cannot be used as measured progress.',
+  'Step unit must be a non-empty string when provided.',
+  'Work unit must be a non-empty string when provided.',
+  'Output character, token, or byte counts do not imply measured step totals.',
+  'Output character, token, or byte counts do not imply measured work totals.',
+  'Step counter source must be a non-empty string when provided.',
+  'Work counter source must be a non-empty string when provided.',
+  'Step counters come from an untrusted or unmeasured source.',
+  'Work counters come from an untrusted or unmeasured source.',
+  'Total steps must be a positive safe integer.',
+  'Total work count must be a positive safe integer.',
+  'Conflicting completed and done step counts.',
+  'Completed steps must be a non-negative safe integer.',
+  'Completed work count must be a non-negative safe integer.',
+  'Completed steps cannot exceed total steps.',
+  'Completed work count cannot exceed total work count.',
+  'Completed count exceeds total count.',
+  'Remaining count does not match completed and total counts.',
+  'Step samples must be an array.',
+  'Each step sample must be a plain object.',
+  'Step sample is missing a timestamp.',
+  'Step sample timestamp is invalid.',
+  'Step sample has conflicting completed and done counts.',
+  'Step sample count must be a non-negative safe integer.',
+  'Step sample count cannot exceed total steps.',
+  'Step sample count regressed.',
+  'Current completed step count regressed below latest sample.',
+]);
+
+function isSafeStepRejectionReason(text) {
+  if (text === null) return false;
+  return SAFE_STEP_REJECTION_REASONS.has(text) || isSafeClockAnomalyReason(text);
+}
+
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value) || ArrayBuffer.isView(value)) {
     return false;
@@ -474,13 +536,16 @@ export function presentProgress(progress, options = undefined) {
     return unavailableResult();
   }
 
-  let clockAnomalyReason = sanitizeText(raw.clockAnomalyReason);
-  const hasClockAnomaly = raw.clockAnomaly === true || clockAnomalyReason !== null;
-  if (hasClockAnomaly && clockAnomalyReason === null) {
-    clockAnomalyReason = 'Clock timestamps are inconsistent or out of range.';
-  }
+  const rawClockAnomalyReason = sanitizeText(raw.clockAnomalyReason);
+  const hasClockAnomaly = raw.clockAnomaly === true || rawClockAnomalyReason !== null;
+  const clockAnomalyReason = hasClockAnomaly
+    ? (isSafeClockAnomalyReason(rawClockAnomalyReason) ? rawClockAnomalyReason : DEFAULT_CLOCK_ANOMALY_REASON)
+    : null;
 
-  let stepRejectionReason = sanitizeText(raw.stepRejectionReason);
+  const rawStepRejectionReason = sanitizeText(raw.stepRejectionReason);
+  let stepRejectionReason = rawStepRejectionReason !== null
+    ? (isSafeStepRejectionReason(rawStepRejectionReason) ? rawStepRejectionReason : DEFAULT_STEP_REJECTION_REASON)
+    : null;
   const stepSamplesValid = raw.stepSamplesValid === true ? true : raw.stepSamplesValid === false ? false : null;
 
   let totalKnown = false;
@@ -492,7 +557,7 @@ export function presentProgress(progress, options = undefined) {
 
   if (stepSamplesValid === false) {
     if (stepRejectionReason === null) {
-      stepRejectionReason = 'Measured work counters were rejected.';
+      stepRejectionReason = DEFAULT_STEP_REJECTION_REASON;
     }
   } else {
     const candidateTotal = raw.totalKnown === false ? null : validPosSafeInt(raw.totalSteps);
@@ -870,7 +935,7 @@ export function presentProgress(progress, options = undefined) {
     const reason = ensureUnavailablePrefix(stepRejectionReason, 'Unavailable');
     rows.push(row('rate', 'Rate', reason, false, stepRejectionReason));
   } else {
-    const cleanReason = formatWorkRateReason(reasonRate, overallUnit);
+    const cleanReason = isTerminal ? null : formatWorkRateReason(reasonRate, overallUnit);
     const reason = cleanReason ?? (isTerminal ? 'Run is no longer active.' : 'Insufficient measured samples.');
     rows.push(row('rate', 'Rate', ensureUnavailablePrefix(reason, 'Unavailable'), false, reason));
   }

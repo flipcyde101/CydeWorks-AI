@@ -897,6 +897,97 @@ test('hostile inputs, accessor getters, revoked proxies, arbitrary objects and c
     }
   }
 
+  // Synthetic caller diagnostics in stepRejectionReason, clockAnomalyReason, and terminal rate reasons never echo
+  const syntheticBoundaryCases=[
+    {
+      name:'failed stepSamplesValid:false stepRejectionReason',
+      input:{
+        phase:'failed',
+        failed:true,
+        stepSamplesValid:false,
+        stepRejectionReason:'Runner detail PRIVATE_DIAGNOSTIC_42',
+      },
+      forbidden:/PRIVATE_DIAGNOSTIC_42|Runner detail/,
+      check(view) {
+        assert.equal(rowByKey(view,'completed').value,'Unavailable: Measured work counters were rejected.');
+        assert.equal(rowByKey(view,'remaining').value,'Unknown (Measured work counters were rejected.)');
+        assert.equal(rowByKey(view,'rate').value,'Unavailable: Measured work counters were rejected.');
+        assert.match(view.announcement,/E_ATTEMPT_FAILED/);
+      },
+    },
+    {
+      name:'active unlisted stepRejectionReason',
+      input:{
+        phase:'active',
+        status:'Running',
+        stepRejectionReason:'Internal counter error SECRET_COUNTER_88',
+      },
+      forbidden:/SECRET_COUNTER_88|Internal counter error/,
+      check(view) {
+        assert.equal(rowByKey(view,'completed').value,'Unavailable: Measured work counters were rejected.');
+        assert.equal(rowByKey(view,'remaining').value,'Unknown (Measured work counters were rejected.)');
+      },
+    },
+    {
+      name:'failed clockAnomalyReason with activity keyword',
+      input:{
+        phase:'failed',
+        failed:true,
+        clockAnomaly:true,
+        clockAnomalyReason:'Last activity detail PRIVATE_CLOCK_DIAGNOSTIC_99',
+      },
+      forbidden:/PRIVATE_CLOCK_DIAGNOSTIC_99|Last activity detail/,
+      check(view) {
+        assert.equal(view.clockAnomaly,true);
+        assert.equal(view.clockAnomalyReason,'Clock timestamps are inconsistent or out of range.');
+        assert.equal(rowByKey(view,'clockAnomaly').value,'Clock timestamps are inconsistent or out of range.');
+        assert.equal(view.announcement,'Timing anomaly detected. Attempt failed. Clock timestamps are inconsistent or out of range.');
+      },
+    },
+    {
+      name:'active unlisted clockAnomalyReason without clockAnomaly flag',
+      input:{
+        phase:'active',
+        status:'Running',
+        clockAnomalyReason:'Runner clock {"token":"SECRET_CLOCK_TOKEN"}',
+      },
+      forbidden:/SECRET_CLOCK_TOKEN|Runner clock/,
+      check(view) {
+        assert.equal(view.clockAnomaly,true);
+        assert.equal(view.clockAnomalyReason,'Clock timestamps are inconsistent or out of range.');
+        assert.equal(view.announcement,'Timing anomaly detected. Running. Clock timestamps are inconsistent or out of range.');
+      },
+    },
+    {
+      name:'failed unavailableReasons.rate',
+      input:{
+        phase:'failed',
+        failed:true,
+        unavailableReasons:{
+          rate:'Runner rate PRIVATE_RATE_77',
+        },
+      },
+      forbidden:/PRIVATE_RATE_77|Runner rate/,
+      check(view) {
+        assert.equal(rowByKey(view,'rate').value,'Unavailable: Run is no longer active.');
+      },
+    },
+  ];
+  for (const item of syntheticBoundaryCases) {
+    const view=presentProgress(item.input);
+    item.check(view);
+    assert.doesNotMatch(view.explanation,item.forbidden,item.name);
+    assert.doesNotMatch(view.announcement,item.forbidden,item.name);
+    assert.doesNotMatch(view.text,item.forbidden,item.name);
+    if (view.clockAnomalyReason!==null) {
+      assert.doesNotMatch(view.clockAnomalyReason,item.forbidden,item.name);
+    }
+    for (const entry of view.rows) {
+      assert.doesNotMatch(entry.value,item.forbidden,item.name);
+      if (entry.reason!==null) assert.doesNotMatch(entry.reason,item.forbidden,item.name);
+    }
+  }
+
   // Non-failure metadata containing quoted JSON keys still redacts secret values cleanly
   const quotedJsonLabel=presentProgress({
     phase:'active',
