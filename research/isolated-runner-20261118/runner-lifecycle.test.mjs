@@ -42,7 +42,8 @@ test('Windows Stop cancels owned WSL parent and child; repeated and stale Stop',
     await assert.rejects(attempt,/unresolved/);
     assert.equal(reconcileClaim(join(dir,'claim')).state,'unresolved');
   } finally {
-    await adapter.stopAndVerify(); claim.close(); rmSync(dir,{recursive:true});
+    if (worker) await adapter.stopAndVerify(worker);
+    claim.close(); rmSync(dir,{recursive:true});
   }
 });
 
@@ -128,12 +129,18 @@ test('verified process cleanup cannot stand in for broker evidence', async () =>
 test('startup deadline aborts owned startup and retains uncertainty', async () => {
   const dir = mkdtempSync(new URL('./lifecycle-test-', import.meta.url));
   const path = join(dir,'claim'); const claim = claimRun(path,{});
-  let signal;
+  let signal, cleanupTarget;
   try {
     await assert.rejects(runOwned({claim, startupTimeoutMs:20, adapter:{
       start: async input => { signal=input.signal; return new Promise(()=>{}); },
-      stopAndVerify: async () => { assert.equal(signal.aborted,true); return {cleanup:'unknown'}; }
+      stopAndVerify: async identity => { cleanupTarget = identity; return {cleanup:'unknown'}; }
     }, execute:()=>assert.fail('must not execute')}), /unresolved/);
+    assert.equal(signal.aborted,true);
+    assert.equal(cleanupTarget,null);
     assert.equal(reconcileClaim(path).state,'unresolved');
+    await assert.rejects(runOwned({claim, adapter:{
+      start:async()=>assert.fail('replay cannot start'),
+      stopAndVerify:async()=>assert.fail('replay cannot stop'),
+    }}), /cannot dispatch again/);
   } finally {claim.close();rmSync(dir,{recursive:true});}
 });

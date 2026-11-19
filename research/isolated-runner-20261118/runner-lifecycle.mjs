@@ -15,7 +15,14 @@ export function claimRun(path, scope) {
   try { append({state: 'claimed', scopeHash: digest(scope), scope}); }
   catch (error) { closeSync(fd); throw error; }
   let closed = false;
-  return {id, append(event) { if (closed) throw Error('Claim closed.'); append(event); },
+  let dispatched = false;
+  return {id,
+    beginDispatch(nonce) {
+      if (closed || dispatched) throw Error('Claim cannot dispatch again.');
+      dispatched = true;
+      append({state: 'launching', nonce});
+    },
+    append(event) { if (closed) throw Error('Claim closed.'); append(event); },
     close() { if (!closed) { closed = true; closeSync(fd); } }};
 }
 
@@ -34,11 +41,13 @@ export function reconcileClaim(path) {
 // The adapter must prove guest identity and complete tree termination, not just
 // termination of the Windows launcher. No PID-only recovery or broad taskkill.
 export async function runOwned({claim, adapter, signal, execute, confirmInferenceSettled, cleanupTimeoutMs = 5000, startupTimeoutMs = 7000, executeTimeoutMs = 5000, settlementTimeoutMs = 100}) {
+  const nonce = randomUUID();
+  claim.beginDispatch(nonce);
   if (!adapter || typeof adapter.start !== 'function' || typeof adapter.stopAndVerify !== 'function') {
     claim.append({state: 'unresolved', cleanup: 'unknown', inference: 'unknown'});
     throw Error('A qualified process ownership adapter is required.');
   }
-  let worker, result, failure, execution;
+  let worker, identity, result, failure, execution;
   let executionDone = false;
   const bounded = async (promise, ms, message) => {
     let timer;
@@ -53,13 +62,12 @@ export async function runOwned({claim, adapter, signal, execute, confirmInferenc
   try {
     controller.signal.throwIfAborted();
     // start must persist identity through record before allowing worker work.
-    const nonce = randomUUID();
     let owned = false;
-    claim.append({state: 'launching', nonce});
-    worker = await bounded(adapter.start({nonce, signal: controller.signal, record: identity => {
+    worker = await bounded(adapter.start({nonce, signal: controller.signal, record: observed => {
       controller.signal.throwIfAborted();
-      if (owned || identity?.nonce !== nonce || !identity.birthIdentity) throw Error('Invalid ownership identity.');
-      claim.append({state: 'owned', identity});
+      if (owned || observed?.nonce !== nonce || !observed.birthIdentity) throw Error('Invalid ownership identity.');
+      claim.append({state: 'owned', identity: observed});
+      identity = observed;
       owned = true;
     }}), startupTimeoutMs, 'Startup deadline exceeded.');
     if (!owned) throw Error('Worker ownership was not recorded.');
@@ -81,7 +89,7 @@ export async function runOwned({claim, adapter, signal, execute, confirmInferenc
   let timer;
   try {
     evidence = await Promise.race([
-      adapter.stopAndVerify(worker),
+      adapter.stopAndVerify(identity ?? null, nonce),
       new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Cleanup deadline exceeded.')), cleanupTimeoutMs); }),
     ]);
   } catch { evidence = null; }

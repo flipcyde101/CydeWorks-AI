@@ -8,11 +8,10 @@ const prefix = ['--distribution', 'Ubuntu-24.04', '--user', 'nobody', '--exec', 
 
 // Deliberately limited to the inert fixture. This is not a general guest adapter.
 export function createSyntheticWslAdapter() {
-  let owned, launcher;
   return {
     async start({record, signal, nonce = randomUUID()}) {
       signal?.throwIfAborted();
-      launcher = spawn('wsl.exe', [...prefix, 'start', nonce], {windowsHide: true, stdio: ['ignore', 'pipe', 'pipe']});
+      const launcher = spawn('wsl.exe', [...prefix, 'start', nonce], {windowsHide: true, stdio: ['ignore', 'pipe', 'pipe']});
       let stderr = '';
       launcher.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-1000); });
       let removeAbort;
@@ -32,21 +31,25 @@ export function createSyntheticWslAdapter() {
             try { resolve(JSON.parse(buffer.split('\n')[0])); } catch (error) { reject(error); }
           }
         });
+      }).catch(error => {
+        if (launcher.exitCode === null) launcher.kill();
+        throw error;
       }).finally(() => removeAbort?.());
-      if (identity.nonce !== nonce) throw Error('Fixture ownership mismatch.');
-      owned = identity;
-      if (signal?.aborted) {
-        await this.stopAndVerify(identity);
-        signal.throwIfAborted();
+      if (identity.nonce !== nonce) {
+        if (launcher.exitCode === null) launcher.kill();
+        throw Error('Fixture ownership mismatch.');
       }
-      record(identity);
+      try {
+        signal?.throwIfAborted();
+        record(identity);
+      } catch (error) {
+        await this.stopAndVerify(identity, nonce);
+        throw error;
+      }
       return identity;
     },
-    async stopAndVerify(identity = owned, nonce = identity?.nonce) {
-      if (!identity) {
-        if (launcher && launcher.exitCode === null) launcher.kill();
-        return {cleanup: 'unknown'};
-      }
+    async stopAndVerify(identity, nonce = identity?.nonce) {
+      if (!identity || identity.nonce !== nonce) return {cleanup: 'unknown'};
       try {
         const {stdout} = await exec('wsl.exe', [...prefix, 'stop', JSON.stringify(identity), nonce],
           {windowsHide: true, timeout: 6000, maxBuffer: 16384});
