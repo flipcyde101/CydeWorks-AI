@@ -58,14 +58,16 @@ test('unknown totals and missing runner counters never invent percentages, rates
   assert.equal(streamView.stateLabel,'Running');
   assert.equal(streamView.counts.totalKnown,false);
   assert.equal(streamView.counts.percent,null);
-  assert.match(rowByKey(streamView,'output').value,/2400 characters.*total unknown/i);
-  assert.match(rowByKey(streamView,'rate').value,/240\.0 characters\/s/i);
+  assert.equal(rowByKey(streamView,'completed').value,'Unavailable (2400 UTF-16 code units received; work counts unmeasured)');
+  assert.equal(rowByKey(streamView,'output').value,'2400 UTF-16 code units (total unknown)');
+  assert.equal(rowByKey(streamView,'rate').value,'240.0 UTF-16 code units/s');
+  assert.doesNotMatch(streamView.text,/\bcharacters(?:\/s)?\b/i);
   assert.match(rowByKey(streamView,'remaining').value,/unknown/i);
   assert.match(rowByKey(streamView,'overallEta').value,/unknown/i);
   assert.match(rowByKey(streamView,'completion').value,/unavailable/i);
   assert.doesNotMatch(streamView.text,/\d+%|projected around/i);
 
-  // Open-total measured steps (completed known, total null)
+  // Open-total measured work (completed known, total null)
   const openSteps=describeProgress({
     status:'running',
     live:{
@@ -87,14 +89,14 @@ test('unknown totals and missing runner counters never invent percentages, rates
   assert.equal(openView.counts.completedSteps,2);
   assert.equal(openView.counts.totalKnown,false);
   assert.equal(openView.counts.percent,null);
-  assert.match(rowByKey(openView,'completed').value,/2 steps completed \(total unknown\)/i);
+  assert.match(rowByKey(openView,'completed').value,/2 units completed \(total unknown\)/i);
   assert.match(rowByKey(openView,'remaining').value,/unknown/i);
-  assert.match(rowByKey(openView,'rate').value,/0\.5 steps\/s/i);
+  assert.match(rowByKey(openView,'rate').value,/0\.5 units\/s/i);
   assert.match(rowByKey(openView,'overallEta').value,/unknown/i);
   assert.match(rowByKey(openView,'completion').value,/unavailable/i);
   assert.doesNotMatch(openView.text,/\d+%|projected around/i);
 
-  // Rejected character-unit steps preserve rejection reason while keeping char stream rate
+  // Rejected character-unit steps preserve rejection reason while keeping UTF-16 code-unit rate
   const rejectedSteps=describeProgress({
     status:'running',
     live:{
@@ -115,7 +117,7 @@ test('unknown totals and missing runner counters never invent percentages, rates
   const rejectedView=presentProgress(rejectedSteps,{formatLocalTime:fixedClock});
   assert.equal(rejectedView.counts.totalKnown,false);
   assert.match(rowByKey(rejectedView,'completed').value,/character/i);
-  assert.match(rowByKey(rejectedView,'rate').value,/240\.0 characters\/s.*rejected/i);
+  assert.match(rowByKey(rejectedView,'rate').value,/240\.0 UTF-16 code units\/s.*rejected/i);
   assert.match(rowByKey(rejectedView,'overallEta').value,/character/i);
 });
 
@@ -159,10 +161,10 @@ test('measured counts and separate current-step vs overall estimates render accu
   assert.equal(view.counts.percent,40);
 
   assert.equal(rowByKey(view,'status').value,'Running step 3 of 5');
-  assert.equal(rowByKey(view,'currentStep').value,'Step 3: Run protected checks (2/8, 25%; 4 sub-steps/s)');
-  assert.equal(rowByKey(view,'completed').value,'2 of 5 steps (2/5, 40%)');
-  assert.equal(rowByKey(view,'remaining').value,'3 of 5 steps remaining');
-  assert.equal(rowByKey(view,'rate').value,'0.5 steps/s (current step: 4 sub-steps/s)');
+  assert.equal(rowByKey(view,'currentStep').value,'Step 3: Run protected checks (2/8, 25%; 4 units/s)');
+  assert.equal(rowByKey(view,'completed').value,'2 of 5 units (2/5, 40%)');
+  assert.equal(rowByKey(view,'remaining').value,'3 of 5 units remaining');
+  assert.equal(rowByKey(view,'rate').value,'0.5 units/s (current step: 4 units/s)');
   assert.equal(rowByKey(view,'elapsed').value,'5.0 s');
   assert.equal(rowByKey(view,'lastActivity').value,'12:00:04 UTC (500 ms ago)');
   assert.equal(rowByKey(view,'heartbeat').value,'12:00:04 UTC (200 ms ago)');
@@ -223,9 +225,93 @@ test('measured counts and separate current-step vs overall estimates render accu
   },attempt,then+11000);
   const nearlyView=presentProgress(nearlyDone,{formatLocalTime:fixedClock});
   assert.equal(rowByKey(nearlyView,'currentStep').value,'Unavailable (current step not reported)');
-  assert.equal(rowByKey(nearlyView,'rate').value,'9999.9 steps/s');
-  assert.equal(rowByKey(nearlyView,'completed').value,'99999 of 100000 steps (99999/100000, 99.99%)');
+  assert.equal(rowByKey(nearlyView,'rate').value,'9999.9 units/s');
+  assert.equal(rowByKey(nearlyView,'completed').value,'99999 of 100000 units (99999/100000, 99.99%)');
   assert.doesNotMatch(rowByKey(nearlyView,'completed').value,/100%/);
+
+  // Inconsistent supplied percentages are overridden by counter-derived percent and incomplete work never formats as 100%
+  const inconsistentPercentView=presentProgress({
+    phase:'active',
+    status:'Running step 1 of 5',
+    totalKnown:true,
+    completedSteps:1,
+    totalSteps:5,
+    remainingSteps:4,
+    percent:99.999,
+    currentStep:{
+      index:1,
+      label:'Scan workspace',
+      completed:1,
+      total:5,
+      remaining:4,
+      percent:99.999,
+    },
+  },{formatLocalTime:fixedClock});
+  assert.equal(inconsistentPercentView.counts.percent,20);
+  assert.equal(rowByKey(inconsistentPercentView,'completed').value,'1 of 5 units (1/5, 20%)');
+  assert.equal(rowByKey(inconsistentPercentView,'currentStep').value,'Step 1: Scan workspace (1/5, 20%)');
+  assert.doesNotMatch(inconsistentPercentView.text,/100%|99\.999/);
+
+  const extremeIncompletePercentView=presentProgress({
+    phase:'active',
+    status:'Running',
+    totalKnown:true,
+    completedSteps:999999,
+    totalSteps:1000000,
+    remainingSteps:1,
+    percent:100,
+    currentStep:{
+      index:1,
+      label:'Verify batch',
+      completed:999999,
+      total:1000000,
+      remaining:1,
+      percent:99.9999,
+    },
+  });
+  assert.equal(extremeIncompletePercentView.counts.percent,99.99);
+  assert.equal(rowByKey(extremeIncompletePercentView,'completed').value,'999999 of 1000000 units (999999/1000000, 99.99%)');
+  assert.equal(rowByKey(extremeIncompletePercentView,'currentStep').value,'Step 1: Verify batch (999999/1000000, 99.99%)');
+  assert.doesNotMatch(extremeIncompletePercentView.text,/100%/);
+
+  // Measured non-step units accepted by describeProgress (e.g. files) render with generic unit labels instead of hardcoded steps/sub-steps
+  const fileUnitState=describeProgress({
+    status:'running',
+    live:{
+      lastActivity:new Date(then+4500).toISOString(),
+      heartbeat:new Date(then+4800).toISOString(),
+      steps:{
+        unit:'files',
+        measured:true,
+        completed:2,
+        total:5,
+        samples:[
+          {at:start,done:0},
+          {at:new Date(then+4000).toISOString(),done:2},
+        ],
+        currentStep:{
+          index:1,
+          label:'Inspect sources',
+          unit:'checks',
+          measured:true,
+          completed:3,
+          total:4,
+          samples:[
+            {at:new Date(then+4000).toISOString(),done:0},
+            {at:new Date(then+4500).toISOString(),done:3},
+          ],
+        },
+      },
+    },
+  },attempt,then+5000);
+  const fileUnitView=presentProgress(fileUnitState,{formatLocalTime:fixedClock});
+  assert.equal(rowByKey(fileUnitView,'currentStep').value,'Step 1: Inspect sources (3/4, 75%; 6 units/s)');
+  assert.equal(rowByKey(fileUnitView,'completed').value,'2 of 5 units (2/5, 40%)');
+  assert.equal(rowByKey(fileUnitView,'remaining').value,'3 of 5 units remaining');
+  assert.equal(rowByKey(fileUnitView,'rate').value,'0.5 units/s (current step: 6 units/s)');
+  assert.doesNotMatch(rowByKey(fileUnitView,'completed').value,/steps/i);
+  assert.doesNotMatch(rowByKey(fileUnitView,'remaining').value,/steps/i);
+  assert.doesNotMatch(rowByKey(fileUnitView,'rate').value,/steps\/s|sub-steps\/s/i);
 
   // Empty currentStep object with positive overall stepRate falls back to not-reported without crashing
   const emptyStepView=presentProgress(describeProgress({
@@ -246,14 +332,14 @@ test('measured counts and separate current-step vs overall estimates render accu
     },
   },attempt,then+5000),{formatLocalTime:fixedClock});
   assert.equal(rowByKey(emptyStepView,'currentStep').value,'Unavailable (current step not reported)');
-  assert.equal(rowByKey(emptyStepView,'rate').value,'0.5 steps/s');
+  assert.equal(rowByKey(emptyStepView,'rate').value,'0.5 units/s');
   assert.equal(rowByKey(emptyStepView,'overallEta').value,'6.0 s');
 });
 
 test('stale data, zero rates, waiting-for-completion, and unavailable inputs behave conservatively',()=>{
   const attempt={started:start,execution:{phase:'dispatching',dispatchedAt:start}};
 
-  // Zero measured step rate shows 0 steps/s without inventing an ETA
+  // Zero measured rate shows 0 units/s without inventing an ETA
   const zeroRate=describeProgress({
     status:'running',
     live:{
@@ -273,7 +359,7 @@ test('stale data, zero rates, waiting-for-completion, and unavailable inputs beh
   const zeroView=presentProgress(zeroRate,{formatLocalTime:fixedClock});
   assert.equal(zeroView.phase,'waiting');
   assert.equal(zeroView.waiting,true);
-  assert.equal(rowByKey(zeroView,'rate').value,'0 steps/s');
+  assert.equal(rowByKey(zeroView,'rate').value,'0 units/s');
   assert.equal(rowByKey(zeroView,'rate').available,true);
   assert.match(rowByKey(zeroView,'overallEta').value,/0 steps\/s/i);
   assert.match(rowByKey(zeroView,'completion').value,/0 steps\/s/i);
@@ -375,7 +461,7 @@ test('stale data, zero rates, waiting-for-completion, and unavailable inputs beh
   const settleView=presentProgress(waitingSettlement,{formatLocalTime:fixedClock});
   assert.equal(settleView.phase,'waiting');
   assert.equal(settleView.complete,false);
-  assert.equal(rowByKey(settleView,'remaining').value,'0 of 5 steps remaining (waiting for completion)');
+  assert.equal(rowByKey(settleView,'remaining').value,'0 of 5 units remaining (waiting for completion)');
   assert.equal(rowByKey(settleView,'currentStepEta').value,'Unavailable until the workspace confirms run completion.');
   assert.equal(rowByKey(settleView,'currentStepEta').available,false);
   assert.doesNotMatch(rowByKey(settleView,'currentStepEta').value,/current step complete|0 ms/i);
@@ -456,8 +542,8 @@ test('failures, premature completion, interruptions and cancellations distinguis
   assert.doesNotMatch(failedView.text,/Protected check exited with status 1/);
   assert.doesNotMatch(failedView.announcement,/Protected check exited with status 1/);
   assert.equal(rowByKey(failedView,'status').value,'Attempt failed');
-  assert.equal(rowByKey(failedView,'completed').value,'3 of 5 steps (3/5, 60%)');
-  assert.equal(rowByKey(failedView,'remaining').value,'2 of 5 steps remaining');
+  assert.equal(rowByKey(failedView,'completed').value,'3 of 5 units (3/5, 60%)');
+  assert.equal(rowByKey(failedView,'remaining').value,'2 of 5 units remaining');
   assert.equal(rowByKey(failedView,'elapsed').value,'7.0 s');
   assert.match(rowByKey(failedView,'currentStepEta').value,/failed/i);
   assert.match(rowByKey(failedView,'overallEta').value,/failed/i);
@@ -539,7 +625,7 @@ test('failures, premature completion, interruptions and cancellations distinguis
     assert.equal(terminal5View.phase,expectedPhase);
     assert.equal(terminal5View.stateLabel,expectedLabel);
     assert.equal(terminal5View.waiting,false);
-    assert.equal(rowByKey(terminal5View,'remaining').value,'0 of 5 steps remaining');
+    assert.equal(rowByKey(terminal5View,'remaining').value,'0 of 5 units remaining');
     assert.doesNotMatch(rowByKey(terminal5View,'remaining').value,/waiting for completion/i);
   }
 });
@@ -639,9 +725,9 @@ test('completion renders 100%, zero remaining, recorded completion clock, and pr
   assert.equal(completeView.stateLabel,'Complete');
   assert.equal(completeView.complete,true);
   assert.equal(rowByKey(completeView,'status').value,'Complete');
-  assert.equal(rowByKey(completeView,'currentStep').value,'None (all steps complete)');
-  assert.equal(rowByKey(completeView,'completed').value,'4 of 4 steps (4/4, 100%)');
-  assert.equal(rowByKey(completeView,'remaining').value,'0 of 4 steps remaining');
+  assert.equal(rowByKey(completeView,'currentStep').value,'None (all measured units complete)');
+  assert.equal(rowByKey(completeView,'completed').value,'4 of 4 units (4/4, 100%)');
+  assert.equal(rowByKey(completeView,'remaining').value,'0 of 4 units remaining');
   assert.equal(rowByKey(completeView,'elapsed').value,'8.0 s');
   assert.equal(rowByKey(completeView,'currentStepEta').value,'Complete. No remaining work.');
   assert.equal(rowByKey(completeView,'overallEta').value,'Complete. No remaining time.');
