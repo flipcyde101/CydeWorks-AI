@@ -4,6 +4,12 @@
 // expiry, immediate revocation, cross-project isolation, and inputs-only task
 // templates that never store or transfer executable approvals.
 //
+// Every public method copies caller input into inert library-owned data before
+// reading the clock or state, and runs under a non-reentrant lock, so caller
+// code (Proxy traps or the clock) cannot interleave with state checks and
+// transitions. This library remains disconnected from live callers: a future
+// adapter must authenticate the owner and derive projectId from trusted state.
+//
 // No filesystem, network, process, environment, credential, UI, or runtime
 // execution dependencies.
 
@@ -152,6 +158,122 @@ function readDenseArray(value, label, maxLength) {
     copied[i] = desc.value;
   }
   return copied;
+}
+
+// Data-only input boundary. Every public method copies its caller-supplied
+// argument into an inert, library-owned tree of plain data BEFORE it reads the
+// clock or any library state. All caller-observable introspection (including
+// Proxy traps such as getPrototypeOf, ownKeys and getOwnPropertyDescriptor)
+// therefore happens in this phase only. Later validation and state transitions
+// operate exclusively on the copy, which has no traps, accessors or custom
+// prototypes, so caller code cannot run between a state check and the state
+// transition that depends on it. Standard JavaScript offers no portable way to
+// detect a Proxy, so the boundary copies instead of attempting detection.
+const INPUT_SNAPSHOT_LIMITS = Object.freeze({
+  maxDepth: 4,
+  maxNodes: 512,
+  maxObjectKeys: 32,
+  maxArrayLength: 64,
+});
+
+function snapshotInput(value, label) {
+  const budget = { nodes: 0 };
+  return snapshotValue(value, label, 0, budget);
+}
+
+function snapshotValue(value, label, depth, budget) {
+  if (typeof value === 'function') {
+    fail(`${label} must be plain data, not a function.`);
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  budget.nodes += 1;
+  if (budget.nodes > INPUT_SNAPSHOT_LIMITS.maxNodes) {
+    fail(`${label} exceeds the maximum number of input nodes.`);
+  }
+  if (depth > INPUT_SNAPSHOT_LIMITS.maxDepth) {
+    fail(`${label} exceeds the maximum input nesting depth.`);
+  }
+  if (ArrayBuffer.isView(value)) {
+    fail(`${label} must be a plain object or dense plain array.`);
+  }
+  if (Array.isArray(value)) {
+    return snapshotArray(value, label, depth, budget);
+  }
+  return snapshotObject(value, label, depth, budget);
+}
+
+function readDataDescriptor(value, key, label, kindLabel) {
+  const desc = Reflect.getOwnPropertyDescriptor(value, key);
+  if (!desc || !('value' in desc) || desc.get !== undefined || desc.set !== undefined) {
+    fail(`${label} ${kindLabel}`);
+  }
+  return desc.value;
+}
+
+function snapshotArray(value, label, depth, budget) {
+  if (Reflect.getPrototypeOf(value) !== Array.prototype) {
+    fail(`${label} must be a dense plain array.`);
+  }
+  const length = readDataDescriptor(value, 'length', label, 'must be a dense plain array.');
+  if (!Number.isSafeInteger(length) || length < 0) {
+    fail(`${label} must be a dense plain array.`);
+  }
+  if (length > INPUT_SNAPSHOT_LIMITS.maxArrayLength) {
+    fail(`${label} exceeds maximum length.`);
+  }
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== length + 1) {
+    fail(`${label} must be a dense array without extra properties.`);
+  }
+  for (const key of ownKeys) {
+    if (key === 'length') {
+      continue;
+    }
+    if (typeof key !== 'string' || String(Number(key)) !== key || !(Number(key) < length)) {
+      fail(`${label} must be a dense array without extra properties.`);
+    }
+  }
+  const copied = new Array(length);
+  for (let i = 0; i < length; i++) {
+    const element = readDataDescriptor(
+      value,
+      String(i),
+      label,
+      'must be a dense array without holes or accessor properties.',
+    );
+    copied[i] = snapshotValue(element, `${label}[${i}]`, depth + 1, budget);
+  }
+  return Object.freeze(copied);
+}
+
+function snapshotObject(value, label, depth, budget) {
+  const proto = Reflect.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    fail(`${label} must have a standard object prototype.`);
+  }
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length > INPUT_SNAPSHOT_LIMITS.maxObjectKeys) {
+    fail(`${label} contains too many fields.`);
+  }
+  const copied = Object.create(null);
+  for (const key of ownKeys) {
+    if (typeof key !== 'string') {
+      fail(`${label} contains a non-string property key.`);
+    }
+    if (PROTOTYPE_KEY_SET.has(key)) {
+      fail(`${label} contains a forbidden prototype key.`);
+    }
+    const field = readDataDescriptor(value, key, label, 'cannot contain accessor properties.');
+    Object.defineProperty(copied, key, {
+      value: snapshotValue(field, `${label}.${key}`, depth + 1, budget),
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return Object.freeze(copied);
 }
 
 function validateIdentifier(value, label) {
@@ -447,6 +569,7 @@ export class ProjectContextLibrary {
   #templates;
   #projectTemplateCounts;
   #approvalSequence;
+  #busy;
 
   constructor({ clock = () => Date.now() } = {}) {
     if (typeof clock !== 'function') {
@@ -458,6 +581,62 @@ export class ProjectContextLibrary {
     this.#templates = new Map();
     this.#projectTemplateCounts = new Map();
     this.#approvalSequence = 0;
+    this.#busy = false;
+  }
+
+  // Runs one public operation under a non-reentrant lock. Caller-controlled
+  // code (input Proxy traps or the injected clock) that calls back into this
+  // library while an operation is in progress is rejected, so no operation can
+  // observe or mutate state between another operation's checks and its state
+  // transition. The raw input is snapshotted into inert data before the clock
+  // or any library state is read (see snapshotInput).
+  #run(rawInput, label, operation) {
+    if (this.#busy) {
+      fail('ProjectContextLibrary rejects reentrant calls while another operation is in progress.');
+    }
+    this.#busy = true;
+    try {
+      const input = snapshotInput(rawInput, label);
+      return operation(input);
+    } finally {
+      this.#busy = false;
+    }
+  }
+
+  registerEntry(input) {
+    return this.#run(input, 'entry', (data) => this.#registerEntry(data));
+  }
+
+  proposeEntryVersion(input) {
+    return this.#run(input, 'entryVersionProposal', (data) => this.#proposeEntryVersion(data));
+  }
+
+  approveEntry(input) {
+    return this.#run(input, 'approval', (data) => this.#approveEntry(data));
+  }
+
+  revokeEntry(input) {
+    return this.#run(input, 'revocation', (data) => this.#revokeEntry(data));
+  }
+
+  getEntry(input) {
+    return this.#run(input, 'entryLookup', (data) => this.#getEntry(data));
+  }
+
+  listEntries(input) {
+    return this.#run(input, 'listEntries', (data) => this.#listEntries(data));
+  }
+
+  previewPromptContext(input) {
+    return this.#run(input, 'previewPromptContext', (data) => this.#previewPromptContext(data));
+  }
+
+  createTaskTemplate(input) {
+    return this.#run(input, 'taskTemplate', (data) => this.#createTaskTemplate(data));
+  }
+
+  instantiateTemplateDraft(input) {
+    return this.#run(input, 'instantiateTemplateDraft', (data) => this.#instantiateTemplateDraft(data));
   }
 
   #now() {
@@ -468,7 +647,7 @@ export class ProjectContextLibrary {
     return now;
   }
 
-  registerEntry(input) {
+  #registerEntry(input) {
     assertPlainObject(input, 'entry', [
       'projectId',
       'entryId',
@@ -538,7 +717,7 @@ export class ProjectContextLibrary {
     return cloneEntrySnapshot(record, now);
   }
 
-  proposeEntryVersion(input) {
+  #proposeEntryVersion(input) {
     assertPlainObject(input, 'entryVersionProposal', [
       'projectId',
       'entryId',
@@ -601,7 +780,7 @@ export class ProjectContextLibrary {
     return cloneEntrySnapshot(existing, now);
   }
 
-  approveEntry(input) {
+  #approveEntry(input) {
     assertPlainObject(input, 'approval', [
       'projectId',
       'entryId',
@@ -673,7 +852,7 @@ export class ProjectContextLibrary {
     return cloneEntrySnapshot(record, now);
   }
 
-  revokeEntry(input) {
+  #revokeEntry(input) {
     assertPlainObject(input, 'revocation', ['projectId', 'entryId', 'revokedBy', 'reason']);
     const now = this.#now();
     const projectId = validateIdentifier(readOwnValue(input, 'projectId'), 'projectId');
@@ -700,7 +879,7 @@ export class ProjectContextLibrary {
     return cloneEntrySnapshot(record, now);
   }
 
-  getEntry(input) {
+  #getEntry(input) {
     assertPlainObject(input, 'entryLookup', ['projectId', 'entryId']);
     const now = this.#now();
     const projectId = validateIdentifier(readOwnValue(input, 'projectId'), 'projectId');
@@ -712,7 +891,7 @@ export class ProjectContextLibrary {
     return cloneEntrySnapshot(record, now);
   }
 
-  listEntries(input) {
+  #listEntries(input) {
     assertPlainObject(input, 'listEntries', ['projectId', 'includeExcluded']);
     const now = this.#now();
     const projectId = validateIdentifier(readOwnValue(input, 'projectId'), 'projectId');
@@ -738,7 +917,7 @@ export class ProjectContextLibrary {
     return deepFreeze(items);
   }
 
-  previewPromptContext(input) {
+  #previewPromptContext(input) {
     assertPlainObject(input, 'previewPromptContext', ['projectId', 'entryIds']);
     const now = this.#now();
     return this.#previewPromptContextAt(input, now);
@@ -908,7 +1087,7 @@ export class ProjectContextLibrary {
     });
   }
 
-  createTaskTemplate(input) {
+  #createTaskTemplate(input) {
     assertPlainObject(input, 'taskTemplate', [
       'projectId',
       'templateId',
@@ -1034,7 +1213,7 @@ export class ProjectContextLibrary {
     return cloneTemplateSnapshot(template);
   }
 
-  instantiateTemplateDraft(input) {
+  #instantiateTemplateDraft(input) {
     assertPlainObject(input, 'instantiateTemplateDraft', ['projectId', 'templateId']);
     const now = this.#now();
     const projectId = validateIdentifier(readOwnValue(input, 'projectId'), 'projectId');

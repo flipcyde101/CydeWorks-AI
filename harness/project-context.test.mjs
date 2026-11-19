@@ -973,6 +973,90 @@ test('requires expectedDigest on approval and enforces immutable revision identi
   });
   assert.equal(pinnedDraft.contextPreview.included.length, 0);
   assert.equal(pinnedDraft.entryChecks[0].reason, 'pinned-version-mismatch');
+
+  // Digest and revision pins are each exercised independently with the version
+  // pin matching the current version (or absent), so an earlier version
+  // mismatch cannot mask them.
+  const pinCases = [
+    {
+      templateId: 'tpl-pin-digest-only',
+      ref: { entryId: 'skill-immutable', pinnedDigest: v1.approvalDigest },
+      reason: 'pinned-digest-mismatch',
+    },
+    {
+      templateId: 'tpl-pin-digest-current-version',
+      ref: { entryId: 'skill-immutable', pinnedVersion: '2.0.0', pinnedDigest: v1.approvalDigest },
+      reason: 'pinned-digest-mismatch',
+    },
+    {
+      templateId: 'tpl-pin-revision-only',
+      ref: { entryId: 'skill-immutable', pinnedRevisionId: v1.revisionId },
+      reason: 'pinned-revision-mismatch',
+    },
+    {
+      templateId: 'tpl-pin-revision-current-digest',
+      ref: {
+        entryId: 'skill-immutable',
+        pinnedVersion: '2.0.0',
+        pinnedDigest: v2.approvalDigest,
+        pinnedRevisionId: v1.revisionId,
+      },
+      reason: 'pinned-revision-mismatch',
+    },
+  ];
+  for (const pinCase of pinCases) {
+    lib.createTaskTemplate({
+      projectId: 'proj-alpha',
+      templateId: pinCase.templateId,
+      title: 'Independent pin check',
+      workflowKind: 'brief',
+      inputs: {
+        requestText: 'Check one pin at a time.',
+        targetScopeLabels: ['docs'],
+        selectedEntryRefs: [pinCase.ref],
+      },
+    });
+    const draft = lib.instantiateTemplateDraft({
+      projectId: 'proj-alpha',
+      templateId: pinCase.templateId,
+    });
+    assert.equal(draft.contextPreview.included.length, 0, pinCase.templateId);
+    assert.deepEqual(
+      draft.entryChecks.map((check) => [check.entryId, check.eligible, check.reason]),
+      [['skill-immutable', false, pinCase.reason]],
+      pinCase.templateId,
+    );
+  }
+
+  // Positive control: all pins matching the current revision are eligible.
+  lib.createTaskTemplate({
+    projectId: 'proj-alpha',
+    templateId: 'tpl-pin-all-current',
+    title: 'All pins current',
+    workflowKind: 'brief',
+    inputs: {
+      requestText: 'Use current revision.',
+      targetScopeLabels: ['docs'],
+      selectedEntryRefs: [
+        {
+          entryId: 'skill-immutable',
+          pinnedVersion: '2.0.0',
+          pinnedDigest: v2.approvalDigest,
+          pinnedRevisionId: v2.revisionId,
+        },
+      ],
+    },
+  });
+  const currentDraft = lib.instantiateTemplateDraft({
+    projectId: 'proj-alpha',
+    templateId: 'tpl-pin-all-current',
+  });
+  assert.deepEqual(
+    currentDraft.entryChecks.map((check) => [check.entryId, check.eligible, check.reason]),
+    [['skill-immutable', true, 'approved']],
+  );
+  assert.equal(currentDraft.contextPreview.included.length, 1);
+  assert.equal(currentDraft.contextPreview.included[0].revisionId, v2.revisionId);
 });
 
 test('binds sourceHash into approvalDigest while labeling sourceHash provenance unverified', () => {
@@ -1010,6 +1094,44 @@ test('binds sourceHash into approvalDigest while labeling sourceHash provenance 
       entryId: 'mem-source-none',
     }),
   );
+
+  // entryA, entryB and entryNone differ in entryId as well as sourceHash, so
+  // comparing them alone cannot prove sourceHash is bound. Register the same
+  // entryId with identical project, kind, content, version, sourceRef and
+  // clock in isolated libraries, varying only sourceHash.
+  const fixedEntryId = 'mem-source-fixed';
+  const registerFixed = (sourceHash) => {
+    const isolated = createProjectContextLibrary({ clock: makeClock().clock });
+    const provenance = {
+      selectionMode: 'explicit',
+      sourceKind: 'owner-selected-file',
+      sourceRef: 'docs/conventions.md',
+      version: '1.0.0',
+    };
+    if (sourceHash !== undefined) {
+      provenance.sourceHash = sourceHash;
+    }
+    return isolated.registerEntry(makeMemoryInput({ entryId: fixedEntryId, provenance }));
+  };
+  const fixedA = registerFixed(hashA);
+  const fixedA2 = registerFixed(hashA);
+  const fixedB = registerFixed(hashB);
+  const fixedNone = registerFixed(undefined);
+  for (const fixed of [fixedA, fixedA2, fixedB, fixedNone]) {
+    assert.equal(fixed.entryId, fixedEntryId);
+    assert.equal(fixed.projectId, 'proj-alpha');
+    assert.equal(fixed.version, '1.0.0');
+    assert.equal(fixed.revisionNumber, 1);
+    assert.equal(fixed.contentSha256, fixedA.contentSha256);
+    assert.equal(fixed.createdAt, fixedA.createdAt);
+  }
+  // Same inputs produce the same digest, so the differences below come only from sourceHash.
+  assert.equal(fixedA.approvalDigest, fixedA2.approvalDigest);
+  assert.equal(fixedA.revisionId, fixedA2.revisionId);
+  assert.notEqual(fixedA.approvalDigest, fixedB.approvalDigest);
+  assert.notEqual(fixedA.approvalDigest, fixedNone.approvalDigest);
+  assert.notEqual(fixedB.approvalDigest, fixedNone.approvalDigest);
+  assert.notEqual(fixedA.revisionId, fixedB.revisionId);
 
   assert.notEqual(entryA.approvalDigest, entryB.approvalDigest);
   assert.notEqual(entryA.approvalDigest, entryNone.approvalDigest);
@@ -1337,4 +1459,270 @@ test('validates dense arrays without invoking caller accessors, holes, or overri
     /dense|extra/i,
   );
   assert.equal(mapCalled, false);
+});
+
+function approveCurrent(lib, snapshot) {
+  return lib.approveEntry({
+    projectId: snapshot.projectId,
+    entryId: snapshot.entryId,
+    version: snapshot.version,
+    approvedBy: 'owner-local',
+    expectedDigest: snapshot.approvalDigest,
+  });
+}
+
+function makeSkillProposal(entryId, version, content, requestedCapabilities) {
+  return {
+    projectId: 'proj-alpha',
+    entryId,
+    content,
+    requestedCapabilities,
+    provenance: {
+      selectionMode: 'explicit',
+      sourceKind: 'owner-authored',
+      sourceRef: 'skills/brief-grounding.md',
+      version,
+    },
+  };
+}
+
+test('reentrant proposal from a caller Proxy trap cannot reuse a version', () => {
+  const lib = createProjectContextLibrary({ clock: makeClock().clock });
+  const v1 = lib.registerEntry(makeSkillInput({ entryId: 'skill-reentrant' }));
+  approveCurrent(lib, v1);
+
+  // Variant A: the trap fires during capability array inspection, which the
+  // previous implementation performed after the version-reuse check. The trap
+  // attempts a nested proposal of the same version and swallows any error.
+  let nestedError = null;
+  let trapCalls = 0;
+  const swallowingCaps = new Proxy(['read-only-source'], {
+    ownKeys(target) {
+      trapCalls += 1;
+      try {
+        lib.proposeEntryVersion(
+          makeSkillProposal('skill-reentrant', '2.0.0', 'Nested replacement content.', ['read-only-source']),
+        );
+      } catch (error) {
+        nestedError = error;
+      }
+      return Reflect.ownKeys(target);
+    },
+  });
+  const outer = lib.proposeEntryVersion(
+    makeSkillProposal('skill-reentrant', '2.0.0', 'Outer v2 content.', swallowingCaps),
+  );
+  assert.ok(trapCalls >= 1);
+  assert.ok(nestedError instanceof Error);
+  assert.match(nestedError.message, /reentrant/);
+  assert.equal(outer.version, '2.0.0');
+  assert.equal(outer.revisionNumber, 2);
+  assert.equal(outer.content, 'Outer v2 content.');
+  assert.deepEqual(outer.usedVersions, ['1.0.0', '2.0.0']);
+  const afterA = lib.getEntry({ projectId: 'proj-alpha', entryId: 'skill-reentrant' });
+  assert.equal(afterA.revisionNumber, 2);
+  assert.equal(afterA.content, 'Outer v2 content.');
+  assert.equal(afterA.revisionId, outer.revisionId);
+  assert.equal(afterA.approvalDigest, outer.approvalDigest);
+  assert.equal(afterA.status, 'pending-approval');
+  assert.throws(
+    () =>
+      lib.proposeEntryVersion(
+        makeSkillProposal('skill-reentrant', '2.0.0', 'Second 2.0.0 attempt.', ['read-only-source']),
+      ),
+    /version/i,
+  );
+
+  // Variant B: the nested error propagates out of the trap. The outer
+  // proposal fails and leaves state unchanged; the version stays unused.
+  const before = lib.getEntry({ projectId: 'proj-alpha', entryId: 'skill-reentrant' });
+  const propagatingCaps = new Proxy(['read-only-source'], {
+    ownKeys(target) {
+      lib.proposeEntryVersion(
+        makeSkillProposal('skill-reentrant', '3.0.0', 'Nested v3 content.', ['read-only-source']),
+      );
+      return Reflect.ownKeys(target);
+    },
+  });
+  assert.throws(
+    () =>
+      lib.proposeEntryVersion(
+        makeSkillProposal('skill-reentrant', '3.0.0', 'Outer v3 content.', propagatingCaps),
+      ),
+    /reentrant/,
+  );
+  assert.deepEqual(lib.getEntry({ projectId: 'proj-alpha', entryId: 'skill-reentrant' }), before);
+
+  const v3 = lib.proposeEntryVersion(
+    makeSkillProposal('skill-reentrant', '3.0.0', 'Plain v3 content.', ['read-only-source']),
+  );
+  assert.equal(v3.revisionNumber, 3);
+  assert.deepEqual(v3.usedVersions, ['1.0.0', '2.0.0', '3.0.0']);
+});
+
+test('reentrant preview selection trap cannot invalidate an already admitted item', () => {
+  const lib = createProjectContextLibrary({ clock: makeClock().clock });
+  const memA = lib.registerEntry(makeMemoryInput({ entryId: 'mem-a', content: 'Alpha admitted content.' }));
+  const memB = lib.registerEntry(makeMemoryInput({ entryId: 'mem-b', content: 'Bravo admitted content.' }));
+  approveCurrent(lib, memA);
+  approveCurrent(lib, memB);
+
+  // The second selection is an object whose traps run after the first
+  // selection would previously have been admitted. They try to revoke mem-a
+  // and to replace it with a new version, swallowing any error.
+  const nestedErrors = [];
+  const laterSelection = new Proxy(
+    { entryId: 'mem-b' },
+    {
+      ownKeys(target) {
+        try {
+          lib.revokeEntry({ projectId: 'proj-alpha', entryId: 'mem-a', revokedBy: 'owner-local' });
+        } catch (error) {
+          nestedErrors.push(error);
+        }
+        try {
+          lib.proposeEntryVersion({
+            projectId: 'proj-alpha',
+            entryId: 'mem-a',
+            content: 'Replacement content.',
+            provenance: {
+              selectionMode: 'explicit',
+              sourceKind: 'owner-selected-file',
+              sourceRef: 'docs/conventions.md',
+              version: '2.0.0',
+            },
+          });
+        } catch (error) {
+          nestedErrors.push(error);
+        }
+        return Reflect.ownKeys(target);
+      },
+    },
+  );
+  const preview = lib.previewPromptContext({
+    projectId: 'proj-alpha',
+    entryIds: ['mem-a', laterSelection],
+  });
+  assert.equal(nestedErrors.length, 2);
+  for (const error of nestedErrors) {
+    assert.match(error.message, /reentrant/);
+  }
+  assert.deepEqual(
+    preview.included.map((item) => item.entryId),
+    ['mem-a', 'mem-b'],
+  );
+  assert.deepEqual(preview.excluded, []);
+
+  // Every admitted item still matches current, approved, unrevoked state.
+  for (const item of preview.included) {
+    const current = lib.getEntry({ projectId: 'proj-alpha', entryId: item.entryId });
+    assert.equal(current.status, 'approved');
+    assert.equal(current.revoked, false);
+    assert.equal(current.version, item.version);
+    assert.equal(current.revisionId, item.revisionId);
+    assert.equal(current.approvalDigest, item.approvalDigest);
+    assert.equal(current.approval.approvalId, item.approvalId);
+    assert.equal(current.content, item.content);
+  }
+  assert.match(preview.promptText, /Alpha admitted content\./);
+  assert.doesNotMatch(preview.promptText, /Replacement content\./);
+
+  // A propagating trap fails the whole preview and leaves mem-a approved.
+  const propagatingSelection = new Proxy(
+    { entryId: 'mem-b' },
+    {
+      ownKeys(target) {
+        lib.revokeEntry({ projectId: 'proj-alpha', entryId: 'mem-a', revokedBy: 'owner-local' });
+        return Reflect.ownKeys(target);
+      },
+    },
+  );
+  assert.throws(
+    () =>
+      lib.previewPromptContext({
+        projectId: 'proj-alpha',
+        entryIds: ['mem-a', propagatingSelection],
+      }),
+    /reentrant/,
+  );
+  const memAAfter = lib.getEntry({ projectId: 'proj-alpha', entryId: 'mem-a' });
+  assert.equal(memAAfter.status, 'approved');
+  assert.equal(memAAfter.revoked, false);
+});
+
+test('copies caller input into inert data before sampling the clock and never invokes get traps', () => {
+  const events = [];
+  const base = makeClock();
+  let reenter = null;
+  const lib = createProjectContextLibrary({
+    clock: () => {
+      events.push('clock');
+      if (reenter) {
+        const callback = reenter;
+        reenter = null;
+        callback();
+      }
+      return base.clock();
+    },
+  });
+  const mem = lib.registerEntry(makeMemoryInput());
+  approveCurrent(lib, mem);
+
+  let getTrapCalls = 0;
+  const handler = {
+    get(target, key, receiver) {
+      getTrapCalls += 1;
+      return Reflect.get(target, key, receiver);
+    },
+    getPrototypeOf(target) {
+      events.push('trap');
+      return Reflect.getPrototypeOf(target);
+    },
+    ownKeys(target) {
+      events.push('trap');
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, key) {
+      events.push('trap');
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  };
+  events.length = 0;
+  const preview = lib.previewPromptContext(
+    new Proxy(
+      {
+        projectId: 'proj-alpha',
+        entryIds: new Proxy([new Proxy({ entryId: 'mem-style' }, handler)], handler),
+      },
+      handler,
+    ),
+  );
+  assert.equal(preview.included.length, 1);
+  assert.equal(getTrapCalls, 0);
+  const firstClock = events.indexOf('clock');
+  assert.ok(firstClock > 0);
+  assert.ok(events.slice(0, firstClock).every((event) => event === 'trap'));
+  assert.ok(events.slice(firstClock).every((event) => event === 'clock'));
+
+  // An injected clock that calls back into the library is rejected as reentrant.
+  reenter = () => lib.revokeEntry({ projectId: 'proj-alpha', entryId: 'mem-style', revokedBy: 'owner-local' });
+  assert.throws(
+    () => lib.previewPromptContext({ projectId: 'proj-alpha', entryIds: ['mem-style'] }),
+    /reentrant/,
+  );
+  assert.equal(lib.getEntry({ projectId: 'proj-alpha', entryId: 'mem-style' }).status, 'approved');
+
+  // The data-only boundary rejects functions and excessive nesting.
+  assert.throws(
+    () => lib.previewPromptContext({ projectId: 'proj-alpha', entryIds: [() => 'mem-style'] }),
+    /plain data/,
+  );
+  let deep = { entryId: 'mem-style' };
+  for (let i = 0; i < 6; i++) {
+    deep = { entryId: deep };
+  }
+  assert.throws(
+    () => lib.previewPromptContext({ projectId: 'proj-alpha', entryIds: [deep] }),
+    /nesting depth/,
+  );
 });
